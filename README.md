@@ -1,8 +1,8 @@
 # Darkstar Harness
 
-Darkstar is a local-first orchestration environment for model execution on privately controlled compute infrastructure.
+Darkstar is a local-first orchestration environment for model execution.
 
-The standard distribution provides integrated Tools, Skills, workflows, and extensible custom nodes without dependency on hosted AI infrastructure. Expansion into diffusion-based modalities is underway.
+The standard distribution provides integrated Tools, Skills, workflows, and extensible custom nodes without dependency on hosted AI infrastructure.
 
 Darkstar currently supports three execution backends:
 
@@ -16,7 +16,7 @@ Darkstar currently targets **Windows environments**. macOS and Linux support is 
 
 Deployment requires:
 
-- Windows 10 or Windows 11
+- Windows 10 or Windows 11 
 - A compatible GGUF model
 - Sufficient system RAM and/or GPU VRAM for the selected workload
 - Network access during initial runtime provisioning when required components are not already present
