@@ -1,0 +1,12 @@
+{
+  "id": "com.darkstar.api-model",
+  "name": "Darkstar API Model",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "description": "Remote OpenAI, Anthropic, Qwen, and OpenAI-compatible model nodes.",
+  "renderer": "darkstar-internal:custom_nodes/api-model/renderer.js",
+  "backend": "darkstar-internal:custom_nodes/api-model/backend.js",
+  "permissions": [
+    "backend:trusted"
+  ]
+}

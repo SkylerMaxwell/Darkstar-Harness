@@ -1,0 +1,182 @@
+# -----------------------------------------------------------------------------
+# Darkstar Harness: private maintainer / local-only material
+# -----------------------------------------------------------------------------
+# Root-only private development areas. Do NOT ignore backend/Dev/: it contains
+# the public regression suite. Only backend/Dev/Diagnostics/ is generated.
+/dev/
+/Dev/
+/.dev/
+/private/
+/secrets/
+/scratch/
+
+# Legacy/current Darkstar local state that must never become source.
+/.darkstar/
+/.blacksun/
+/.darkstar-runtime/
+
+# Darkstar user data created inside a source checkout.
+/models/
+/projects/
+/venv/
+/.venv/
+/env/
+/.envdir/
+
+# Model payloads/projectors are user-supplied local data.
+*.gguf
+*.mproj
+
+# Runtime/session persistence: defense in depth if copied into the repo.
+chat-session.dscs
+workflow-session.dswf
+workflow-session.json
+dialog-locations.json
+
+# -----------------------------------------------------------------------------
+# Secrets, credentials, and machine-local configuration
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+/.npmrc
+/.pypirc
+/.netrc
+/.aws/
+/.ssh/
+/.gnupg/
+
+/credentials/
+**/credentials.json
+**/credentials.local.json
+**/secrets.json
+**/secrets.local.json
+**/service-account.json
+**/service-account-*.json
+**/*-service-account.json
+
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+id_ecdsa
+id_ecdsa.*
+id_dsa
+id_dsa.*
+
+# -----------------------------------------------------------------------------
+# Darkstar generated/runtime output
+# -----------------------------------------------------------------------------
+/dist/
+/release/
+/out/
+/build/
+/BUILD_MANIFEST_SHA256.txt
+
+# Electron is bootstrapped from the pinned official release asset.
+/backend/vendor/electron/win32-x64/
+
+# Native inference/runtime binaries are release inputs, not source.
+# Keep backend/bin documentation trackable; ignore notices materialized by the pinned bootstrap.
+/backend/bin/**/*.exe
+/backend/bin/**/*.dll
+/backend/bin/**/*.pdb
+/backend/bin/**/*.so
+/backend/bin/**/*.dylib
+/backend/bin/**/*.lib
+/backend/bin/**/*.exp
+/backend/bin/**/*.ilk
+/backend/bin/**/llama-server
+/backend/bin/**/llama-cli
+/backend/bin/.darkstar-bootstrap.json
+/backend/bin/licenses/llama.cpp-LICENSE
+/backend/bin/licenses/NVIDIA-CUDA-12.4-EULA.pdf
+/backend/bin.bootstrap-backup-*/
+/backend/bin/backends.bootstrap-backup-*/
+
+# Local diagnostics, traces, dumps, and crash artifacts.
+/backend/Dev/Diagnostics/
+*.log
+*.jsonl
+*.dmp
+*.core
+*.crash
+*.stackdump
+*.pid
+
+# -----------------------------------------------------------------------------
+# Dependency/cache output
+# -----------------------------------------------------------------------------
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage
+.coverage.*
+htmlcov/
+coverage/
+.tox/
+.nox/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# -----------------------------------------------------------------------------
+# Temporary, backup, and editor recovery files
+# -----------------------------------------------------------------------------
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+
+# -----------------------------------------------------------------------------
+# Local IDE / AI-editor state
+# -----------------------------------------------------------------------------
+.vscode/
+.idea/
+.vs/
+.cursor/
+.claude/
+.continue/
+.windsurf/
+.history/
+.aider*
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# -----------------------------------------------------------------------------
+# OS-local metadata/history
+# -----------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Thumbs.db:encryptable
+Desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+.bash_history
+.zsh_history
+.python_history
+.node_repl_history

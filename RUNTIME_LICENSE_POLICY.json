@@ -1,0 +1,183 @@
+{
+  "schemaVersion": 1,
+  "project": "Darkstar Harness",
+  "electron": {
+    "root": "backend/vendor/electron/win32-x64",
+    "sentinel": "electron.exe",
+    "versionFile": "version",
+    "required": false,
+    "notices": [
+      "backend/vendor/electron/win32-x64/LICENSE",
+      "backend/vendor/electron/win32-x64/LICENSES.chromium.html"
+    ],
+    "noticeChecks": {
+      "backend/vendor/electron/win32-x64/LICENSE": [
+        "Permission is hereby granted, free of charge",
+        "THE SOFTWARE IS PROVIDED"
+      ],
+      "backend/vendor/electron/win32-x64/LICENSES.chromium.html": [
+        "Chromium"
+      ]
+    },
+    "version": "43.2.0",
+    "bootstrap": {
+      "asset": "electron-v43.2.0-win32-x64.zip",
+      "url": "https://github.com/electron/electron/releases/download/v43.2.0/electron-v43.2.0-win32-x64.zip",
+      "sha256": "eba5f5088af40ecb364fe258809c79a5234c6ece5a75c64722772eba01b02786"
+    }
+  },
+  "backendBin": {
+    "root": "backend/bin",
+    "components": [
+      {
+        "id": "llama.cpp",
+        "name": "llama.cpp runtime",
+        "license": "MIT",
+        "patterns": [
+          "llama-server.exe",
+          "llama.dll",
+          "mtmd.dll",
+          "ggml*.dll",
+          "backends/*/llama*.exe",
+          "backends/*/llama*.dll",
+          "backends/*/mtmd.dll",
+          "backends/*/ggml*.dll"
+        ],
+        "notices": [
+          "backend/bin/licenses/llama.cpp-LICENSE"
+        ],
+        "noticeChecks": {
+          "backend/bin/licenses/llama.cpp-LICENSE": [
+            "Permission is hereby granted, free of charge",
+            "THE SOFTWARE IS PROVIDED"
+          ]
+        }
+      },
+      {
+        "id": "nvidia-cuda-runtime",
+        "name": "NVIDIA CUDA 12.4 runtime components",
+        "license": "NVIDIA CUDA Toolkit EULA 12.4",
+        "patterns": [
+          "cudart*.dll",
+          "cufft*.dll",
+          "cufftw*.dll",
+          "cublas*.dll",
+          "cublasLt*.dll",
+          "nvblas*.dll",
+          "cusparse*.dll",
+          "cusolver*.dll",
+          "curand*.dll",
+          "nppc*.dll",
+          "nppial*.dll",
+          "nppicc*.dll",
+          "nppicom*.dll",
+          "nppidei*.dll",
+          "nppif*.dll",
+          "nppig*.dll",
+          "nppim*.dll",
+          "nppist*.dll",
+          "nppisu*.dll",
+          "nppitc*.dll",
+          "npps*.dll",
+          "nvjpeg*.dll",
+          "nvrtc*.dll",
+          "nvrtc-builtins*.dll",
+          "nvvm*.dll",
+          "libnvJitLink*.dll",
+          "cupti*.dll",
+          "nvToolsExt*.dll",
+          "backends/cuda/cudart*.dll",
+          "backends/cuda/cufft*.dll",
+          "backends/cuda/cufftw*.dll",
+          "backends/cuda/cublas*.dll",
+          "backends/cuda/cublasLt*.dll",
+          "backends/cuda/nvblas*.dll",
+          "backends/cuda/cusparse*.dll",
+          "backends/cuda/cusolver*.dll",
+          "backends/cuda/curand*.dll",
+          "backends/cuda/nppc*.dll",
+          "backends/cuda/nppial*.dll",
+          "backends/cuda/nppicc*.dll",
+          "backends/cuda/nppicom*.dll",
+          "backends/cuda/nppidei*.dll",
+          "backends/cuda/nppif*.dll",
+          "backends/cuda/nppig*.dll",
+          "backends/cuda/nppim*.dll",
+          "backends/cuda/nppist*.dll",
+          "backends/cuda/nppisu*.dll",
+          "backends/cuda/nppitc*.dll",
+          "backends/cuda/npps*.dll",
+          "backends/cuda/nvjpeg*.dll",
+          "backends/cuda/nvrtc*.dll",
+          "backends/cuda/nvrtc-builtins*.dll",
+          "backends/cuda/nvvm*.dll",
+          "backends/cuda/libnvJitLink*.dll",
+          "backends/cuda/cupti*.dll",
+          "backends/cuda/nvToolsExt*.dll"
+        ],
+        "notices": [
+          "backend/bin/licenses/NVIDIA-CUDA-12.4-EULA.pdf"
+        ],
+        "noticeChecks": {},
+        "cudaRelease": "12.4",
+        "cudaMajor": 12
+      }
+    ],
+    "manualDeclarations": [],
+    "bootstrap": {
+      "bundleVersion": 2,
+      "build": "b10520",
+      "commit": "cd644c39545aac3dca63261f99a9bfc35956cb25",
+      "cudaRelease": "12.4",
+      "backends": {
+        "cpu": {
+          "label": "CPU",
+          "archives": [
+            {
+              "asset": "llama-b10520-bin-win-cpu-x64.zip",
+              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10520/llama-b10520-bin-win-cpu-x64.zip",
+              "sha256": "e91930be901cd7efd6fda1ed5343aea0aa77a5aac73a1a80e90e3b169677e874"
+            }
+          ]
+        },
+        "vulkan": {
+          "label": "Vulkan",
+          "archives": [
+            {
+              "asset": "llama-b10520-bin-win-vulkan-x64.zip",
+              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10520/llama-b10520-bin-win-vulkan-x64.zip",
+              "sha256": "53d0ed54e6993c25f0a69f7924617ece72d3983e9c22475a5a7a288f2fb75eb6"
+            }
+          ]
+        },
+        "cuda": {
+          "label": "CUDA 12.4",
+          "archives": [
+            {
+              "asset": "llama-b10520-bin-win-cuda-12.4-x64.zip",
+              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10520/llama-b10520-bin-win-cuda-12.4-x64.zip",
+              "sha256": "ea9c64786333f8052056fb3735d3edb95d4b9a5e4c816390d81c45ec8e59780f"
+            },
+            {
+              "asset": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10520/cudart-llama-bin-win-cuda-12.4-x64.zip",
+              "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"
+            }
+          ]
+        }
+      },
+      "noticeDownloads": [
+        {
+          "asset": "llama.cpp-LICENSE",
+          "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/cd644c39545aac3dca63261f99a9bfc35956cb25/LICENSE",
+          "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+        },
+        {
+          "asset": "NVIDIA-CUDA-12.4-EULA.pdf",
+          "url": "https://docs.nvidia.com/cuda/archive/12.4.0/pdf/EULA.pdf",
+          "sha256": "6ada441ae5a45a4a3d51ade8850fa2229fc6dd95de0c9da6e2cdd7a46701b844"
+        }
+      ]
+    }
+  }
+}
