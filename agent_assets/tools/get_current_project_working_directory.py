@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Darkstar tool: return the project folder currently used as workspace."""
 import sys as _darkstar_sys
 from pathlib import Path as _DarkstarPath

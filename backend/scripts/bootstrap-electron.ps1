@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 [CmdletBinding()]
 param()
 
@@ -30,6 +30,48 @@ function Test-ElectronRuntime([string]$Directory) {
     } catch { return $false }
 }
 
+function Invoke-DarkstarDownload([string]$Url, [string]$Destination) {
+    $CurlCandidates = @(
+        (Join-Path $env:SystemRoot 'System32\curl.exe'),
+        'curl.exe'
+    )
+    $CurlExe = $null
+    foreach ($Candidate in $CurlCandidates) {
+        if ([string]::IsNullOrWhiteSpace($Candidate)) { continue }
+        if ([IO.Path]::IsPathRooted($Candidate)) {
+            if (Test-Path -LiteralPath $Candidate -PathType Leaf) { $CurlExe = $Candidate; break }
+        } else {
+            $Resolved = Get-Command $Candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $Resolved) { $CurlExe = $Resolved.Source; break }
+        }
+    }
+
+    if ($null -ne $CurlExe) {
+        Write-Host '[Darkstar Harness] Download progress:'
+        $CurlArguments = @(
+            '--location', '--fail', '--show-error',
+            '--retry', '3', '--retry-delay', '1',
+            '--connect-timeout', '20',
+            '--progress-bar',
+            '--output', $Destination,
+            $Url
+        )
+        & $CurlExe @CurlArguments
+        if ($LASTEXITCODE -ne 0) { throw "curl.exe download failed with exit code $LASTEXITCODE." }
+        return
+    }
+
+    Write-Host '[Darkstar Harness] curl.exe is unavailable; using the compatibility downloader.'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $PreviousProgressPreference = $ProgressPreference
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Destination
+    } finally {
+        $ProgressPreference = $PreviousProgressPreference
+    }
+}
+
 function Test-PinnedArchive([string]$Archive) {
     if (-not (Test-Path -LiteralPath $Archive -PathType Leaf)) { return $false }
     try {
@@ -50,8 +92,7 @@ if (-not (Test-PinnedArchive $CachedZip)) {
     Remove-Item -LiteralPath $Partial -Force -ErrorAction SilentlyContinue
     Write-Host "[Darkstar Harness] Downloading Electron $ElectronVersion Windows x64 from the official Electron GitHub release..."
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -UseBasicParsing -Uri $AssetUrl -OutFile $Partial
+        Invoke-DarkstarDownload $AssetUrl $Partial
         $Actual = (Get-FileHash -LiteralPath $Partial -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($Actual -ne $ExpectedSha256) {
             throw "Electron archive SHA-256 mismatch. Expected $ExpectedSha256 but received $Actual. The file will not be installed."

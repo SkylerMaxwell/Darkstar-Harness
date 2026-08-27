@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Shared execution helpers for Darkstar's operating-system command tools.
 
 This module registers no tools. It provides consistent validation, workspace path
@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-from .tool_common import ToolInputError, get_working_directory, is_within, json_result, relative_display
+from .tool_common import ToolInputError, get_filesystem_access, get_working_directory, is_within, json_result, relative_display
 
 MAX_COMMAND_CHARS = 32_000
 MAX_STDIN_BYTES = 1_000_000
@@ -69,16 +69,18 @@ def require_boolean(value: Any, name: str, default: bool = False) -> bool:
 
 def resolve_command_directory(raw: Any, kwargs: dict[str, Any]) -> tuple[Path, Path]:
     root, _source = get_working_directory(kwargs)
+    access = get_filesystem_access(kwargs)
+    boundary = access["root"]
     if raw in (None, ""):
         directory = root
     else:
         if not isinstance(raw, str) or not raw.strip():
-            raise ToolInputError("working_directory must be a non-empty workspace-relative path.")
+            raise ToolInputError("working_directory must be a non-empty path.")
         supplied = Path(raw.strip()).expanduser()
         candidate = supplied if supplied.is_absolute() else root / supplied
         directory = candidate.resolve(strict=False)
-    if not is_within(root, directory):
-        raise ToolInputError("working_directory escapes the current project workspace.")
+    if boundary is not None and not is_within(boundary, directory):
+        raise ToolInputError(f"working_directory is outside Filesystem Access Level {access['level']}.")
     if not directory.exists():
         raise ToolInputError(f"working_directory does not exist: {raw}")
     if not directory.is_dir():

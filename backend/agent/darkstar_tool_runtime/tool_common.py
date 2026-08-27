@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Shared, non-tool helpers for Darkstar workspace Python tools.
 
 This module intentionally registers no callable tool.  Individual providers in this
@@ -25,6 +25,42 @@ class ToolInputError(ValueError):
 
 def json_result(**payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def request_yes_no(question: str) -> dict[str, Any]:
+    """Ask the user a Yes/No question while the current tool invocation remains in flight."""
+    text = str(question or "").strip()
+    if not text:
+        raise ToolInputError("A Yes/No question is required.")
+    return {"__darkstarAction": "ask_user_yes_no", "question": text}
+
+
+def request_attention(
+    *,
+    kind: str,
+    payload: dict[str, Any] | None = None,
+    title: str | None = None,
+    prompt: str | None = None,
+) -> dict[str, Any]:
+    """Request a privileged Darkstar action through the generic user-attention gate.
+
+    The Python tool itself performs no privileged action. Core keeps the current
+    tool invocation in flight, asks the user, and dispatches the registered action
+    handler only when the user chooses Allow. Reject terminates that same call.
+    """
+    normalized_kind = str(kind or "").strip().lower()
+    if not normalized_kind:
+        raise ToolInputError("Attention request kind is required.")
+    request: dict[str, Any] = {
+        "__darkstarAction": "request_attention",
+        "kind": normalized_kind,
+        "payload": dict(payload or {}),
+    }
+    if title is not None:
+        request["title"] = str(title)
+    if prompt is not None:
+        request["prompt"] = str(prompt)
+    return request
 
 
 def _mapping_candidates(value: Any) -> Iterable[dict[str, Any]]:
@@ -93,6 +129,52 @@ def get_working_directory(kwargs: dict[str, Any], *, must_exist: bool = True) ->
     return root, source or "unknown"
 
 
+def get_filesystem_access(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return the Core-issued filesystem boundary for the current tool call."""
+    raw = kwargs.get("filesystem_access")
+    configured = isinstance(raw, dict)
+    if not configured:
+        for mapping in _mapping_candidates(kwargs):
+            candidate = mapping.get("filesystem_access")
+            if isinstance(candidate, dict):
+                raw = candidate
+                configured = True
+                break
+    raw = raw if isinstance(raw, dict) else {}
+    level = str(raw.get("level") or "3").strip()
+    if level not in {"1", "2", "3"}:
+        level = "3"
+    workspace, _source = get_working_directory(kwargs)
+    root_value = str(raw.get("root") or "").strip()
+    if level == "1":
+        boundary = None
+    else:
+        boundary = Path(root_value).expanduser().resolve(strict=False) if root_value else workspace
+    return {
+        "level": level,
+        "mode": str(raw.get("mode") or ("unrestricted" if level == "1" else "working-directory")),
+        "root": boundary,
+        "working_directory": workspace,
+        "home_root": str(raw.get("homeRoot") or raw.get("home_root") or ""),
+        "unrestricted": level == "1",
+        "allow_subprocess": bool(raw.get("allowSubprocess") or raw.get("allow_subprocess")),
+        "internal_roots": tuple(
+            Path(value).expanduser().resolve(strict=False)
+            for value in (raw.get("internalRoots") or raw.get("internal_roots") or [])
+            if isinstance(value, str) and value.strip()
+        ),
+        "configured": configured,
+    }
+
+
+def filesystem_path_allowed(candidate: Path, kwargs: dict[str, Any]) -> bool:
+    access = get_filesystem_access(kwargs)
+    if access["unrestricted"]:
+        return True
+    boundary = access["root"]
+    return bool(boundary and is_within(boundary, candidate))
+
+
 def _normcase(path: Path) -> str:
     return os.path.normcase(str(path))
 
@@ -112,36 +194,43 @@ def resolve_workspace_path(
     must_exist: bool = False,
     allow_root: bool = True,
 ) -> tuple[Path, Path]:
-    root, _ = get_working_directory(kwargs)
+    workspace, _ = get_working_directory(kwargs)
+    access = get_filesystem_access(kwargs)
+    boundary = access["root"]
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise ToolInputError("A non-empty path is required.")
     supplied = Path(raw_path.strip()).expanduser()
-    lexical = supplied if supplied.is_absolute() else root / supplied
+    lexical = supplied if supplied.is_absolute() else workspace / supplied
     lexical = Path(os.path.abspath(os.path.normpath(str(lexical))))
-    if not is_within(root, lexical):
-        raise ToolInputError(f"Path escapes the current project working directory: {raw_path}")
+    if boundary is not None and not is_within(boundary, lexical):
+        raise ToolInputError(f"Path is outside Filesystem Access Level {access['level']}: {raw_path}")
 
-    # Resolve parent links but deliberately do not follow the final path component.
-    # This lets deletion remove an in-workspace symlink itself instead of deleting
-    # its target, while still rejecting a parent symlink that escapes the workspace.
-    if _normcase(lexical) == _normcase(root):
-        candidate = root
+    # Resolve parent links but deliberately do not follow a final symlink. This
+    # preserves safe deletion of an allowed symlink while preventing parent-link escapes.
+    if boundary is not None:
+        if _normcase(lexical) == _normcase(boundary):
+            candidate = boundary
+        else:
+            parent = lexical.parent.resolve(strict=False)
+            candidate = parent / lexical.name
+        if not is_within(boundary, candidate):
+            raise ToolInputError(f"Path resolves outside Filesystem Access Level {access['level']}: {raw_path}")
     else:
-        parent = lexical.parent.resolve(strict=False)
-        candidate = parent / lexical.name
-    if not is_within(root, candidate):
-        raise ToolInputError(f"Path escapes the current project working directory: {raw_path}")
-    if not allow_root and _normcase(candidate) == _normcase(root):
+        candidate = lexical
+    if not allow_root and _normcase(candidate) == _normcase(workspace):
         raise ToolInputError("This operation cannot target the project working directory itself.")
     if must_exist and not (candidate.exists() or candidate.is_symlink()):
         raise ToolInputError(f"Path does not exist: {raw_path}")
-    return root, candidate
+    return workspace, candidate
 
 
 def relative_display(root: Path, path: Path) -> str:
     if _normcase(root) == _normcase(path):
         return "."
-    return path.relative_to(root).as_posix()
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def ensure_regular_text_file(path: Path, *, max_bytes: int = MAX_TEXT_FILE_BYTES) -> None:

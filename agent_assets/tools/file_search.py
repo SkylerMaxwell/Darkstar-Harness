@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Darkstar tool: recursively search project text files for matching lines.
 
 This provider is self-contained and requires only the ``tools.registry`` module

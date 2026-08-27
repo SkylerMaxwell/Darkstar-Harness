@@ -1,4 +1,4 @@
-param([switch]$Persistent) # SPDX-License-Identifier: GPL-3.0-only
+param([switch]$Persistent) # SPDX-License-Identifier: Apache-2.0
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 

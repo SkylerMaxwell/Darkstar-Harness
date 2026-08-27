@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Generic host for trusted registry-based Python tool files.
 
 The selected file is imported in a child Python process. During import this host
@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import builtins
 import contextlib
+import contextvars
+import io
 import importlib.util
 import inspect
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import traceback
 import types
@@ -36,6 +40,8 @@ class ToolEntry:
     is_async: bool = False
     description: str = ""
     emoji: str = ""
+    permission: dict[str, Any] | str | None = None
+    filesystem: str | None = None
 
 
 class ToolRegistry:
@@ -53,6 +59,8 @@ class ToolRegistry:
         is_async: bool = False,
         description: str = "",
         emoji: str = "",
+        permission: dict[str, Any] | str | None = None,
+        filesystem: str | None = None,
         override: bool = False,
         **_metadata: Any,
     ) -> None:
@@ -73,6 +81,8 @@ class ToolRegistry:
             is_async=bool(is_async),
             description=str(description or ""),
             emoji=str(emoji or ""),
+            permission=permission,
+            filesystem=str(filesystem).strip().lower() if filesystem is not None else None,
         )
 
     def get(self, name: str) -> ToolEntry | None:
@@ -155,6 +165,12 @@ def _normalize_definition(entry: ToolEntry) -> dict[str, Any]:
         parameters = {"type": "object", "properties": {}, "additionalProperties": True}
     parameters.setdefault("type", "object")
     function["parameters"] = parameters
+    if entry.permission is not None:
+        function["x-darkstar-permission"] = entry.permission
+    if entry.filesystem is not None:
+        if entry.filesystem not in {"none", "scoped", "unrestricted"}:
+            raise ValueError(f"Tool {entry.name} has an invalid filesystem contract: {entry.filesystem}")
+        function["x-darkstar-filesystem"] = entry.filesystem
     return {"type": "function", "function": function}
 
 
@@ -225,6 +241,7 @@ def _call_handler(entry: ToolEntry, arguments: dict[str, Any], context: dict[str
         "enabled_tools": context.get("enabled_tools"),
         "workspace": context.get("workspace"),
         "skills_root": context.get("skills_root"),
+        "filesystem_access": context.get("filesystem_access"),
     }
     kwargs = {key: value for key, value in kwargs.items() if value is not None}
     with contextlib.redirect_stdout(sys.stderr):
@@ -234,6 +251,282 @@ def _call_handler(entry: ToolEntry, arguments: dict[str, Any], context: dict[str
     return result
 
 
+_active_filesystem_scope: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("darkstar_filesystem_scope", default=None)
+_guard_bypass: contextvars.ContextVar[bool] = contextvars.ContextVar("darkstar_filesystem_guard_bypass", default=False)
+_original_open = builtins.open
+_original_io_open = io.open
+_original_os_open = os.open
+_original_stat = os.stat
+_original_lstat = os.lstat
+_original_listdir = os.listdir
+_original_scandir = os.scandir
+_original_readlink = os.readlink
+_original_access = os.access
+_original_chdir = os.chdir
+_original_remove = os.remove
+_original_unlink = os.unlink
+_original_rmdir = os.rmdir
+_original_mkdir = os.mkdir
+_original_rename = os.rename
+_original_replace = os.replace
+_original_chmod = os.chmod
+_original_truncate = os.truncate
+_original_utime = os.utime
+_original_symlink = os.symlink
+_original_link = os.link
+_original_fchdir = getattr(os, 'fchdir', None)
+_original_exec_functions = {name: getattr(os, name) for name in ('execl', 'execle', 'execlp', 'execlpe', 'execv', 'execve', 'execvp', 'execvpe') if hasattr(os, name)}
+_original_spawn_functions = {name: getattr(os, name) for name in ('spawnl', 'spawnle', 'spawnlp', 'spawnlpe', 'spawnv', 'spawnve', 'spawnvp', 'spawnvpe') if hasattr(os, name)}
+_original_popen = subprocess.Popen
+_original_run = subprocess.run
+_original_call = subprocess.call
+_original_check_call = subprocess.check_call
+_original_check_output = subprocess.check_output
+_original_os_system = os.system
+_original_os_popen = os.popen
+
+
+def _scope_from_context(context: dict[str, Any]) -> dict[str, Any]:
+    raw = context.get("filesystem_access")
+    if not isinstance(raw, dict):
+        # Compatibility for direct/test hosts. Production ToolService always
+        # supplies a Core-issued scope before a model-triggered execution.
+        return {"level": "1", "root": None, "unrestricted": True, "allow_subprocess": True}
+    level = str(raw.get("level") or "3").strip()
+    if level not in {"1", "2", "3"}:
+        level = "3"
+    root_value = str(raw.get("root") or "").strip()
+    if level == "1":
+        root = None
+    elif root_value:
+        token = _guard_bypass.set(True)
+        try:
+            root = Path(root_value).expanduser().resolve(strict=False)
+        finally:
+            _guard_bypass.reset(token)
+    else:
+        workspace = str(context.get("workspace") or "").strip()
+        token = _guard_bypass.set(True)
+        try:
+            root = Path(workspace or os.getcwd()).expanduser().resolve(strict=False)
+        finally:
+            _guard_bypass.reset(token)
+    internal_roots: list[Path] = []
+    for value in raw.get("internalRoots") or raw.get("internal_roots") or []:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        token = _guard_bypass.set(True)
+        try:
+            internal_roots.append(Path(value).expanduser().resolve(strict=False))
+        finally:
+            _guard_bypass.reset(token)
+    return {
+        "level": level,
+        "root": root,
+        "internal_roots": tuple(internal_roots),
+        "unrestricted": level == "1",
+        "allow_subprocess": bool(raw.get("allowSubprocess") or raw.get("allow_subprocess")),
+    }
+
+
+def _inside(root: Path, candidate: Path) -> bool:
+    try:
+        return os.path.commonpath([os.path.normcase(str(root)), os.path.normcase(str(candidate))]) == os.path.normcase(str(root))
+    except ValueError:
+        return False
+
+
+def _guarded_candidate(raw: Any) -> Any:
+    scope = _active_filesystem_scope.get()
+    if scope is None or scope.get("unrestricted") or _guard_bypass.get() or isinstance(raw, int):
+        return raw
+    root = scope.get("root")
+    if not isinstance(root, Path):
+        raise PermissionError("Filesystem Access boundary is unavailable for this tool call.")
+    token = _guard_bypass.set(True)
+    try:
+        supplied = Path(os.fspath(raw)).expanduser()
+        lexical = supplied if supplied.is_absolute() else Path(os.getcwd()) / supplied
+        candidate = lexical.resolve(strict=False)
+    finally:
+        _guard_bypass.reset(token)
+    allowed_roots = (root, *tuple(scope.get("internal_roots") or ()))
+    if not any(isinstance(allowed_root, Path) and _inside(allowed_root, candidate) for allowed_root in allowed_roots):
+        raise PermissionError(f"Filesystem Access Level {scope['level']} denied path: {candidate}")
+    return os.fspath(raw)
+
+
+def _guarded_open(file: Any, *args: Any, **kwargs: Any):
+    _guarded_candidate(file)
+    return _original_open(file, *args, **kwargs)
+
+
+def _guarded_io_open(file: Any, *args: Any, **kwargs: Any):
+    _guarded_candidate(file)
+    return _original_io_open(file, *args, **kwargs)
+
+
+def _guarded_os_open(file: Any, *args: Any, **kwargs: Any):
+    _guarded_candidate(file)
+    return _original_os_open(file, *args, **kwargs)
+
+
+def _one_path(original: Callable[..., Any]) -> Callable[..., Any]:
+    def wrapped(path_value: Any, *args: Any, **kwargs: Any):
+        _guarded_candidate(path_value)
+        return original(path_value, *args, **kwargs)
+    return wrapped
+
+
+def _optional_path(original: Callable[..., Any]) -> Callable[..., Any]:
+    def wrapped(path_value: Any = '.', *args: Any, **kwargs: Any):
+        _guarded_candidate(path_value)
+        return original(path_value, *args, **kwargs)
+    return wrapped
+
+
+def _two_paths(original: Callable[..., Any]) -> Callable[..., Any]:
+    def wrapped(source: Any, destination: Any, *args: Any, **kwargs: Any):
+        _guarded_candidate(source)
+        _guarded_candidate(destination)
+        return original(source, destination, *args, **kwargs)
+    return wrapped
+
+
+def _restricted_scope() -> dict[str, Any] | None:
+    scope = _active_filesystem_scope.get()
+    if scope is None or scope.get('unrestricted') or _guard_bypass.get():
+        return None
+    return scope
+
+
+def _guarded_link_operation(kind: str, original: Callable[..., Any]) -> Callable[..., Any]:
+    def wrapped(source: Any, destination: Any, *args: Any, **kwargs: Any):
+        scope = _restricted_scope()
+        if scope is not None:
+            raise PermissionError(f"{kind} creation is blocked by Filesystem Access Level {scope.get('level', '3')} to prevent link-based boundary escapes.")
+        return original(source, destination, *args, **kwargs)
+    return wrapped
+
+
+def _guarded_fchdir(fd: int) -> None:
+    scope = _restricted_scope()
+    if scope is not None:
+        raise PermissionError(f"Descriptor-based chdir is blocked by Filesystem Access Level {scope.get('level', '3')}.")
+    if _original_fchdir is None:
+        raise AttributeError('os.fchdir is unavailable on this platform')
+    return _original_fchdir(fd)
+
+
+def _guarded_process_primitive(kind: str, original: Callable[..., Any]) -> Callable[..., Any]:
+    def wrapped(*args: Any, **kwargs: Any):
+        if not _subprocess_allowed():
+            scope = _active_filesystem_scope.get() or {}
+            raise PermissionError(f"{kind} is blocked by Filesystem Access Level {scope.get('level', '3')} for this tool.")
+        return original(*args, **kwargs)
+    return wrapped
+
+
+def _subprocess_allowed() -> bool:
+    scope = _active_filesystem_scope.get()
+    return scope is None or scope.get("unrestricted") or scope.get("allow_subprocess") is True
+
+
+def _guarded_popen(*args: Any, **kwargs: Any):
+    if not _subprocess_allowed():
+        scope = _active_filesystem_scope.get() or {}
+        raise PermissionError(f"Child-process execution is blocked by Filesystem Access Level {scope.get('level', '3')} for this tool.")
+    return _original_popen(*args, **kwargs)
+
+
+def _guarded_run(*args: Any, **kwargs: Any):
+    if not _subprocess_allowed():
+        scope = _active_filesystem_scope.get() or {}
+        raise PermissionError(f"Child-process execution is blocked by Filesystem Access Level {scope.get('level', '3')} for this tool.")
+    return _original_run(*args, **kwargs)
+
+
+def _guarded_call(*args: Any, **kwargs: Any):
+    if not _subprocess_allowed():
+        scope = _active_filesystem_scope.get() or {}
+        raise PermissionError(f"Child-process execution is blocked by Filesystem Access Level {scope.get('level', '3')} for this tool.")
+    return _original_call(*args, **kwargs)
+
+
+def _guarded_check_call(*args: Any, **kwargs: Any):
+    if not _subprocess_allowed():
+        scope = _active_filesystem_scope.get() or {}
+        raise PermissionError(f"Child-process execution is blocked by Filesystem Access Level {scope.get('level', '3')} for this tool.")
+    return _original_check_call(*args, **kwargs)
+
+
+def _guarded_check_output(*args: Any, **kwargs: Any):
+    if not _subprocess_allowed():
+        scope = _active_filesystem_scope.get() or {}
+        raise PermissionError(f"Child-process execution is blocked by Filesystem Access Level {scope.get('level', '3')} for this tool.")
+    return _original_check_output(*args, **kwargs)
+
+
+def _guarded_os_system(command: str) -> int:
+    if not _subprocess_allowed():
+        scope = _active_filesystem_scope.get() or {}
+        raise PermissionError(f"Child-process execution is blocked by Filesystem Access Level {scope.get('level', '3')} for this tool.")
+    return _original_os_system(command)
+
+
+def _guarded_os_popen(command: str, *args: Any, **kwargs: Any):
+    if not _subprocess_allowed():
+        scope = _active_filesystem_scope.get() or {}
+        raise PermissionError(f"Child-process execution is blocked by Filesystem Access Level {scope.get('level', '3')} for this tool.")
+    return _original_os_popen(command, *args, **kwargs)
+
+
+def _install_filesystem_guard() -> None:
+    builtins.open = _guarded_open
+    io.open = _guarded_io_open
+    os.open = _guarded_os_open
+    os.stat = _one_path(_original_stat)
+    os.lstat = _one_path(_original_lstat)
+    os.listdir = _optional_path(_original_listdir)
+    os.scandir = _optional_path(_original_scandir)
+    os.readlink = _one_path(_original_readlink)
+    os.access = _one_path(_original_access)
+    os.chdir = _one_path(_original_chdir)
+    os.remove = _one_path(_original_remove)
+    os.unlink = _one_path(_original_unlink)
+    os.rmdir = _one_path(_original_rmdir)
+    os.mkdir = _one_path(_original_mkdir)
+    os.rename = _two_paths(_original_rename)
+    os.replace = _two_paths(_original_replace)
+    os.chmod = _one_path(_original_chmod)
+    os.truncate = _one_path(_original_truncate)
+    os.utime = _one_path(_original_utime)
+    os.symlink = _guarded_link_operation('Symbolic-link', _original_symlink)
+    os.link = _guarded_link_operation('Hard-link', _original_link)
+    if _original_fchdir is not None:
+        os.fchdir = _guarded_fchdir
+    for name, original in _original_exec_functions.items():
+        setattr(os, name, _guarded_process_primitive(f'os.{name}', original))
+    for name, original in _original_spawn_functions.items():
+        setattr(os, name, _guarded_process_primitive(f'os.{name}', original))
+    subprocess.Popen = _guarded_popen
+    subprocess.run = _guarded_run
+    subprocess.call = _guarded_call
+    subprocess.check_call = _guarded_check_call
+    subprocess.check_output = _guarded_check_output
+    os.system = _guarded_os_system
+    os.popen = _guarded_os_popen
+
+
+@contextlib.contextmanager
+def _filesystem_scope(context: dict[str, Any]):
+    token = _active_filesystem_scope.set(_scope_from_context(context))
+    try:
+        yield
+    finally:
+        _active_filesystem_scope.reset(token)
+
+
 @contextlib.contextmanager
 def _working_directory(context: dict[str, Any]):
     workspace = context.get("workspace")
@@ -241,11 +534,11 @@ def _working_directory(context: dict[str, Any]):
         yield
         return
     previous = os.getcwd()
-    os.chdir(str(workspace))
+    _original_chdir(str(workspace))
     try:
         yield
     finally:
-        os.chdir(previous)
+        _original_chdir(previous)
 
 
 def _execute(name: str, arguments: Any, context: Any) -> Any:
@@ -256,7 +549,8 @@ def _execute(name: str, arguments: Any, context: Any) -> Any:
         raise TypeError("Tool arguments must be a JSON object")
     context_dict = context if isinstance(context, dict) else {}
     with _working_directory(context_dict):
-        return _call_handler(entry, arguments, context_dict)
+        with _filesystem_scope(context_dict):
+            return _call_handler(entry, arguments, context_dict)
 
 
 def _response(request_id: Any, success: bool, *, result: Any = None, error: str | None = None) -> dict[str, Any]:
@@ -307,6 +601,7 @@ def main() -> int:
     if tool_file.suffix.lower() != ".py" or not tool_file.is_file():
         raise FileNotFoundError(f"Select an existing .py tool file: {tool_file}")
     _install_bundled_python_dependencies()
+    _install_filesystem_guard()
     _load_tool_file(tool_file)
     if not registry.entries():
         raise RuntimeError("The selected Python file did not register any tools")

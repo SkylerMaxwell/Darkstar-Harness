@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Darkstar tool: pause the current agent run for a requested number of seconds."""
 from __future__ import annotations
 

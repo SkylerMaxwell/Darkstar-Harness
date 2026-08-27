@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Darkstar tool: execute commands with a non-login Linux shell."""
 from __future__ import annotations
 

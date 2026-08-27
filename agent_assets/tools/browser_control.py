@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: GPL-3.0-only
-"""Darkstar Browser Control with strict online browsing, spatial control, live Three.js diagnostics, and transactional modeling.
+# SPDX-License-Identifier: Apache-2.0
+"""Darkstar Browser Control with online browsing, spatial control, live Three.js diagnostics, and transactional modeling.
 
 This is the full Browser Control provider. It preserves the existing browser and
 Three.backend/renderer/modeling features and adds constrained spatial inspection and semantic
@@ -20,6 +20,7 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from tools.registry import registry
+from _darkstar_tool_common import get_filesystem_access
 
 PROVIDER_ID = "browser-control-spatial-threejs-modeler"
 PROVIDER_NAME = "Browser Control + Spatial Control + Three.js Debug + Modeler"
@@ -105,7 +106,7 @@ MAX_SOURCE_ISSUES = 60
 DEBUG_FILE_MARKER = "DARKSTAR THREE DEBUG COPY"
 
 DESCRIPTION = (
-    "Control Darkstar's isolated internal browser with native Chromium input in local OFFLINE mode or STRICT ONLINE mode, with deterministic spatial control for canvas/custom-rendered interfaces. "
+    "Control Darkstar's internal browser with native Chromium input in local OFFLINE mode or ONLINE mode, with deterministic spatial control for canvas/custom-rendered interfaces. "
     "For online browsing use open with url='https://…'; for workspace-local HTML use open with path='page.html'. Provide exactly one. "
     "Prefer interactive_map and stable refs for ordinary controls. interactive_map returns exact CSS-pixel boxes, centers, occlusion state, viewport size, devicePixelRatio, and a short-lived layout id. "
     "Use get_element_coordinates or scroll_into_view for an exact current ref position, and hit_test/inspect_at_point to identify what receives input at a CSS-pixel point. "
@@ -113,7 +114,7 @@ DESCRIPTION = (
     "Then use grid_overlay for a labeled screenshot, grid_click for one cell, or grid_drag for a semantic move such as E2 to E4. Darkstar resolves cell coordinates from the live grid immediately before input; do not estimate board coordinates from screenshots. "
     "Use annotated_screenshot to label visible interactive elements with their stable refs. Use wait_for_stable before measuring highly animated layouts. "
     "For difficult local Three.js work use threejs_source_audit, threejs_open_debug, threejs_audit, threejs_profile, threejs_object, and threejs_model. "
-    "Arbitrary evaluate is for workspace-local pages only and is rejected by the secure online host. Online pages remain in Darkstar's separate ephemeral browser compartment. "
+    "Arbitrary evaluate is for workspace-local pages only and is rejected by the online host. Online pages use a separate browser session. "
     "Three.js r184 is preloaded as window.THREE before local page scripts."
 )
 
@@ -144,7 +145,7 @@ SCHEMA = {
                 "minLength": 1,
                 "maxLength": 4096,
                 "pattern": "^https://",
-                "description": "HTTPS address for action='open' in STRICT ONLINE mode. Provide url or path, never both.",
+                "description": "HTTPS address for action='open' in ONLINE mode. Provide url or path, never both.",
             },
             "ref": {
                 "type": "string",
@@ -228,7 +229,7 @@ SCHEMA = {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 64_000,
-                "description": "JavaScript statement body for evaluate on workspace-local pages only. Secure online pages reject arbitrary evaluation. Use return to provide a result.",
+                "description": "JavaScript statement body for evaluate on workspace-local pages only. Online pages reject arbitrary evaluation. Use return to provide a result.",
             },
             "layout_id": {
                 "type": "string",
@@ -409,7 +410,7 @@ def _validated_online_url(value: Any) -> str:
         raise ValueError("url must not exceed 4096 characters")
     parsed = urlsplit(url)
     if parsed.scheme.lower() != "https" or not parsed.hostname:
-        raise ValueError("STRICT ONLINE mode accepts only absolute https:// URLs")
+        raise ValueError("ONLINE mode accepts only absolute https:// URLs")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("Online URLs must not contain embedded credentials")
     return url
@@ -447,17 +448,32 @@ def _is_within(root: Path, candidate: Path) -> bool:
         return False
 
 
+def _filesystem_boundary(kwargs: dict[str, Any]) -> Path | None:
+    access = get_filesystem_access(kwargs)
+    root = access.get("root")
+    return root if isinstance(root, Path) else None
+
+
+def _display_path(workspace: Path, candidate: Path) -> str:
+    try:
+        return candidate.relative_to(workspace).as_posix()
+    except ValueError:
+        return str(candidate)
+
+
 def _resolve_html(raw_path: Any, kwargs: dict[str, Any], *, must_exist: bool = True) -> tuple[Path, Path, str]:
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise ValueError("path is required")
-    root = _workspace_root(kwargs)
+    workspace = _workspace_root(kwargs)
+    boundary = _filesystem_boundary(kwargs)
+    access = get_filesystem_access(kwargs)
     supplied = Path(raw_path.strip()).expanduser()
-    lexical = supplied if supplied.is_absolute() else root / supplied
+    lexical = supplied if supplied.is_absolute() else workspace / supplied
     lexical = Path(os.path.abspath(os.path.normpath(str(lexical))))
     parent = lexical.parent.resolve(strict=False)
     candidate = parent / lexical.name
-    if not _is_within(root, candidate):
-        raise ValueError("path must stay inside the current project workspace")
+    if boundary is not None and not _is_within(boundary, candidate):
+        raise ValueError(f"path is outside Filesystem Access Level {access['level']}")
     if candidate.suffix.lower() not in {".html", ".htm"}:
         raise ValueError("path must identify an .html or .htm file")
     if must_exist:
@@ -465,11 +481,15 @@ def _resolve_html(raw_path: Any, kwargs: dict[str, Any], *, must_exist: bool = T
             raise ValueError(f"HTML file does not exist: {raw_path}")
         if candidate.is_symlink():
             raise ValueError("Symbolic-link HTML files are not accepted")
+        resolved = candidate.resolve(strict=True)
+        if boundary is not None and not _is_within(boundary, resolved):
+            raise ValueError(f"HTML file resolves outside Filesystem Access Level {access['level']}")
+        candidate = resolved
         if not candidate.is_file():
             raise ValueError("path is not a regular file")
         if candidate.stat().st_size > MAX_HTML_BYTES:
             raise ValueError(f"HTML file exceeds the {MAX_HTML_BYTES // (1024 * 1024)} MiB debug limit")
-    return root, candidate, candidate.relative_to(root).as_posix()
+    return workspace, candidate, _display_path(workspace, candidate)
 
 
 def _read_html(path: Path) -> str:
@@ -541,6 +561,8 @@ def _resolve_local_reference(html_path: Path, reference: str) -> Path | None:
 
 def _source_audit(raw_path: Any, kwargs: dict[str, Any], include_info: bool = False) -> dict[str, Any]:
     root, path, display = _resolve_html(raw_path, kwargs)
+    boundary = _filesystem_boundary(kwargs)
+    access = get_filesystem_access(kwargs)
     source = _read_html(path)
     lower = source.lower()
     issues: list[dict[str, Any]] = []
@@ -573,15 +595,15 @@ def _source_audit(raw_path: Any, kwargs: dict[str, Any], include_info: bool = Fa
         if local is None:
             continue
         checked_assets += 1
-        if not _is_within(root, local):
+        if boundary is not None and not _is_within(boundary, local):
             _source_issue(
                 issues,
                 "error",
-                "ASSET_OUTSIDE_WORKSPACE",
-                "A referenced local asset resolves outside the active workspace.",
+                "ASSET_OUTSIDE_FILESYSTEM_ACCESS",
+                f"A referenced local asset resolves outside Filesystem Access Level {access['level']}.",
                 line=_line_number(source, offset),
                 evidence=ref[:180],
-                fix="Move the asset into the workspace and update the relative path.",
+                fix="Move the asset inside the active Filesystem Access boundary and update the relative path.",
             )
         elif not local.exists():
             missing_assets.append(ref)
@@ -741,7 +763,7 @@ def _open_debug(raw_path: Any, kwargs: dict[str, Any], timer_ms: int | None) -> 
     if generated.exists():
         existing = _read_html(generated)
         if DEBUG_FILE_MARKER not in existing[:1000]:
-            raise ValueError(f"Refusing to overwrite non-debug file: {generated.relative_to(root).as_posix()}")
+            raise ValueError(f"Refusing to overwrite non-debug file: {_display_path(root, generated)}")
     instrumented = _inject_debug_bootstrap(source, display)
     temporary = generated.with_name(generated.name + f".tmp-{os.getpid()}")
     try:
@@ -755,7 +777,7 @@ def _open_debug(raw_path: Any, kwargs: dict[str, Any], timer_ms: int | None) -> 
     request: dict[str, Any] = {
         "__darkstarAction": "browser_control",
         "action": "open",
-        "path": generated.relative_to(root).as_posix(),
+        "path": _display_path(root, generated),
         "snapshot_mode": "all",
         "max_elements": 160,
     }
@@ -766,6 +788,7 @@ def _open_debug(raw_path: Any, kwargs: dict[str, Any], timer_ms: int | None) -> 
 
 def _cleanup_debug(raw_path: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     root = _workspace_root(kwargs)
+    boundary = _filesystem_boundary(kwargs)
     removed: list[str] = []
     if raw_path:
         _root, original, _display = _resolve_html(raw_path, kwargs)
@@ -783,7 +806,7 @@ def _cleanup_debug(raw_path: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
                 if name.endswith((".darkstar-three-debug.html", ".darkstar-three-debug.htm")) and name.startswith("."):
                     candidates.append(Path(directory, name))
     for candidate in candidates:
-        if not _is_within(root, candidate) or not candidate.exists() or candidate.is_symlink() or not candidate.is_file():
+        if (boundary is not None and not _is_within(boundary, candidate)) or not candidate.exists() or candidate.is_symlink() or not candidate.is_file():
             continue
         try:
             raw_prefix = candidate.open("rb").read(4096)
@@ -793,7 +816,7 @@ def _cleanup_debug(raw_path: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
         if DEBUG_FILE_MARKER not in prefix:
             continue
         candidate.unlink()
-        removed.append(candidate.relative_to(root).as_posix())
+        removed.append(_display_path(root, candidate))
     return {"success": True, "action": "threejs_cleanup_debug", "removed": removed, "removed_count": len(removed)}
 
 
@@ -1252,4 +1275,5 @@ registry.register(
     schema=SCHEMA,
     handler=handler,
     description=DESCRIPTION,
+    filesystem="scoped",
 )

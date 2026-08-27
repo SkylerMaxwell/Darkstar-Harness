@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 [CmdletBinding()]
 param()
 
@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $Root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
-$PolicyPath = Join-Path $Root 'RUNTIME_LICENSE_POLICY.json'
+$PolicyPath = Join-Path $Root 'backend\runtime-component-policy.json'
 $Destination = Join-Path $Root 'backend\bin'
 $BackendsDestination = Join-Path $Destination 'backends'
 $ReceiptPath = Join-Path $Destination '.darkstar-bootstrap.json'
@@ -17,7 +17,7 @@ if (-not (Test-Path -LiteralPath $PolicyPath -PathType Leaf)) {
 
 $Policy = Get-Content -LiteralPath $PolicyPath -Raw | ConvertFrom-Json
 $Bootstrap = $Policy.backendBin.bootstrap
-if ($null -eq $Bootstrap) { throw 'RUNTIME_LICENSE_POLICY.json does not define backendBin.bootstrap.' }
+if ($null -eq $Bootstrap) { throw 'backend/runtime-component-policy.json does not define backendBin.bootstrap.' }
 
 $BundleVersion = [int]$Bootstrap.bundleVersion
 $LlamaBuild = [string]$Bootstrap.build
@@ -62,6 +62,48 @@ function Test-PinnedFile([string]$FilePath, [string]$ExpectedSha256) {
     } catch { return $false }
 }
 
+function Invoke-DarkstarDownload([string]$Url, [string]$Destination) {
+    $CurlCandidates = @(
+        (Join-Path $env:SystemRoot 'System32\curl.exe'),
+        'curl.exe'
+    )
+    $CurlExe = $null
+    foreach ($Candidate in $CurlCandidates) {
+        if ([string]::IsNullOrWhiteSpace($Candidate)) { continue }
+        if ([IO.Path]::IsPathRooted($Candidate)) {
+            if (Test-Path -LiteralPath $Candidate -PathType Leaf) { $CurlExe = $Candidate; break }
+        } else {
+            $Resolved = Get-Command $Candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $Resolved) { $CurlExe = $Resolved.Source; break }
+        }
+    }
+
+    if ($null -ne $CurlExe) {
+        Write-Host '[Darkstar Harness] Download progress:'
+        $CurlArguments = @(
+            '--location', '--fail', '--show-error',
+            '--retry', '3', '--retry-delay', '1',
+            '--connect-timeout', '20',
+            '--progress-bar',
+            '--output', $Destination,
+            $Url
+        )
+        & $CurlExe @CurlArguments
+        if ($LASTEXITCODE -ne 0) { throw "curl.exe download failed with exit code $LASTEXITCODE." }
+        return
+    }
+
+    Write-Host '[Darkstar Harness] curl.exe is unavailable; using the compatibility downloader.'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $PreviousProgressPreference = $ProgressPreference
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Destination
+    } finally {
+        $ProgressPreference = $PreviousProgressPreference
+    }
+}
+
 function Get-VerifiedDownload($Asset, [string[]]$AllowedHosts) {
     $Name = [string]$Asset.asset
     $Url = [string]$Asset.url
@@ -82,8 +124,7 @@ function Get-VerifiedDownload($Asset, [string[]]$AllowedHosts) {
     Remove-Item -LiteralPath $Partial -Force -ErrorAction SilentlyContinue
     Write-Host "[Darkstar Harness] Downloading pinned $Name..."
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Partial
+        Invoke-DarkstarDownload $Url $Partial
         $Actual = (Get-FileHash -LiteralPath $Partial -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($Actual -ne $ExpectedSha256) {
             throw "SHA-256 mismatch for $Name. Expected $ExpectedSha256 but received $Actual. The file will not be installed."

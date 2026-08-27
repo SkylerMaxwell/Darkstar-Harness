@@ -1,13 +1,14 @@
 {
   "name": "darkstar",
   "version": "1.2.1",
-  "description": "Darkstar Harness - private local AI client with a compartmentalized secure browser",
+  "description": "Darkstar Harness - local AI client with an embedded browser",
   "main": "../Darkstar_Core.js",
   "scripts": {
+    "bootstrap-python": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ../scripts/bootstrap-python.ps1",
     "bootstrap-electron": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ../scripts/bootstrap-electron.ps1",
     "bootstrap-llamacpp": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ../scripts/bootstrap-llamacpp.ps1",
-    "start": "npm run bootstrap-electron && npm run bootstrap-llamacpp && node ../Darkstar_Core.js --darkstar-command=start",
-    "build": "npm run bootstrap-electron && npm run bootstrap-llamacpp && node ../Darkstar_Core.js --darkstar-command=build",
+    "start": "npm run bootstrap-python && npm run bootstrap-electron && npm run bootstrap-llamacpp && node ../Darkstar_Core.js --darkstar-command=start",
+    "build": "npm run bootstrap-python && npm run bootstrap-electron && npm run bootstrap-llamacpp && node ../Darkstar_Core.js --darkstar-command=build",
     "vendor-runtime": "node ../Darkstar_Core.js --darkstar-command=vendor-runtime",
     "test": "node --test ../Dev/Darkstar_Tests.js",
     "quality": "node ../Darkstar_Core.js --darkstar-command=quality",
@@ -33,15 +34,12 @@
       "agent_assets/",
       "workflows/",
       "README.md",
-      "LICENSE",
-      "THIRD_PARTY_NOTICES.md",
-      "RUNTIME_LICENSE_POLICY.json",
-      "LICENSING.md"
+      "LICENSE"
     ],
     "asarUnpack": [
       "agent_assets/tools/**",
       "agent_assets/skills/**"
     ]
   },
-  "license": "GPL-3.0-only"
+  "license": "Apache-2.0"
 }

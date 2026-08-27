@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 <html lang="en">
 <head>
     <meta http-equiv="Content-Security-Policy" content="default-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:*; media-src 'self' data: blob:; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none';">
@@ -102,6 +102,15 @@
                     <span class="node-editor-sidebar-label">Traces</span>
                 </button>
                 <div class="node-editor-sidebar-divider" aria-hidden="true"></div>
+                <button class="node-editor-sidebar-button" id="nodePermissionPolicyButton" type="button" title="Model action permissions" aria-label="Model action permissions" aria-expanded="false" aria-controls="permissionPolicyPanel">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 19 6v5c0 4.6-2.8 8-7 10-4.2-2-7-5.4-7-10V6z"></path><path d="m9.2 12 1.8 1.8 3.8-4"></path></svg>
+                    <span class="node-editor-sidebar-label node-editor-sidebar-label-stacked"><span>Auth</span><span>Controls</span></span>
+                </button>
+                <button class="node-editor-sidebar-button" id="nodeFilesystemAccessButton" type="button" title="Filesystem Access · Level 2 · User Profile" aria-label="Filesystem Access · Level 2 · User Profile" aria-expanded="false" aria-controls="filesystemAccessPanel" data-level="2">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 7.5h6l2 2h9v9.5h-17z"></path><path d="M12 11.5v5"></path><path d="M9.5 14 12 16.5 14.5 14"></path></svg>
+                    <span class="node-editor-sidebar-label node-editor-sidebar-label-stacked"><span>Filesystem</span><span>Access</span></span>
+                </button>
+                <div class="node-editor-sidebar-divider" aria-hidden="true"></div>
                 <button class="node-editor-sidebar-button" id="nodeChatAutosaveButton" type="button" title="Autosave Chats: On · Click to stop saving open chat tabs" aria-label="Autosave Chats: On" aria-pressed="true">
                     <svg class="node-sidebar-chat-save" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5.5h16v10H9l-5 4z"></path><path d="M9 9h6M9 12h4"></path><path d="M17.5 15.5v5M15 18h5"></path></svg>
                     <span class="node-editor-sidebar-label node-editor-sidebar-label-stacked"><span>Autosave</span><span>Chats</span></span>
@@ -116,6 +125,43 @@
                     <span class="node-editor-sidebar-label">Deep Blue</span>
                 </button>
             </nav>
+            <section class="permission-policy-panel" id="permissionPolicyPanel" hidden aria-labelledby="permissionPolicyTitle">
+                <div class="permission-policy-header">
+                    <div>
+                        <div class="permission-policy-eyebrow">MODEL ACTION PERMISSIONS</div>
+                        <div class="permission-policy-title" id="permissionPolicyTitle">Authorization level</div>
+                    </div>
+                    <button class="permission-policy-close" id="permissionPolicyClose" type="button" aria-label="Close permission settings">×</button>
+                </div>
+                <div class="permission-policy-body authorization-policy-body">
+                    <input class="permission-policy-slider authorization-policy-slider" id="permissionPolicySlider" type="range" min="1" max="5" step="1" value="2" aria-label="Model action permission level">
+                    <div class="permission-policy-stages authorization-policy-stages" id="permissionPolicyStages"></div>
+                </div>
+                <div class="permission-policy-current">
+                    <strong id="permissionPolicyCurrentLabel">Boundary Guard</strong>
+                    <span id="permissionPolicyCurrentDescription">Ask only before actions that can affect state outside this workspace.</span>
+                </div>
+                <div class="permission-policy-error" id="permissionPolicyError" role="alert" aria-live="polite"></div>
+            </section>
+            <section class="filesystem-access-panel permission-policy-panel" id="filesystemAccessPanel" hidden aria-labelledby="filesystemAccessTitle">
+                <div class="permission-policy-header">
+                    <div>
+                        <div class="permission-policy-eyebrow">TOOL FILESYSTEM SANDBOX</div>
+                        <div class="permission-policy-title" id="filesystemAccessTitle">Filesystem Access</div>
+                    </div>
+                    <button class="permission-policy-close" id="filesystemAccessClose" type="button" aria-label="Close Filesystem Access settings">×</button>
+                </div>
+                <div class="permission-policy-body filesystem-access-body">
+                    <input class="permission-policy-slider filesystem-access-slider" id="filesystemAccessSlider" type="range" min="0" max="2" step="1" value="1" aria-label="Filesystem Access level">
+                    <div class="permission-policy-stages filesystem-access-stages" id="filesystemAccessStages"></div>
+                </div>
+                <div class="permission-policy-current">
+                    <strong id="filesystemAccessCurrentLabel">Level 2 · User Profile</strong>
+                    <span id="filesystemAccessCurrentDescription">Tools may access only files and folders under the current OS user profile directory.</span>
+                    <span class="filesystem-access-boundary" id="filesystemAccessBoundary"></span>
+                </div>
+                <div class="permission-policy-error" id="filesystemAccessError" role="alert" aria-live="polite"></div>
+            </section>
             <div class="node-editor-toast" id="nodeEditorToast" role="status" aria-live="polite" aria-hidden="true"></div>
             <div class="grid-canvas" id="gridCanvas">
                 <div class="grid-pattern-major" id="gridPatternMajor"></div>
@@ -158,7 +204,7 @@
             <button class="tab-new" id="newTabButton" type="button" aria-label="New chat tab">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
             </button>
-            <button class="tab-bar-browser-toggle offline-browser-toggle" id="offlineBrowserToggle" type="button" title="Toggle Secure Browser (Ctrl+Shift+B)" aria-label="Toggle Secure Browser" aria-pressed="false">
+            <button class="tab-bar-browser-toggle offline-browser-toggle" id="offlineBrowserToggle" type="button" title="Toggle Browser (Ctrl+Shift+B)" aria-label="Toggle Browser" aria-pressed="false">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 8h18"></path><path d="M7 6h.01M10 6h.01"></path></svg>
                 <span class="tab-bar-browser-label">Browser</span>
             </button>
@@ -203,34 +249,34 @@
         </div>
 
         <div class="offline-browser-resize-handle" id="offlineBrowserResizeHandle" title="Resize browser" aria-hidden="true"></div>
-        <aside class="offline-browser-sidebar" id="offlineBrowserSidebar" aria-label="Secure side browser" aria-hidden="true">
+        <aside class="offline-browser-sidebar" id="offlineBrowserSidebar" aria-label="Browser" aria-hidden="true">
             <div class="offline-browser-toolbar">
                 <button class="offline-browser-icon-button" id="offlineBrowserBack" type="button" title="Back" aria-label="Back" disabled>‹</button>
                 <button class="offline-browser-icon-button" id="offlineBrowserForward" type="button" title="Forward" aria-label="Forward" disabled>›</button>
                 <button class="offline-browser-icon-button" id="offlineBrowserReload" type="button" title="Reload page" aria-label="Reload page">↻</button>
                 <div class="offline-browser-address-wrap">
-                    <span class="offline-browser-lock" id="offlineBrowserPrivacyBadge" title="Strict privacy mode">STRICT</span>
+                    <span class="offline-browser-mode-badge" id="offlineBrowserModeBadge" title="Browser mode">LOCAL</span>
                     <input id="offlineBrowserAddress" class="offline-browser-address" type="text" placeholder="https://example.com or workspace/page.html" spellcheck="false">
                 </div>
                 <button class="offline-browser-open-button" id="offlineBrowserOpenButton" type="button" title="Open address">Go</button>
                 <button class="offline-browser-icon-button" id="offlineBrowserChooseFileButton" type="button" title="Choose local HTML" aria-label="Choose local HTML">⌂</button>
-                <button class="offline-browser-icon-button" id="offlineBrowserReset" type="button" title="Destroy this online session and start a new private session" aria-label="Start a new private browser session" disabled>◇</button>
+                <button class="offline-browser-icon-button" id="offlineBrowserReset" type="button" title="Restart online browser session" aria-label="Restart online browser session" disabled>◇</button>
                 <button class="offline-browser-icon-button close" id="offlineBrowserCloseButton" type="button" title="Close browser" aria-label="Close browser">×</button>
             </div>
             <div class="offline-browser-title-row">
-                <span class="offline-browser-title" id="offlineBrowserTitle">Secure Browser</span>
+                <span class="offline-browser-title" id="offlineBrowserTitle">Browser</span>
                 <span class="offline-browser-network-state" id="offlineBrowserNetworkState">Local files only</span>
             </div>
-            <div class="offline-browser-viewport" id="offlineBrowserViewport" tabindex="0" aria-label="Secure browser viewport">
-                <img class="offline-browser-online-frame" id="offlineBrowserOnlineFrame" alt="Secure online browser frame" draggable="false">
+            <div class="offline-browser-viewport" id="offlineBrowserViewport" tabindex="0" aria-label="Browser viewport">
+                <img class="offline-browser-online-frame" id="offlineBrowserOnlineFrame" alt="Browser page" draggable="false">
                 <div class="offline-browser-placeholder">
                     <div class="offline-browser-placeholder-icon">WEB</div>
-                    <strong>Secure browsing compartment</strong>
-                    <span>Enter an HTTPS address for an ephemeral, proxy-confined online session, or open a workspace HTML file offline. Private-network access, common trackers, downloads, popups, device and clipboard access, and cross-site cookie headers are blocked.</span>
+                    <strong>Browser</strong>
+                    <span>Enter a web address, or open an HTML file from the current workspace.</span>
                     <button type="button" id="offlineBrowserFocusAddressButton">Enter address</button>
                 </div>
             </div>
-            <div class="offline-browser-footer" id="offlineBrowserStatus">Secure Browser · no page loaded</div>
+            <div class="offline-browser-footer" id="offlineBrowserStatus">Browser · no page loaded</div>
         </aside>
 
         <main class="main-content">
@@ -268,6 +314,20 @@
                             <span>Choose a workspace directory before chatting with the model.</span>
                         </div>
                         <button type="button" id="projectDirectoryChooseButton">Choose Directory</button>
+                    </div>
+                    <div class="agent-attention-card" id="agentAttentionCard" hidden role="alert" aria-live="assertive" aria-labelledby="agentAttentionTitle">
+                        <div class="agent-attention-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a7 7 0 0 0-7 7v3.7L3.6 16h16.8L19 13.7V10a7 7 0 0 0-7-7Z"></path><path d="M9.7 19a2.5 2.5 0 0 0 4.6 0"></path></svg>
+                        </div>
+                        <div class="agent-attention-copy">
+                            <div class="agent-attention-heading"><strong id="agentAttentionTitle">Permission required</strong><span id="agentAttentionCount" hidden></span></div>
+                            <span id="agentAttentionPrompt">A model action is waiting for your decision.</span>
+                            <span class="agent-attention-error" id="agentAttentionError" role="status"></span>
+                        </div>
+                        <div class="agent-attention-actions">
+                            <button type="button" id="agentAttentionAllow" class="agent-attention-primary">Allow</button>
+                            <button type="button" id="agentAttentionReject">Reject</button>
+                        </div>
                     </div>
                     <div class="input-wrapper">
                         <div class="composer-context-contract-notice" id="composerContextContractNotice" role="status" aria-live="polite" aria-hidden="true" hidden>Context contract exceeded. Try increasing the context length, starting a new conversation, or deleting old messages.</div>
@@ -357,13 +417,32 @@
             </div>
             <div class="workflow-file-name-section" id="workflowFileNameSection">
                 <label class="workflow-file-field-label" for="workflowFileNameInput">Name</label>
-                <input class="workflow-file-name-input" id="workflowFileNameInput" type="text" autocomplete="off" spellcheck="false" placeholder="Enter workflow name" aria-describedby="workflowFileNameHint workflowFileModalError">
+                <div class="workflow-file-location-row">
+                    <div class="workflow-file-history-controls" id="workflowFileHistoryControls" aria-label="Folder history" hidden>
+                        <button class="workflow-file-history-button" id="workflowFileBackButton" type="button" title="Back" aria-label="Back" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13.5 6 7.5 12l6 6M8 12h9"/></svg></button>
+                        <button class="workflow-file-history-button" id="workflowFileForwardButton" type="button" title="Forward" aria-label="Forward" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10.5 6 6 6-6 6M16 12H7"/></svg></button>
+                    </div>
+                    <input class="workflow-file-name-input" id="workflowFileNameInput" type="text" autocomplete="off" spellcheck="false" placeholder="Enter workflow name" aria-describedby="workflowFileNameHint workflowFileModalError">
+                </div>
                 <div class="workflow-file-name-hint" id="workflowFileNameHint">A name is required. The saved file will use the .dswf extension.</div>
             </div>
-            <div class="workflow-file-picker-section">
+            <div class="workflow-file-picker-section" id="workflowFilePickerSection">
                 <div class="workflow-file-picker-label" id="workflowFilePickerLabel">Existing workflows</div>
-                <div class="workflow-file-list" id="workflowFileList" role="listbox" aria-labelledby="workflowFilePickerLabel"></div>
-                <div class="workflow-file-empty" id="workflowFileEmpty" hidden>No .dswf workflows are currently saved in ./workflows.</div>
+                <div class="workflow-file-picker-body">
+                    <nav class="workflow-file-sidebar" id="workflowFileSidebar" aria-label="Locations" hidden>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="desktop"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><span>Desktop</span></button>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="downloads"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg><span>Downloads</span></button>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="documents"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3.5h8l4 4V20.5H6zM14 3.5v4h4M9 12h6M9 16h6"/></svg><span>Documents</span></button>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="pictures"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="16" rx="2"/><circle cx="9" cy="9" r="1.5"/><path d="m6 17 4-4 3 3 2-2 3 3"/></svg><span>Pictures</span></button>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="music"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 17.5V6l9-2v11.5M9 7.5l9-2M6.5 20a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Zm9 0a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z"/></svg><span>Music</span></button>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="videos"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M8 5v14M16 5v14M3.5 10h17M3.5 14h17"/></svg><span>Videos</span></button>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="this-pc"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="12" rx="2"/><path d="M8 20h8M12 16v4M6.5 7.5h11"/></svg><span>This PC</span></button>
+                    </nav>
+                    <div class="workflow-file-list-pane">
+                        <div class="workflow-file-list" id="workflowFileList" role="listbox" aria-labelledby="workflowFilePickerLabel"></div>
+                        <div class="workflow-file-empty" id="workflowFileEmpty" hidden>No .dswf workflows are currently saved in ./workflows.</div>
+                    </div>
+                </div>
             </div>
             <div class="workflow-file-modal-error" id="workflowFileModalError" role="alert" aria-live="polite"></div>
             <div class="workflow-file-modal-buttons">

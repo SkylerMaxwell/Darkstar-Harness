@@ -30,7 +30,3 @@ jobs:
       - name: Verify source, policy, and regressions
         run: npm --prefix backend/shell run verify
 
-      - name: Rebuild Windows launcher
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: ./backend/scripts/build-windows-launcher.ps1

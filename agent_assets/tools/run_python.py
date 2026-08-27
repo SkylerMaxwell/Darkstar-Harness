@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Darkstar tool: execute Python in a constrained per-call subprocess."""
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 from tools.registry import registry
-from _darkstar_tool_common import ToolInputError, get_working_directory, require_int
+from _darkstar_tool_common import ToolInputError, get_filesystem_access, get_working_directory, require_int
 
 ALLOWED_IMPORT_ROOTS = {
     "PIL", "pypdf", "reportlab", "docx", "pptx", "openpyxl",
@@ -40,9 +40,10 @@ BLOCKED_ATTRIBUTE_PARTS = {
 SCHEMA = {
     "name": "run_python",
     "description": (
-        "Execute Python code in a fresh, isolated subprocess rooted in a per-call folder under the "
-        "current project. Network and child-process operations are blocked, writes are confined to the "
-        "run folder, execution has a timeout and output limits, and generated files are returned. "
+        "Execute Python code in a fresh, isolated subprocess. Filesystem reads and writes honor the "
+        "current Filesystem Access level: Level 1 permits OS-account filesystem access, Level 2 is limited "
+        "to the user profile, and Level 3 is limited to the active working directory. Network and nested "
+        "child-process operations remain blocked, execution has a timeout and output limits, and generated files are returned. "
         "Available document libraries include Pillow, pypdf, ReportLab, python-docx, python-pptx, and "
         "openpyxl. This is a constrained application sandbox, not a hardened virtual machine."
     ),
@@ -85,8 +86,13 @@ WORKER = r'''
 import builtins, contextlib, io, json, os, pathlib, site, socket, subprocess, sys, traceback
 sandbox = pathlib.Path(sys.argv[1]).resolve()
 workspace = pathlib.Path(sys.argv[2]).resolve()
+filesystem_level = str(sys.argv[3] if len(sys.argv) > 3 else "3")
+filesystem_root_raw = str(sys.argv[4] if len(sys.argv) > 4 else str(workspace))
+filesystem_root = pathlib.Path(filesystem_root_raw).resolve(strict=False) if filesystem_level != "1" else None
 code_path = sandbox / "program.py"
-allowed_read_roots = [sandbox, workspace, pathlib.Path(sys.base_prefix).resolve(), pathlib.Path(sys.prefix).resolve()]
+allowed_read_roots = [sandbox, pathlib.Path(sys.base_prefix).resolve(), pathlib.Path(sys.prefix).resolve()]
+if filesystem_root is not None:
+    allowed_read_roots.append(filesystem_root)
 for package_root in [*site.getsitepackages(), site.getusersitepackages()]:
     if package_root:
         candidate = pathlib.Path(package_root).resolve(strict=False)
@@ -116,10 +122,11 @@ real_open = builtins.open
 def guarded_open(file, mode="r", *args, **kwargs):
     p = checked_path(file)
     writing = any(flag in mode for flag in "wax+")
-    if writing and not inside(sandbox, p):
-        raise PermissionError(f"Sandbox write denied: {p}")
-    if not writing and p not in allowed_read_files and not any(inside(root, p) for root in allowed_read_roots):
-        raise PermissionError(f"Sandbox read denied: {p}")
+    if filesystem_level != "1":
+        if writing and (filesystem_root is None or not inside(filesystem_root, p)):
+            raise PermissionError(f"Filesystem Access Level {filesystem_level} write denied: {p}")
+        if not writing and p not in allowed_read_files and not any(inside(root, p) for root in allowed_read_roots):
+            raise PermissionError(f"Filesystem Access Level {filesystem_level} read denied: {p}")
     return real_open(p, mode, *args, **kwargs)
 
 builtins.open = guarded_open
@@ -127,8 +134,8 @@ io.open = guarded_open
 
 def sandbox_write_path(raw):
     p = checked_path(raw)
-    if not inside(sandbox, p):
-        raise PermissionError(f"Sandbox mutation denied: {p}")
+    if filesystem_level != "1" and (filesystem_root is None or not inside(filesystem_root, p)):
+        raise PermissionError(f"Filesystem Access Level {filesystem_level} mutation denied: {p}")
     return p
 
 real_remove = os.remove
@@ -142,9 +149,9 @@ real_os_open = os.open
 
 def read_path(raw):
     p = checked_path(raw)
-    if p in allowed_read_files or any(inside(root, p) for root in allowed_read_roots):
+    if filesystem_level == "1" or p in allowed_read_files or any(inside(root, p) for root in allowed_read_roots):
         return p
-    raise PermissionError(f"Sandbox read denied: {p}")
+    raise PermissionError(f"Filesystem Access Level {filesystem_level} read denied: {p}")
 
 def guarded_os_open(path, flags, *args, **kwargs):
     writing = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
@@ -215,6 +222,8 @@ namespace = {
     "__file__": str(code_path),
     "OUTPUT_DIR": str(sandbox),
     "WORKSPACE_DIR": str(workspace),
+    "FILESYSTEM_ACCESS_LEVEL": filesystem_level,
+    "FILESYSTEM_ACCESS_ROOT": str(filesystem_root) if filesystem_root is not None else None,
 }
 try:
     source = code_path.read_text(encoding="utf-8")
@@ -245,12 +254,16 @@ def handler(args, **kwargs):
     validate_code(code)
     timeout = require_int(args.get("timeout_seconds"), "timeout_seconds", 30, 1, 60)
     root, _source = get_working_directory(kwargs)
+    filesystem_access = get_filesystem_access(kwargs)
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     run_dir = root / ".darkstar" / "python_runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "program.py").write_text(code, encoding="utf-8", newline="")
     (run_dir / "_runner.py").write_text(WORKER, encoding="utf-8", newline="")
-    command = [sys.executable, "-B", str(run_dir / "_runner.py"), str(run_dir), str(root)]
+    access_root = filesystem_access["root"]
+    command = [sys.executable, "-B", str(run_dir / "_runner.py"), str(run_dir), str(root),
+        filesystem_access["level"], str(access_root or root),
+    ]
     environment = {
         "PATH": os.environ.get("PATH", ""),
         "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
@@ -299,6 +312,8 @@ def handler(args, **kwargs):
         "duration_ms": duration_ms,
         "run_directory": run_dir.relative_to(root).as_posix(),
         "files": _list_outputs(run_dir),
+        "filesystem_access_level": filesystem_access["level"],
+        "filesystem_access_root": str(access_root) if access_root is not None else None,
     })
     if completed.stderr and not payload.get("stderr"):
         payload["stderr"] = completed.stderr

@@ -1,6 +1,17 @@
 {
   "schemaVersion": 1,
   "project": "Darkstar Harness",
+  "python": {
+    "version": "3.11.9",
+    "requiredSeries": "3.11",
+    "architecture": "amd64",
+    "installer": "backend/vendor/python/python-3.11.9-amd64.exe",
+    "source": "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe",
+    "sha256": "5ee42c4eee1e6b4464bb23722f90b45303f79442df63083f05322f1785f5fdde",
+    "publisher": "Python Software Foundation",
+    "license": "PSF-2.0",
+    "notice": "backend/vendor/python/PYTHON-LICENSE.txt"
+  },
   "electron": {
     "root": "backend/vendor/electron/win32-x64",
     "sentinel": "electron.exe",
@@ -126,17 +137,17 @@
     "manualDeclarations": [],
     "bootstrap": {
       "bundleVersion": 2,
-      "build": "b10520",
-      "commit": "cd644c39545aac3dca63261f99a9bfc35956cb25",
+      "build": "b10645",
+      "commit": "c5fc7e34885ba31217e330809437afa993d27745",
       "cudaRelease": "12.4",
       "backends": {
         "cpu": {
           "label": "CPU",
           "archives": [
             {
-              "asset": "llama-b10520-bin-win-cpu-x64.zip",
-              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10520/llama-b10520-bin-win-cpu-x64.zip",
-              "sha256": "e91930be901cd7efd6fda1ed5343aea0aa77a5aac73a1a80e90e3b169677e874"
+              "asset": "llama-b10645-bin-win-cpu-x64.zip",
+              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10645/llama-b10645-bin-win-cpu-x64.zip",
+              "sha256": "d3a82793b79701cff48323ebf18d3f0a4384d54aacd502e13cc3c30fa09653b2"
             }
           ]
         },
@@ -144,9 +155,9 @@
           "label": "Vulkan",
           "archives": [
             {
-              "asset": "llama-b10520-bin-win-vulkan-x64.zip",
-              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10520/llama-b10520-bin-win-vulkan-x64.zip",
-              "sha256": "53d0ed54e6993c25f0a69f7924617ece72d3983e9c22475a5a7a288f2fb75eb6"
+              "asset": "llama-b10645-bin-win-vulkan-x64.zip",
+              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10645/llama-b10645-bin-win-vulkan-x64.zip",
+              "sha256": "2dbb1b161252d0caf704a20a00a111fdc53b1f77812787e3ab87c3ef726b9666"
             }
           ]
         },
@@ -154,13 +165,13 @@
           "label": "CUDA 12.4",
           "archives": [
             {
-              "asset": "llama-b10520-bin-win-cuda-12.4-x64.zip",
-              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10520/llama-b10520-bin-win-cuda-12.4-x64.zip",
-              "sha256": "ea9c64786333f8052056fb3735d3edb95d4b9a5e4c816390d81c45ec8e59780f"
+              "asset": "llama-b10645-bin-win-cuda-12.4-x64.zip",
+              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10645/llama-b10645-bin-win-cuda-12.4-x64.zip",
+              "sha256": "c172f30312a8830795fba4b08f4ac027777f62505d61653b07b896c43898c86a"
             },
             {
               "asset": "cudart-llama-bin-win-cuda-12.4-x64.zip",
-              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10520/cudart-llama-bin-win-cuda-12.4-x64.zip",
+              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10645/cudart-llama-bin-win-cuda-12.4-x64.zip",
               "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"
             }
           ]
@@ -169,7 +180,7 @@
       "noticeDownloads": [
         {
           "asset": "llama.cpp-LICENSE",
-          "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/cd644c39545aac3dca63261f99a9bfc35956cb25/LICENSE",
+          "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/c5fc7e34885ba31217e330809437afa993d27745/LICENSE",
           "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
         },
         {

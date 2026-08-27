@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Internal Python runtime support for Darkstar tool providers.
 
 These modules are application infrastructure. They do not register model-facing

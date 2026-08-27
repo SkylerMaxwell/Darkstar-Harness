@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
+/* SPDX-License-Identifier: Apache-2.0 */
 /* Node editor controls only. This file is loaded by the node-editor runtime in backend/renderer/nodes/editor/core.js. */
 
 .node-editor-view .node-port-input,
@@ -475,6 +475,37 @@
 .node-editor-view .node-action-button:disabled {
     opacity: 0.42;
     cursor: wait;
+}
+
+.node-editor-view .node-local-browser-field {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 34px;
+    align-items: end;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.node-editor-view .node-local-browser-field > .node-param {
+    min-width: 0;
+    margin-bottom: 0;
+}
+
+.node-editor-view .node-action-button.node-local-browser-button {
+    width: 34px;
+    min-width: 34px;
+    height: 34px;
+    min-height: 34px;
+    padding: 0;
+    border-color: rgba(255, 255, 255, 0.11);
+    background: linear-gradient(180deg, rgba(24, 24, 24, 0.98), rgba(13, 13, 13, 0.98));
+    font-size: 18px;
+    line-height: 1;
+}
+
+.node-editor-view .node-action-button.node-local-browser-button:hover,
+.node-editor-view .node-action-button.node-local-browser-button:focus-visible {
+    border-color: rgba(249, 115, 22, 0.70);
+    background: linear-gradient(180deg, rgba(31, 31, 31, 0.99), rgba(16, 16, 16, 0.99));
 }
 
 .node-editor-view .node-agent-description {
@@ -1445,6 +1476,9 @@ html[data-theme]:not([data-theme='quantum']) .node-search-badge { background: co
 html[data-theme]:not([data-theme='quantum']) .node-editor-view .node-action-button { border-color: var(--theme-border); background: var(--theme-panel-soft); color: var(--theme-text-soft); }
 html[data-theme]:not([data-theme='quantum']) .node-editor-view .node-action-button:hover:not(:disabled) { border-color: color-mix(in srgb, var(--theme-blue) 34%, transparent); background: var(--theme-panel-hover); color: var(--theme-text-strong); }
 html[data-theme]:not([data-theme='quantum']) .node-editor-view .node-action-button.secondary { color: var(--theme-text-faint); }
+html[data-theme]:not([data-theme='quantum']) .node-editor-view .node-action-button.node-local-browser-button { border-color: var(--theme-border); background: var(--theme-panel-soft); color: var(--theme-text-soft); }
+html[data-theme]:not([data-theme='quantum']) .node-editor-view .node-action-button.node-local-browser-button:hover,
+html[data-theme]:not([data-theme='quantum']) .node-editor-view .node-action-button.node-local-browser-button:focus-visible { border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: var(--theme-panel-hover); color: var(--theme-text-strong); }
 html[data-theme]:not([data-theme='quantum']) .node-editor-view .node-agent-description { color: var(--theme-text-faint); }
 html[data-theme]:not([data-theme='quantum']) .node-editor-view .node-toggle-control { border-color: var(--theme-border); background: color-mix(in srgb, var(--bg-secondary) 78%, transparent); }
 html[data-theme]:not([data-theme='quantum']) .node-editor-view .node-toggle-control:hover { border-color: var(--theme-border-strong); background: var(--theme-hover); }

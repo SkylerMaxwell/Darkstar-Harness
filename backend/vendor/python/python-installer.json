@@ -1,0 +1,10 @@
+{
+  "version": "3.11.9",
+  "requiredSeries": "3.11",
+  "architecture": "amd64",
+  "asset": "python-3.11.9-amd64.exe",
+  "source": "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe",
+  "sha256": "5ee42c4eee1e6b4464bb23722f90b45303f79442df63083f05322f1785f5fdde",
+  "publisher": "Python Software Foundation",
+  "licenseFile": "PYTHON-LICENSE.txt"
+}

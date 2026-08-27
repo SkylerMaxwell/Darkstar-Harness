@@ -1,4 +1,4 @@
-'use strict'; // SPDX-License-Identifier: GPL-3.0-only
+'use strict'; // SPDX-License-Identifier: Apache-2.0
 
 // ============================================================================
 // DARKSTAR REGRESSION TEST MONOLITH
@@ -663,12 +663,36 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const {
+    agentInputBody,
     buildAgentRequest,
     retryInstruction,
     streamAgent,
 } = require('../../runtime/agent-loop');
 const { performChatCompletion } = require('../../runtime/chat-completion');
 const { diagnosticLlamaEnvironment, diagnosticServerArguments } = require('../../runtime/generation-diagnostics');
+
+test('agent runtime capability projection follows the loaded projector across turns, not renderer hints', async () => {
+    const seen = [];
+    const screenshot = { type: 'function', function: { name: 'screenshot_html', description: 'Capture HTML.', parameters: { type: 'object', properties: {} } } };
+    const runtime = {
+        loadedProjectorPath: null,
+        normalizeChatRequest(request) { return { model: request.model || 'model.gguf', messages: structuredClone(request.messages || []), stream: true }; },
+        toolService: {
+            hasApplicationInterfaceTargets() { return false; },
+            async buildRuntime(configuration) {
+                seen.push(configuration.visionEnabled);
+                return { definitions: configuration.visionEnabled ? [screenshot] : [], toolChoice: 'auto', catalog: '' };
+            },
+        },
+    };
+    const base = { model: 'model.gguf', messages: [{ role: 'user', content: 'same conversation' }], tools: { providers: [] }, skills: { skills: [] } };
+    const hidden = await agentInputBody(runtime, { ...base, vision: { enabled: true } });
+    assert.equal(Object.hasOwn(hidden, 'tools'), false, 'renderer hints must not expose vision tools before a projector is actually loaded');
+    runtime.loadedProjectorPath = 'C:\\Models\\mmproj.gguf';
+    const visible = await agentInputBody(runtime, { ...base, vision: { enabled: false } });
+    assert.deepEqual(seen, [false, true]);
+    assert.deepEqual(visible.tools.map((entry) => entry.function.name), ['screenshot_html'], 'the next turn in the same conversation must expose vision tools after projector attach');
+});
 
 test('tool-enabled local generation never invents a 4096-token output cap', () => {
     const baseBody = {
@@ -976,7 +1000,7 @@ test('API custom plugin registers exactly the requested loader and sampler witho
 
     const workflow = fs.readFileSync(path.join(root, 'workflows/darkstar-workflow.dswf'));
     assert.equal(workflow.includes(Buffer.from('com.darkstar.api-model')), false);
-    assert.equal(crypto.createHash('sha256').update(workflow).digest('hex'), '4eef9fcbea1d33f9055c401b33089a199af2a53c06992b116da2e98db082eb90');
+    assert.equal(crypto.createHash('sha256').update(workflow).digest('hex'), 'ea552a384d11efdbccc0e62e263565a5c08843e1ecc85a0d20a2e8c1c68fce9c');
     const workflowSource = read('backend/renderer/workflow.js');
     assert.doesNotMatch(workflowSource, /com\.darkstar\.api-model/u);
     assert.match(read('backend/renderer/send.js'), /request && typeof request.generateTitle/u);
@@ -1243,7 +1267,7 @@ test('Tools node never renders or migrates Application Interface as a tool provi
     assert.doesNotMatch(source, /name:\s*'Application Interface'|function\s+uipProvider\s*\(/u);
     assert.match(source, /if \(!id \|\| id === 'uip'\) return null;/u);
     assert.match(source, /delete node\.params\.uipToolMigrationVersion;/u);
-    assert.match(source, /providers:\s*\[screenshotProvider\(\), browserControlProvider\(\), timeoutProvider\(\)\]/u);
+    assert.match(source, /providers:\s*\[screenshotProvider\(\), browserControlProvider\(\), timeoutProvider\(\), askUserYesNoProvider\(\)\]/u);
 });
 
 
@@ -1271,6 +1295,7 @@ test('legacy Tools-node state physically drops a persisted locked builtin:uip ro
         uipToolMigrationVersion: 1,
         browserControlToolMigrationVersion: 1,
         timeoutToolMigrationVersion: 1,
+        askUserYesNoToolMigrationVersion: 1,
         maxRoundsMigrationVersion: 2,
         maxRounds: 'auto',
         toolChoice: 'auto',
@@ -1279,6 +1304,28 @@ test('legacy Tools-node state physically drops a persisted locked builtin:uip ro
     assert.equal(node.params.providers.some((provider) => provider && provider.kind === 'builtin' && provider.id === 'uip'), false);
     assert.equal(Object.prototype.hasOwnProperty.call(node.params, 'uipToolMigrationVersion'), false);
     assert.deepEqual(Array.from(node.params.providers, (provider) => provider.path), ['custom.py']);
+});
+
+test('existing Tools nodes receive Ask User Yes/No exactly once through the versioned bundled-tool migration', () => {
+    let definition = null;
+    const sandbox = {
+        document: { getElementById() { return null; } },
+        Darkstar: { nodes: { controls: {}, PORT_TYPES: { TOOLS: 'TOOLS' }, registerNode(value) { definition = value; } } },
+    };
+    sandbox.window = sandbox; sandbox.globalThis = sandbox;
+    const context = vm.createContext(sandbox);
+    vm.runInContext(read('backend/renderer/nodes/builtin/common.js'), context, { filename: 'backend/renderer/nodes/builtin/common.js' });
+    vm.runInContext(read('backend/renderer/nodes/builtin/tools.js'), context, { filename: 'backend/renderer/nodes/builtin/tools.js' });
+    const node = { params: {
+        providers: [{ kind: 'python', path: 'custom.py', name: 'Custom', toolCount: 1 }],
+        browserControlToolMigrationVersion: 1, timeoutToolMigrationVersion: 1, maxRoundsMigrationVersion: 2,
+        maxRounds: 'auto', toolChoice: 'auto',
+    } };
+    definition.normalizeNode(node);
+    assert.equal(node.params.askUserYesNoToolMigrationVersion, 1);
+    assert.equal(node.params.providers.filter((provider) => provider.path === 'agent_assets/tools/ask_user_yes_no.py').length, 1);
+    definition.normalizeNode(node);
+    assert.equal(node.params.providers.filter((provider) => provider.path === 'agent_assets/tools/ask_user_yes_no.py').length, 1, 'migration must be idempotent');
 });
 
 test('Tools node collapses relative/absolute aliases after inspection and preserves the portable workflow reference', async () => {
@@ -1319,6 +1366,7 @@ test('Tools node collapses relative/absolute aliases after inspection and preser
         ],
         browserControlToolMigrationVersion: 1,
         timeoutToolMigrationVersion: 1,
+        askUserYesNoToolMigrationVersion: 1,
         maxRoundsMigrationVersion: 2,
         maxRounds: 'auto',
         toolChoice: 'auto',
@@ -1336,6 +1384,7 @@ test('Tools node collapses relative/absolute aliases after inspection and preser
         ],
         browserControlToolMigrationVersion: 1,
         timeoutToolMigrationVersion: 1,
+        askUserYesNoToolMigrationVersion: 1,
         maxRoundsMigrationVersion: 2,
         maxRounds: 'auto',
         toolChoice: 'auto',
@@ -1408,6 +1457,93 @@ test('Application Interface model function is injected by harness only for the a
     await service.shutdown();
 });
 
+test('tool runtime hides screenshot capabilities when the active model has no projector', async () => {
+    const screenshotDefinition = { type: 'function', function: {
+        name: 'screenshot_html', description: 'Capture HTML.',
+        parameters: { type: 'object', properties: {}, additionalProperties: false },
+    } };
+    const browserDefinition = { type: 'function', function: {
+        name: 'browser_control', description: 'Browser with screenshot and grid helpers.',
+        parameters: { type: 'object', required: ['action'], additionalProperties: false, properties: {
+            action: { type: 'string', enum: ['open', 'snapshot', 'screenshot', 'annotated_screenshot', 'grid_inspect', 'grid_overlay', 'grid_click', 'grid_drag', 'grid_clear'], description: 'Use screenshot and grid_overlay when useful.' },
+            annotation_mode: { type: 'string', enum: ['interactive', 'grid', 'all'], description: 'Screenshot overlay mode.' },
+            grid_id: { type: 'string' }, grid_ref: { type: 'string' }, grid_target: { type: 'string' },
+            grid_rows: { type: 'integer' }, grid_columns: { type: 'integer' }, grid_label_mode: { type: 'string' },
+            grid_orientation: { type: 'string' }, cell: { type: 'string' }, from_cell: { type: 'string' }, to_cell: { type: 'string' }, verify: { type: 'boolean' },
+        } },
+    } };
+    const starts = [];
+    const registry = {
+        inspections: new Map(), hosts: new Map(),
+        resolvePath(reference) { return String(reference.path); },
+        async inspect(reference) {
+            const sourcePath = String(reference.path);
+            const definition = sourcePath.includes('screenshot') ? screenshotDefinition : browserDefinition;
+            return { scriptPath: sourcePath, provider: { id: sourcePath, name: sourcePath, protocol: 1, path: sourcePath, tools: [definition], unavailable: [] } };
+        },
+        async hostFor(reference) { starts.push(String(reference.path)); return { call() { throw new Error('fixture host must not execute'); } }; },
+        async shutdown() {},
+    };
+    const service = new ToolService({ baseDir: root, pythonRegistry: registry });
+    const runtime = await service.buildRuntime({ visionEnabled: false, providers: [
+        { kind: 'python', path: 'screenshot.py' }, { kind: 'python', path: 'browser.py' },
+    ] });
+    assert.deepEqual(runtime.definitions.map((entry) => entry.function.name), ['browser_control']);
+    assert.equal(runtime.handlers.has('screenshot_html'), false);
+    assert.deepEqual(runtime.providers.map((provider) => provider.path), ['browser.py']);
+    assert.deepEqual(starts, ['browser.py'], 'a hidden screenshot-only provider must not start a Python host');
+    const browser = runtime.definitions[0].function;
+    assert.deepEqual(browser.parameters.properties.action.enum, ['open', 'snapshot']);
+    assert.equal('annotation_mode' in browser.parameters.properties, false);
+    assert.doesNotMatch(JSON.stringify(browser), /screenshot|grid_(?:inspect|overlay|click|drag|clear)/iu);
+    await service.shutdown();
+});
+
+test('tool runtime exposes screenshot capabilities unchanged when projector vision is active', async () => {
+    const screenshotDefinition = { type: 'function', function: { name: 'screenshot_html', description: 'Capture HTML.', parameters: { type: 'object', properties: {}, additionalProperties: false } } };
+    const browserDefinition = { type: 'function', function: { name: 'browser_control', description: 'Browser screenshot controls.', parameters: { type: 'object', required: ['action'], additionalProperties: false, properties: {
+        action: { type: 'string', enum: ['snapshot', 'screenshot', 'annotated_screenshot', 'grid_inspect', 'grid_overlay', 'grid_click', 'grid_drag', 'grid_clear'] }, annotation_mode: { type: 'string' },
+    } } } };
+    const starts = [];
+    const registry = {
+        inspections: new Map(), hosts: new Map(), resolvePath(reference) { return String(reference.path); },
+        async inspect(reference) { const sourcePath = String(reference.path), definition = sourcePath.includes('screenshot') ? screenshotDefinition : browserDefinition; return { scriptPath: sourcePath, provider: { id: sourcePath, name: sourcePath, protocol: 1, path: sourcePath, tools: [definition], unavailable: [] } }; },
+        async hostFor(reference) { starts.push(String(reference.path)); return { call() { throw new Error('fixture host must not execute'); } }; }, async shutdown() {},
+    };
+    const service = new ToolService({ baseDir: root, pythonRegistry: registry });
+    const runtime = await service.buildRuntime({ visionEnabled: true, providers: [{ kind: 'python', path: 'screenshot.py' }, { kind: 'python', path: 'browser.py' }] });
+    assert.deepEqual(runtime.definitions.map((entry) => entry.function.name), ['screenshot_html', 'browser_control']);
+    assert.deepEqual(runtime.definitions[1].function.parameters.properties.action.enum, browserDefinition.function.parameters.properties.action.enum);
+    assert.deepEqual(starts, ['screenshot.py', 'browser.py']);
+    await service.shutdown();
+});
+
+test('Application Interface schemas hide only image-producing actions without projector vision', async () => {
+    const uipService = {
+        listTargets: () => [{ id: 'uip-1', appType: 'chromium', capabilities: { chromium: { available: true }, windowsUia: { available: true } } }],
+        async chromiumInterfaceControl() { return { success: true }; }, async windowsUiaControl() { return { success: true }; },
+    };
+    const service = new ToolService({ baseDir: root, uipService });
+    const hidden = await service.buildRuntime({ workspaceId: 'p', uipScopeId: 'p', providers: [], toolChoice: 'none', visionEnabled: false });
+    const chromium = hidden.definitions.find((entry) => entry.function.name === 'UIP_Chromium_Interface_Element').function.parameters.properties;
+    const uia = hidden.definitions.find((entry) => entry.function.name === 'UIP_Windows_UI_Automation').function.parameters.properties;
+    assert.equal(chromium.action.enum.includes('screenshot'), false);
+    assert.equal(chromium.action.enum.includes('annotated_screenshot'), false);
+    assert.equal(chromium.action.enum.includes('grid_overlay'), false);
+    assert.equal(chromium.action.enum.includes('grid_inspect'), true);
+    assert.equal('annotation_mode' in chromium, false);
+    assert.equal(uia.action.enum.includes('screenshot'), false);
+
+    const visible = await service.buildRuntime({ workspaceId: 'p', uipScopeId: 'p', providers: [], toolChoice: 'none', visionEnabled: true });
+    const visibleChromium = visible.definitions.find((entry) => entry.function.name === 'UIP_Chromium_Interface_Element').function.parameters.properties;
+    const visibleUia = visible.definitions.find((entry) => entry.function.name === 'UIP_Windows_UI_Automation').function.parameters.properties;
+    assert.equal(visibleChromium.action.enum.includes('screenshot'), true);
+    assert.equal(visibleChromium.action.enum.includes('annotated_screenshot'), true);
+    assert.equal(visibleChromium.action.enum.includes('grid_overlay'), true);
+    assert.equal(visibleUia.action.enum.includes('screenshot'), true);
+    await service.shutdown();
+});
+
 test('slash and auto-compact bridge path no longer depends on nodes.services.getBridge', () => {
     const source = read('backend/renderer/commands.js');
     assert.doesNotMatch(source, /Darkstar\.nodes\.services\.getBridge|nodes\.services\.getBridge/u);
@@ -1430,13 +1566,13 @@ const { spawnSync } = require('node:child_process');
 const test = require('node:test');
 
 const ROOT = path.resolve(__dirname, '..', '..', '..');
-const { AppPythonEnvironment, comparablePath } = require('../../agent/python-environment');
+const { AppPythonEnvironment, comparablePath, launcherArgs } = require('../../agent/python-environment');
 const { PythonProviderRegistry } = require('../../agent/python-provider-registry');
 const { createTerminalToolProvider } = require('../../agent/builtin/terminal-tools');
 
 function bootstrapPython() {
     const candidates = process.platform === 'win32'
-        ? [['py', ['-3']], ['python', []], ['python3', []]]
+        ? [['py', ['-3.11']], ['python', []], ['python3', []]]
         : [['python3', []], ['python', []]];
     for (const [executable, prefix] of candidates) {
         const probe = spawnSync(executable, [...prefix, '-B', '-c', 'import sys; raise SystemExit(0 if sys.version_info[0] == 3 else 1)'], {
@@ -1618,6 +1754,12 @@ test('root-level venv is excluded from repository audits and build manifests', (
         const source = fs.readFileSync(path.join(ROOT, relativePath), 'utf8');
         assert.match(source, /['"]venv['"]/u, `${relativePath} must ignore the generated root venv`);
     }
+});
+
+test('Windows Python launcher is pinned to the 3.11 series', () => {
+    assert.deepEqual(launcherArgs('py', ['-B', '-c', 'pass'], 'win32'), ['-3.11', '-B', '-c', 'pass']);
+    assert.deepEqual(launcherArgs('C:\\Windows\\py.exe', ['-m', 'venv', 'x'], 'win32'), ['-3.11', '-m', 'venv', 'x']);
+    assert.deepEqual(launcherArgs('python.exe', ['-B'], 'win32'), ['-B']);
 });
 
 test('Windows venv probes compare paths case-insensitively', () => {
@@ -2129,6 +2271,7 @@ test('the default workflow uses canonical provider paths and automatic round bud
 
     const paths = bundledPythonProviders().map((provider) => provider.path);
     assert.ok(paths.includes('agent_assets/tools/screenshot_html.py'));
+    assert.ok(paths.includes('agent_assets/tools/ask_user_yes_no.py'));
     assert.ok(paths.includes('agent_assets/tools/pdf_tools.py'));
     assert.ok(paths.includes('agent_assets/tools/windows_cmd.py'));
     assert.ok(paths.includes('agent_assets/tools/linux_terminal.py'));
@@ -2171,12 +2314,16 @@ test('workflow save/load buttons remain connected to the native in-app workflow 
     assert.match(modal, /Save Workflow[\s\S]*?Commit[\s\S]*?Abort/u);
     assert.match(modal, /api\.list\(\)[\s\S]*?\.dswf/u);
     assert.match(modal, /api\.save\(\{ snapshot: root\.createWorkflowSnapshot\(\), fileName: requestedName \}\)[\s\S]*?Workflow saved:/u);
-    assert.match(modal, /api\.load\(\{ fileName: fileName \}\)[\s\S]*?restoreWorkflowDocument[\s\S]*?restoreWorkflowSnapshot[\s\S]*?scheduleWorkflowSessionSave\(0\)[\s\S]*?Workflow loaded:/u);
+    assert.match(modal, /api\.load\(\{ fileName: fileName \}\)[\s\S]*?await root\.restoreWorkflowDocument[\s\S]*?await root\.restoreWorkflowSnapshot[\s\S]*?scheduleWorkflowSessionSave\(0\)[\s\S]*?Workflow loaded:/u);
 });
 
-test('reset and tidy graph buttons preserve graph reconstruction/layout/save semantics', () => {
+test('reset and tidy graph buttons preserve canonical-default/layout/save semantics', () => {
     const core = read('backend/renderer/nodes/editor/core.js');
-    assert.match(core, /function resetNodeGraph\(\)[\s\S]*?nodeEditorState\.nodes = \[\][\s\S]*?nodeEditorState\.connections = \[\][\s\S]*?createDefaultNodePipeline\(60, 22\)[\s\S]*?arrangeDefaultNodePipeline\(60, 22, 52\)[\s\S]*?scheduleWorkflowSessionSave\(\)/u);
+    assert.match(core, /async function resetNodeGraph\(\)[\s\S]*?restoreCanonicalDefaultWorkflow\(\)[\s\S]*?scheduleWorkflowSessionSave\(\)[\s\S]*?Emergency fallback[\s\S]*?createDefaultNodePipeline\(60, 22\)[\s\S]*?arrangeDefaultNodePipeline\(60, 22, 52\)/u);
+    const workflow = read('backend/renderer/workflow.js');
+    assert.match(workflow, /DEFAULT_WORKFLOW_FILE = 'darkstar-workflow\.dswf'/u);
+    assert.match(workflow, /async function loadCanonicalDefaultWorkflow\(\)[\s\S]*?bridge\.load\(\{ fileName: DEFAULT_WORKFLOW_FILE \}\)/u);
+    assert.match(workflow, /async function restoreWorkflowSession\(\)[\s\S]*?loadCanonicalDefaultWorkflow\(\)[\s\S]*?bridge\.loadSession\(\)[\s\S]*?restoreCanonicalDefaultWorkflow\(\)/u);
     const layout = read('backend/renderer/nodes/editor/layout.js');
     assert.match(layout, /function autoArrangeNodeGraph\(\)[\s\S]*?cancelNodeLayoutGestures\(\)[\s\S]*?arrangeNodeGraph\(60, 40, AUTO_LAYOUT_HORIZONTAL_GAP, AUTO_LAYOUT_VERTICAL_GAP\)[\s\S]*?scheduleWorkflowSessionSave\(\)[\s\S]*?showNodeEditorToast\('Nodes arranged', 'success', 1800\)/u);
 });
@@ -2193,13 +2340,13 @@ test('chat-autosave button still clears persisted session when disabled and forc
     assert.match(source, /chatSessionRevision \+= 1;[\s\S]*?saveChatSessionNow\(\{ force: true \}\)[\s\S]*?Chat autosave enabled/u);
 });
 
-test('secure-browser navigation/session buttons retain the exact backend command mapping', () => {
+test('browser navigation/session buttons retain the exact backend command mapping', () => {
     const source = read('backend/renderer/offline-browser.js');
     assert.match(source, /root\.toggleOfflineBrowser = function\(force\) \{ return setOpen\(force === undefined \? !state\.open : Boolean\(force\)\); \};/u);
     assert.match(source, /root\.offlineBrowserBack = function\(\) \{ return invoke\('back'\); \};/u);
     assert.match(source, /root\.offlineBrowserForward = function\(\) \{ return invoke\('forward'\); \};/u);
     assert.match(source, /root\.offlineBrowserReload = function\(\) \{ return invoke\('reload'\); \};/u);
-    assert.match(source, /root\.resetSecureBrowser = function\(\) \{ return invoke\('reset'\); \};/u);
+    assert.match(source, /root\.resetBrowser = function\(\) \{ return invoke\('reset'\); \};/u);
     assert.match(source, /root\.openOfflineBrowserAddress = openAddress;/u);
     assert.match(source, /root\.chooseOfflineBrowserFile = chooseFile;/u);
 });
@@ -2230,9 +2377,11 @@ test('send/stop/upload controls retain their current operational entry points', 
     assert.match(send, /async function sendMessage\(regenerateFromIndex, options\)/u);
     assert.match(send, /async function stopGeneration\(\)[\s\S]*?cancelCurrentGeneration/u);
     const image = read('backend/renderer/image.js');
-    assert.match(image, /function handleImageSelect\(ev\)[\s\S]*?attachImageFile/u);
+    assert.match(image, /async function chooseComposerImage\(\)[\s\S]*?imageFiles[\s\S]*?open\(\{ multiple: false \}\)[\s\S]*?safeDataUrl/u);
     assert.match(read('backend/shell/index.html'), /<button\b(?=[^>]*\bid="imageUploadButton")(?=[^>]*\bclass="btn-upload")(?=[^>]*\btype="button")[^>]*>/u);
-    assert.match(read('backend/renderer/event-listeners.js'), /bindClickById\('imageUploadButton'[\s\S]*?getElementById\('imageInput'\)[\s\S]*?input\.click\(\)/u);
+    const listeners = read('backend/renderer/event-listeners.js');
+    assert.match(listeners, /bindClickById\('imageUploadButton'[\s\S]*?chooseComposerImage\(\)/u);
+    assert.doesNotMatch(listeners, /bindClickById\('imageUploadButton'[\s\S]{0,300}?imageInput[\s\S]{0,120}?\.click\(\)/u);
 });
 });
 
@@ -2355,7 +2504,7 @@ test('native continuation disables generation-prompt insertion at the llama.cpp 
     const reasoning = normalizeChatRequest({
         model: 'm', messages: [{ role: 'assistant', content: '', reasoning_content: 'partial thought' }], continueFinalMessage: 'reasoning'
     });
-    assert.equal(reasoning.continue_final_message, 'reasoning_content', 'Darkstar reasoning continuation must use llama.cpp b10520 reasoning_content wire mode');
+    assert.equal(reasoning.continue_final_message, 'reasoning_content', 'Darkstar reasoning continuation must use llama.cpp b10645 reasoning_content wire mode');
     assert.equal(reasoning.add_generation_prompt, false);
     const automatic = normalizeChatRequest({ model: 'm', messages: [{ role: 'assistant', content: 'partial' }], continueFinalMessage: true });
     assert.equal(automatic.continue_final_message, true, 'llama.cpp auto continuation is a boolean protocol value, not the unsupported string auto');
@@ -2394,14 +2543,14 @@ test('continuation graph path has only reasoning/content channels and never rout
     assert.match(sampler, /requestedContinuationMode = String\(context\.continueFinalMessageMode \|\| ''\)\.toLowerCase\(\)/u);
     assert.match(sampler, /requestedContinuationMode === 'reasoning'[\s\S]*?'reasoning'[\s\S]*?: 'content'/u);
     assert.match(sampler, /reasoning: continuingFinalMessage && continuationMode === 'content' \? 'off' : selectedReasoning/u);
-    assert.match(sampler, /secureContinuationBoundary = continuingFinalMessage && context\.continuationBrowserCompartmentActivated === true/u);
-    assert.match(sampler, /var toolConfiguration = Object\.assign[\s\S]*executionDisabled: secureContinuationBoundary/u);
+    assert.match(sampler, /browserContinuationBoundary = continuingFinalMessage && context\.continuationBrowserCompartmentActivated === true/u);
+    assert.match(sampler, /var toolConfiguration = Object\.assign[\s\S]*executionDisabled: browserContinuationBoundary/u);
     assert.match(sampler, /skills: inputs\.skills \|\| \{ skills: \[\] \}/u);
     assert.match(sampler, /continueFinalMessage: continuingFinalMessage \? continuationMode : undefined/u);
     assert.doesNotMatch(sampler, /toolCallContinuation|continueToolCall/u, 'user Continue must never send a tool-continuation request');
     const apiSampler = read('custom_nodes/api-model/renderer.js');
-    assert.match(apiSampler, /secureContinuationBoundary = continuingFinalMessage && context\.continuationBrowserCompartmentActivated === true/u);
-    assert.match(apiSampler, /executionDisabled: secureContinuationBoundary/u);
+    assert.match(apiSampler, /browserContinuationBoundary = continuingFinalMessage && context\.continuationBrowserCompartmentActivated === true/u);
+    assert.match(apiSampler, /executionDisabled: browserContinuationBoundary/u);
     assert.match(apiSampler, /skills: inputs\.skills \|\| \{ skills: \[\] \}/u);
     const send = read('backend/renderer/send.js');
     assert.match(send, /enforceAtomicToolState === 'function' \? enforceAtomicToolState\(targetMessage\)/u);
@@ -2905,6 +3054,14 @@ test('message actions are outside bubbles, reserve a stable gutter during genera
         'message actions must use a consistent lightweight stroke');
     assert.ok(messageActions.includes('stroke-linecap=\"round\"') && messageActions.includes('stroke-linejoin=\"round\"'),
         'message actions must use one consistent rounded-stroke icon system');
+    assert.match(messageActions, /kind === 'retry'[\s\S]*?return start \+ '<path/u,
+        'Retry must be a vector icon, never selectable text');
+    assert.match(messageActions, /kind === 'delete'[\s\S]*?return start \+ '<path/u,
+        'Delete must be a vector icon, never selectable text');
+    assert.doesNotMatch(messageActions, />[↻−]<\/span>/u,
+        'message action source must not contain copyable text-glyph icons');
+    assert.doesNotMatch(css, /\.action-symbol(?:-retry|-delete|\s*\{)/u,
+        'retired text-glyph presentation rules must not remain in the stylesheet');
     assert.match(chat, /<div class="message-stack"><div class="message-content">' \+ messageBody \+ '<\/div><\/div>' \+ actionsHtml/u,
         'actions must be outside message-stack so they cannot affect bubble/avatar geometry');
     assert.doesNotMatch(chat, /<div class="message-content">' \+ messageBody \+ actionsHtml/u);
@@ -3939,12 +4096,13 @@ function rule(selector) {
     return match[1];
 }
 
-test('chat Schema sidebar is slightly narrower without changing the Nodes sidebar', () => {
+test('chat Schema sidebar remains independent while Nodes reserves enough width for Authorization', () => {
     assert.match(css, /--workspace-sidebar-width:\s*280px\s*;/u);
     assert.match(rule('.workspace-sidebar'), /width:\s*var\(--workspace-sidebar-width\)\s*;/u);
     assert.match(rule('.main-content'), /margin-left:\s*var\(--workspace-sidebar-width\)\s*;/u);
     assert.match(rule('.tab-bar'), /left:\s*var\(--workspace-sidebar-width\)\s*;/u);
-    assert.match(rule('.node-workflow-sidebar'), /width:\s*66px\s*;/u, 'Nodes sidebar width must remain unchanged');
+    assert.match(rule('.node-workflow-sidebar'), /width:\s*76px\s*;/u, 'Nodes sidebar must reserve enough width for the full Authorization label');
+    assert.match(rule('.node-editor-sidebar-button'), /width:\s*64px\s*;/u);
 
     assert.match(workspaceSource, /tabBar\.style\.left = collapsed \? '28px' : currentWorkspaceSidebarWidth\(\) \+ 'px'/u);
     assert.match(chatSessionSource, /tabBar\.style\.left = collapsed === true \? '28px' : \(typeof currentWorkspaceSidebarWidth === 'function' \? currentWorkspaceSidebarWidth\(\) : 280\) \+ 'px'/u);
@@ -4615,13 +4773,17 @@ const EXPECTED_STATIC_BUTTONS = [
     ['nodeAutoLayoutButton', 'node-editor-sidebar-button', '', 'Tidy node layout', 'Tidy node layout', false, 'Tidy'],
     ['nodeClearContextButton', 'node-editor-sidebar-button', '', 'Clear active chat context', 'Clear active chat context', false, 'Clear'],
     ['nodeChatTraceButton', 'node-editor-sidebar-button', '', 'Expand all chat traces', 'Expand all chat traces', false, 'Traces'],
+    ['nodePermissionPolicyButton', 'node-editor-sidebar-button', '', 'Model action permissions', 'Model action permissions', false, 'Auth Controls'],
+    ['nodeFilesystemAccessButton', 'node-editor-sidebar-button', '', 'Filesystem Access · Level 2 · User Profile', 'Filesystem Access · Level 2 · User Profile', false, 'Filesystem Access'],
     ['nodeChatAutosaveButton', 'node-editor-sidebar-button', '', 'Autosave Chats: On · Click to stop saving open chat tabs', 'Autosave Chats: On', false, 'Autosave Chats'],
     ['nodeMuteButton', 'node-editor-sidebar-button', '', 'Mute interface sounds', 'Mute interface sounds', false, 'Mute'],
     ['nodeThemeButton', 'node-editor-sidebar-button', '', 'Current: Deep Blue · Next: Light', 'Current theme: Deep Blue. Switch to Light', false, 'Deep Blue'],
+    ['permissionPolicyClose', 'permission-policy-close', '', '', 'Close permission settings', false, '×'],
+    ['filesystemAccessClose', 'permission-policy-close', '', '', 'Close Filesystem Access settings', false, '×'],
     ['nodeResetGraphButton', 'toolbar-btn', '', '', '', false, 'Reset Graph'],
     ['tabNav', 'tab-nav', '', '', 'Open node editor', false, ''],
     ['newTabButton', 'tab-new', '', '', 'New chat tab', false, ''],
-    ['offlineBrowserToggle', 'tab-bar-browser-toggle offline-browser-toggle', '', 'Toggle Secure Browser (Ctrl+Shift+B)', 'Toggle Secure Browser', false, 'Browser'],
+    ['offlineBrowserToggle', 'tab-bar-browser-toggle offline-browser-toggle', '', 'Toggle Browser (Ctrl+Shift+B)', 'Toggle Browser', false, 'Browser'],
     ['workspaceToggle', 'workspace-toggle', '', '', '', false, ''],
     ['workspaceOpenFolder', 'workspace-open-folder', '', 'Choose Directory', 'Choose Directory', false, ''],
     ['uipAddButton', 'schema-project-add uip-add-button', '', 'Connect application window', 'Connect application window', false, ''],
@@ -4631,12 +4793,14 @@ const EXPECTED_STATIC_BUTTONS = [
     ['offlineBrowserReload', 'offline-browser-icon-button', '', 'Reload page', 'Reload page', false, '↻'],
     ['offlineBrowserOpenButton', 'offline-browser-open-button', '', 'Open address', '', false, 'Go'],
     ['offlineBrowserChooseFileButton', 'offline-browser-icon-button', '', 'Choose local HTML', 'Choose local HTML', false, '⌂'],
-    ['offlineBrowserReset', 'offline-browser-icon-button', '', 'Destroy this online session and start a new private session', 'Start a new private browser session', true, '◇'],
+    ['offlineBrowserReset', 'offline-browser-icon-button', '', 'Restart online browser session', 'Restart online browser session', true, '◇'],
     ['offlineBrowserCloseButton', 'offline-browser-icon-button close', '', 'Close browser', 'Close browser', false, '×'],
     ['offlineBrowserFocusAddressButton', '', '', '', '', false, 'Enter address'],
     ['queueToggle', 'queue-toggle', '', '', '', false, ''],
     ['removeImageButton', 'btn-remove-image', '', '', '', false, ''],
     ['projectDirectoryChooseButton', '', '', '', '', false, 'Choose Directory'],
+    ['agentAttentionAllow', 'agent-attention-primary', '', '', '', false, 'Allow'],
+    ['agentAttentionReject', '', '', '', '', false, 'Reject'],
     ['imageUploadButton', 'btn-upload', '', 'Upload image', '', false, ''],
     ['scheduleBtn', 'btn-schedule', '', 'Insert this user message into the current generation', 'Insert this user message into the current generation', false, ''],
     ['sendBtn', 'btn-send', '', 'Send message', 'Send message', false, ''],
@@ -4644,6 +4808,15 @@ const EXPECTED_STATIC_BUTTONS = [
     ['uipWindowPickerClose', '', '', '', 'Close window picker', false, '×'],
     ['projectDeleteCancelButton', 'project-delete-modal-button project-delete-modal-cancel', '', '', '', false, 'Cancel'],
     ['projectDeleteConfirmButton', 'project-delete-modal-button project-delete-modal-confirm', '', '', '', false, 'Delete Project'],
+    ['workflowFileBackButton', 'workflow-file-history-button', '', 'Back', 'Back', true, ''],
+    ['workflowFileForwardButton', 'workflow-file-history-button', '', 'Forward', 'Forward', true, ''],
+    ['', 'workflow-file-sidebar-item', '', '', '', false, 'Desktop'],
+    ['', 'workflow-file-sidebar-item', '', '', '', false, 'Downloads'],
+    ['', 'workflow-file-sidebar-item', '', '', '', false, 'Documents'],
+    ['', 'workflow-file-sidebar-item', '', '', '', false, 'Pictures'],
+    ['', 'workflow-file-sidebar-item', '', '', '', false, 'Music'],
+    ['', 'workflow-file-sidebar-item', '', '', '', false, 'Videos'],
+    ['', 'workflow-file-sidebar-item', '', '', '', false, 'This PC'],
     ['workflowFileAbortButton', 'workflow-file-modal-button workflow-file-abort', '', '', '', false, 'Abort'],
     ['workflowFileCommitButton', 'workflow-file-modal-button workflow-file-commit', '', '', '', true, 'Commit'],
     ['workspaceDeleteCancelButton', 'project-delete-modal-button project-delete-modal-cancel', '', '', '', false, 'Cancel'],
@@ -4746,6 +4919,8 @@ test('every current node-editor action button is named in the regression surface
         ['backend/renderer/nodes/builtin/tools.js', 'remove-tool-file:'],
         ['backend/renderer/nodes/builtin/tools.js', "controls.button('Add Tool Files…', node.id, 'add-tool-file')"],
         ['backend/renderer/nodes/builtin/load-model.js', "controls.button('Unload model', node.id, 'unload-model'"],
+        ['backend/renderer/nodes/builtin/load-model.js', "'browse-local-model'"],
+        ['backend/renderer/nodes/builtin/load-model.js', "'browse-local-projector'"],
         ['backend/renderer/nodes/builtin/load-server.js', 'toggle-gpu:'],
         ['backend/renderer/nodes/builtin/load-server.js', 'data-action="refresh-gpus"'],
     ];
@@ -5534,7 +5709,7 @@ test('Context node has no overflow dropdown or hidden overflow policy and preser
 test('Control node has no Image Pruning toggle or persisted pruning parameter', async () => {
     const definition = loadDefinition('backend/renderer/nodes/builtin/control.js', { CONTROL: 'control' });
     const node = definition.factory('control-1', 0, 0);
-    assert.deepEqual(Object.keys(node.params).sort(), ['autoCompact', 'nameConversations']);
+    assert.deepEqual(Object.keys(node.params).sort(), ['autoCompact', 'modelIdleUnloadEnabled', 'nameConversations']);
     const html = definition.buildContentHTML(node);
     assert.match(html, /Name Conversations/u);
     assert.match(html, /Auto-compact/u);
@@ -5542,9 +5717,9 @@ test('Control node has no Image Pruning toggle or persisted pruning parameter', 
 
     const legacy = { id: 'legacy', params: { nameConversations: false, autoCompact: true, imagePruning: true } };
     definition.normalizeNode(legacy);
-    assert.deepEqual(JSON.parse(JSON.stringify(legacy.params)), { nameConversations: false, autoCompact: true });
+    assert.deepEqual(JSON.parse(JSON.stringify(legacy.params)), { nameConversations: false, autoCompact: true, modelIdleUnloadEnabled: false });
     const output = await definition.execute({}, legacy);
-    assert.deepEqual(JSON.parse(JSON.stringify(output.while)), { nameConversations: false, autoCompact: true });
+    assert.deepEqual(JSON.parse(JSON.stringify(output.while)), { nameConversations: false, autoCompact: true, modelIdleUnloadSeconds: 0 });
 });
 
 
@@ -5554,7 +5729,36 @@ test('bundled workflow contains only the surviving Context and Control settings'
     const contextNode = nodes.find((node) => node.type === 'context');
     const controlNode = nodes.find((node) => node.type === 'control');
     assert.deepEqual(contextNode.params, { systemPrompt: '', includeHistory: true });
-    assert.deepEqual(controlNode.params, { nameConversations: true, autoCompact: false });
+    assert.deepEqual(controlNode.params, { nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: false });
+});
+
+test('canonical default workflow enables Flash Attention on Load Server', () => {
+    const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(root, 'workflows', 'darkstar-workflow.dswf')));
+    const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : snapshot.editor.nodes;
+    const loadServer = nodes.find((node) => node && node.type === 'loadServer');
+    assert.ok(loadServer, 'canonical workflow must contain a Load Server node');
+    assert.equal(loadServer.params.flashAttention, true, 'Flash Attention must default to enabled');
+});
+
+test('canonical default workflow uses portable model and MMProj placeholders without selecting machine-specific files', () => {
+    const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(root, 'workflows', 'darkstar-workflow.dswf')));
+    const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : snapshot.editor.nodes;
+    const loader = nodes.find((node) => node && node.type === 'modelLoader');
+    assert.ok(loader, 'canonical workflow must contain a Load Model node');
+    assert.equal(loader.selectedModel, '', 'the model placeholder must not become an active model selection');
+    assert.equal(loader.params.projectorPath, '', 'the MMProj placeholder must not become an active projector selection');
+    assert.equal(loader.params.modelPathPlaceholder, 'C:/Your/Model/Path');
+    assert.equal(loader.params.projectorPathPlaceholder, 'C:/Your/MMProj/Path');
+    assert.deepEqual(loader.params.projectorCandidates, []);
+});
+
+test('Load Model renders default path placeholders as inert empty selections', () => {
+    const definition = loadDefinition('backend/renderer/nodes/builtin/load-model.js', { SERVER: 'server', MODEL: 'model' });
+    const node = definition.factory('loader-1', 0, 0);
+    assert.equal(node.selectedModel, '');
+    assert.equal(node.params.projectorPath, '');
+    assert.equal(node.params.modelPathPlaceholder, 'C:/Your/Model/Path');
+    assert.equal(node.params.projectorPathPlaceholder, 'C:/Your/MMProj/Path');
 });
 
 test('legacy image exclusion metadata is stripped at transport without removing the image', () => {
@@ -6134,13 +6338,12 @@ test('user bubbles reserve the opposite chevron lane instead of crossing the ass
         'a maximum-width user bubble must stop one assistant chevron track plus grid gap inside the row edge');
 });
 
-test('message and sidebar symbols are proportionally larger and Retry uses the new standalone glyph', () => {
+test('message and sidebar symbols are proportionally larger and Retry uses the vector icon system', () => {
     const css = read('backend/shell/styles.css');
     const messageActions = read('backend/renderer/message-actions.js');
-    assert.match(messageActions, /action-symbol action-symbol-retry[^>]*>↻<\/span>/u);
-    assert.doesNotMatch(messageActions, /M20 8v5h-5/u);
+    assert.match(messageActions, /kind === 'retry'[\s\S]*?return start \+ '<path/u);
+    assert.doesNotMatch(messageActions, />↻<\/span>/u);
     assert.match(cssRule(css, '.btn-action svg'), /width:\s*16px;\s*height:\s*16px/u);
-    assert.match(cssRule(css, '.action-symbol'), /font-size:\s*18px/u);
     assert.match(cssRule(css, '.workspace-toggle svg'), /width:\s*20px;\s*height:\s*20px/u);
     assert.match(cssRule(css, '.workspace-file-item svg'), /width:\s*15px;\s*height:\s*15px/u);
     assert.match(cssRule(css, '.node-editor-sidebar-button svg'), /width:\s*23px;\s*height:\s*23px/u);
@@ -7575,6 +7778,7 @@ const contracts = [
     ['dynamic node dropdown trigger delegates to toggleNodeDropdown', 'backend/renderer/nodes/editor/controls.js', /closest\('\.node-dropdown-trigger'\)[\s\S]*?toggleNodeDropdown\(event, trigger\)/u],
     ['dynamic node dropdown option delegates to selectNodeDropdownOption', 'backend/renderer/nodes/editor/controls.js', /closest\('\.node-dropdown-option'\)[\s\S]*?selectNodeDropdownOption\(event, option\)/u],
     ['dynamic node action button delegates to runNodeAction', 'backend/renderer/nodes/editor/controls.js', /closest\('\.node-action-button'\)[\s\S]*?runNodeAction\(event, actionButton\)/u],
+    ['dynamic local browser action delegates before generic node actions', 'backend/renderer/nodes/editor/controls.js', /node-local-browser-button[\s\S]*?browseNodeLocalFilesystem\(event, actionButton\)/u],
     ['node dropdown trigger keyboard is delegated', 'backend/renderer/nodes/editor/controls.js', /onNodeDropdownTriggerKeydown\(event, trigger\)/u],
     ['node dropdown option keyboard is delegated', 'backend/renderer/nodes/editor/controls.js', /onNodeDropdownOptionKeydown\(event, option\)/u],
     ['node file drop delegates to runNodeFileDrop', 'backend/renderer/nodes/editor/controls.js', /function onNodeFileDrop\(event\)[\s\S]*?runNodeFileDrop\(event, dropZone\)/u],
@@ -7585,6 +7789,7 @@ const contracts = [
     ['Tools remove-file button encodes its exact index', 'backend/renderer/nodes/builtin/tools.js', /data-action="remove-tool-file:' \+ index/u],
     ['Tools Add Tool Files action is rendered', 'backend/renderer/nodes/builtin/tools.js', /controls\.button\('Add Tool Files…', node\.id, 'add-tool-file'\)/u],
     ['Load Model Unload model action is rendered and disabled with no selection', 'backend/renderer/nodes/builtin/load-model.js', /controls\.button\('Unload model', node\.id, 'unload-model',[\s\S]*?disabled: !node\.selectedModel/u],
+    ['Load Model local browser buttons render beside model and projector fields', 'backend/renderer/nodes/builtin/load-model.js', /localBrowseField\(common\.modelDropdown\(node\), node\.id, 'browse-local-model', 'Model'\)[\s\S]*?localBrowseField\(controls\.dropdown\('Projector'[\s\S]*?node\.id, 'browse-local-projector', 'Projector'\)/u],
     ['Load Server per-GPU toggle action encodes CUDA device index', 'backend/renderer/nodes/builtin/load-server.js', /data-action="toggle-gpu:' \+ escape\(device\.index\)/u],
     ['Load Server Refresh GPU button routes to refresh-gpus', 'backend/renderer/nodes/builtin/load-server.js', /class="node-action-button node-gpu-refresh"[\s\S]*?data-action="refresh-gpus"/u],
 ];
@@ -7596,7 +7801,7 @@ for (const [name, file, pattern] of contracts) {
 }
 
 test('dynamic-control inventory contains every currently implemented dynamic actionable family', () => {
-    assert.equal(contracts.length, 58);
+    assert.equal(contracts.length, 60);
 });
 });
 
@@ -7631,6 +7836,7 @@ const features = [
     ['adversary context projection and continuation rebuild', 'backend/renderer/adversary-context.js', ['historySnapshot', 'rebuildBaseHistory', 'continuationHistory', 'executionHistory']],
     ['slash command menu and registered handlers', 'backend/renderer/commands.js', ['function updateSlashCommandMenu(value)', 'registerSystemCommands', 'systemCommands.catalog()']],
     ['manual and automatic context compaction', 'backend/renderer/commands.js', ['DEFAULT_COMPACT_PERCENT = 90', 'AUTO_COMPACT_PERCENT = 50', 'AUTO_COMPACT_TRIGGER_FRACTION = 0.90', 'async function compactConversation(tab, percentage, options)', 'summarizeForCompaction']],
+    ['send-side Auto-compact threshold policy', 'backend/renderer/send.js', ['AUTO_COMPACT_TRIGGER_FRACTION = 0.90', 'continueAtAutoCompactThreshold', 'auto-compact-threshold-stop']],
     ['visible compaction generation lifecycle', 'backend/renderer/compaction-activity.js', ['namespace.compactionActivity', "session.phase = 'compaction'", 'onReasoningToken', 'finishVisual', 'release']],
     ['compaction eligibility planner', 'backend/renderer/compaction-plan.js', ['function buildPlan(history, percentage, options)', 'function replaceHistory(history, plan, summaryMessage)', 'function anchorEnd(history)', 'eligibleTurnCount']],
     ['graph execution adapter', 'backend/renderer/graph-execution.js', ['async function executeGraph(context)', 'new Darkstar.nodes.GraphRuntime', 'function isGraphReady()']],
@@ -7648,7 +7854,7 @@ const features = [
     ['node SDK registry and port types', 'backend/renderer/nodes/sdk.js', ['function NodeRegistry()', 'PORT_TYPES', 'registerNode: function registerNode(definition)']],
     ['renderer node backend services', 'backend/renderer/nodes/services.js', ['var serviceApi = Object.freeze', 'namespace.chatRuntime = serviceApi', 'nodes.services = serviceApi', 'streamChat:', 'getBridge:', 'getAgentBridge:']],
     ['generation parameter compatibility facade', 'backend/renderer/params.js', ['function getGenerationParams()', "n.type === 'sampler'", 'repeat_penalty: parseFloat(sampler.params.repeatPenalty)']],
-    ['model inventory refresh/status', 'backend/renderer/server.js', ['async function loadModelList(options)', 'function applyModelInventory(records)', 'function startAutomaticModelRefresh()']],
+    ['model inventory refresh/status', 'backend/renderer/server.js', ['async function loadModelList(options)', 'function applyModelInventory(records, projectorRecords)', 'function startAutomaticModelRefresh()']],
     ['startup UI readiness gate', 'backend/renderer/init.js', ['function setDarkstarStartupUiReady(ready)', "input.setAttribute('placeholder', isReady ? input.dataset.readyPlaceholder : 'Starting Darkstar...')", 'input.disabled = !isReady']],
     ['mobile settings panel toggle', 'backend/renderer/views.js', ['function toggleSettings()', "panel.classList.toggle('visible')", "btn.classList.toggle('active')"]],
     ['chat/node view switching', 'backend/renderer/views.js', ['function switchView(view)', "view === 'settings'", "settingsView.classList.add('active')", "settingsView.classList.remove('active')"]],
@@ -7656,6 +7862,8 @@ const features = [
     ['model selector synchronization into Model Loader node', 'backend/renderer/views.js', ['function syncModelSelect(value)', "node.type === 'modelLoader'", 'setNodeModelValue(loader.id, value)']],
 
     ['theme persistence', 'backend/renderer/preferences.js', ['darkstar.ui.theme', 'function toggleDarkstarTheme()', 'localStorage.setItem']],
+    ['model action permission slider with workflow-owned persistence', 'backend/renderer/permission-policy.js', ['function initializePermissionPolicyUi()', "document.getElementById('nodePermissionPolicyButton')", 'scheduleWorkflowSessionSave(0)', 'workflowSecuritySnapshot']],
+    ['filesystem access slider with workflow-owned persistence', 'backend/renderer/filesystem-access-policy.js', ['function initializeFilesystemAccessUi()', "document.getElementById('nodeFilesystemAccessButton')", 'scheduleWorkflowSessionSave(0)', 'restoreFilesystemAccessLevel']],
     ['six-theme cycle', 'backend/renderer/preferences.js', ["'deep-blue'", "'light'", "'quantum'", "'terminal'", "'arctic'", "'space'"]],
     ['mute persistence', 'backend/renderer/preferences.js', ['darkstar.ui.muted', 'function toggleDarkstarUiMuted()', "aria-pressed"]],
     ['chat autosave persistence toggle', 'backend/renderer/chat-session.js', ['function toggleChatAutosave()', 'function setChatAutosaveEnabled(enabled)', 'saveChatSessionNow({ force: true })']],
@@ -7694,6 +7902,7 @@ const features = [
     ['workspace reveal in Explorer', 'backend/renderer/workspace.js', ['async function revealWorkspaceEntry(entry)', 'revealEntry']],
     ['workspace file/folder deletion', 'backend/renderer/workspace.js', ['async function deleteWorkspaceEntry(entry)', 'deleteEntry']],
     ['workspace refresh events are debounced', 'backend/renderer/workspace.js', ['function scheduleWorkspaceRefresh(payload)', 'setTimeout']],
+    ['agent attention permission surface', 'backend/renderer/attention.js', ['function initializeAgentAttention()', 'function resolveAgentAttentionDecision(decision)', 'function preflightAgentAttentionSend(tab, message, options)']],
 
     ['per-tab rendering', 'backend/renderer/tabs.js', ['function renderTabs()', 'activeProjectTabs()', 'tab-item']],
     ['tab switching saves/restores scroll and browser/workspace ownership', 'backend/renderer/tabs.js', ['function switchTab(tabId)', 'saveActiveTabScrollState()', 'activateWorkspaceForTab(tabId)', 'activateOfflineBrowserForTab(tabId)']],
@@ -7712,7 +7921,7 @@ const features = [
     ['message formatting', 'backend/renderer/message-markup.js', ['function formatMessage(value)', 'safeMessageLinkHref', 'protectedCode']],
     ['smart chat autoscroll', 'backend/renderer/chat.js', ['function smartScrollToBottom()', 'userScrolledUp']],
 
-    ['image file selection', 'backend/renderer/image.js', ['function handleImageSelect(ev)', 'attachImageFile']],
+    ['image file selection', 'backend/renderer/image.js', ['async function chooseComposerImage()', 'imageFiles', 'safeDataUrl']],
     ['image validation/attachment', 'backend/renderer/image.js', ['function attachImageFile', 'pendingImage']],
     ['image removal', 'backend/renderer/image.js', ['function removeImage()', 'pendingImage = null', "container.classList.remove('has-image')"]],
 
@@ -7756,7 +7965,7 @@ const features = [
     ['workflow Ctrl+S shortcut', 'backend/renderer/workflow.js', ["String(event.key).toLowerCase() !== 's'", 'saveNodeWorkflow()']],
 
     ['default node graph pipeline', 'backend/renderer/nodes/editor/core.js', ['function createDefaultNodePipeline', 'modelLoader', 'sampler']],
-    ['Reset Graph reconstruction', 'backend/renderer/nodes/editor/core.js', ['function resetNodeGraph()', 'nodeEditorState.nodes = []', 'nodeEditorState.connections = []', 'createDefaultNodePipeline']],
+    ['Reset Graph reconstruction', 'backend/renderer/nodes/editor/core.js', ['async function resetNodeGraph()', 'restoreCanonicalDefaultWorkflow', 'createDefaultNodePipeline']],
     ['node auto-arrange', 'backend/renderer/nodes/editor/layout.js', ['function autoArrangeNodeGraph()', 'arrangeNodeGraph', "Nodes arranged"]],
     ['node creation from registry', 'backend/renderer/nodes/editor/core.js', ['function addNodeEditorNode', 'getNodeDef']],
     ['node deletion', 'backend/renderer/nodes/editor/core.js', ['function removeNode(nodeId)', 'nodeEditorState.connections = nodeEditorState.connections.filter']],
@@ -7817,19 +8026,19 @@ const features = [
     ['Sampler prompt-cache control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.booleanSelect('Reuse prompt cache'", 'cachePrompt']],
     ['Sampler Ignore EOS control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.booleanSelect('Ignore EOS'", 'ignoreEos']],
 
-    ['secure browser open/close', 'backend/renderer/offline-browser.js', ['root.toggleOfflineBrowser = function(force)', 'setOpen']],
-    ['secure browser per-tab ownership', 'backend/renderer/offline-browser.js', ['activeBrowserId', 'activateOfflineBrowserForTab']],
-    ['secure browser Back command', 'backend/renderer/offline-browser.js', ["root.offlineBrowserBack = function() { return invoke('back'); }"]],
-    ['secure browser Forward command', 'backend/renderer/offline-browser.js', ["root.offlineBrowserForward = function() { return invoke('forward'); }"]],
-    ['secure browser Reload command', 'backend/renderer/offline-browser.js', ["root.offlineBrowserReload = function() { return invoke('reload'); }"]],
-    ['secure browser Reset command', 'backend/renderer/offline-browser.js', ["root.resetSecureBrowser = function() { return invoke('reset'); }"]],
-    ['secure browser address dispatch', 'backend/renderer/offline-browser.js', ['async function openAddress()', "return invoke('open', value)"]],
-    ['secure browser local-file chooser', 'backend/renderer/offline-browser.js', ['function chooseFile()', 'chooseFile']],
-    ['secure browser navigation state UI', 'backend/renderer/offline-browser.js', ['back.disabled = !next.canGoBack', 'forward.disabled = !next.canGoForward']],
-    ['secure browser privacy badge', 'backend/renderer/offline-browser.js', ["badge.textContent = isOnline() ? 'STRICT' : 'OFFLINE'", 'blockedCrossSiteCookies']],
-    ['secure browser resizable width persistence', 'backend/renderer/offline-browser.js', ['function setWidth(value, persist, snapped)', 'WIDTH_RATIO_KEY', 'SNAP_KEY']],
-    ['secure browser foreground block reasons', 'backend/renderer/offline-browser.js', ['function setOverlayBlockReason(reason, blocked)', 'overlayBlockReasons']],
-    ['secure browser keyboard shortcut', 'backend/renderer/offline-browser.js', ["(event.ctrlKey || event.metaKey) && event.shiftKey", "String(event.key).toLowerCase() === 'b'"]],
+    ['browser open/close', 'backend/renderer/offline-browser.js', ['root.toggleOfflineBrowser = function(force)', 'setOpen']],
+    ['browser per-tab ownership', 'backend/renderer/offline-browser.js', ['activeBrowserId', 'activateOfflineBrowserForTab']],
+    ['browser Back command', 'backend/renderer/offline-browser.js', ["root.offlineBrowserBack = function() { return invoke('back'); }"]],
+    ['browser Forward command', 'backend/renderer/offline-browser.js', ["root.offlineBrowserForward = function() { return invoke('forward'); }"]],
+    ['browser Reload command', 'backend/renderer/offline-browser.js', ["root.offlineBrowserReload = function() { return invoke('reload'); }"]],
+    ['browser Reset command', 'backend/renderer/offline-browser.js', ["root.resetBrowser = function() { return invoke('reset'); }"]],
+    ['browser address dispatch', 'backend/renderer/offline-browser.js', ['async function openAddress()', "return invoke('open', value)"]],
+    ['browser local-file chooser', 'backend/renderer/offline-browser.js', ['function chooseFile()', 'chooseFile']],
+    ['browser navigation state UI', 'backend/renderer/offline-browser.js', ['back.disabled = !next.canGoBack', 'forward.disabled = !next.canGoForward']],
+    ['browser mode badge', 'backend/renderer/offline-browser.js', ["badge.textContent = isOnline() ? 'ONLINE' : 'LOCAL'", "offlineBrowserModeBadge"]],
+    ['browser resizable width persistence', 'backend/renderer/offline-browser.js', ['function setWidth(value, persist, snapped)', 'WIDTH_RATIO_KEY', 'SNAP_KEY']],
+    ['browser foreground block reasons', 'backend/renderer/offline-browser.js', ['function setOverlayBlockReason(reason, blocked)', 'overlayBlockReasons']],
+    ['browser keyboard shortcut', 'backend/renderer/offline-browser.js', ["(event.ctrlKey || event.metaKey) && event.shiftKey", "String(event.key).toLowerCase() === 'b'"]],
 
     ['UIP target list rendering', 'backend/renderer/uip.js', ['function renderTargets()', 'uip-target-row']],
     ['UIP window picker', 'backend/renderer/uip.js', ['async function openPicker()', 'api.listWindows()']],
@@ -7857,12 +8066,16 @@ const features = [
     ['chat autosave store', 'backend/preferences/chat-session-store.js', ['class ChatSessionStore']],
     ['protected persisted payloads', 'backend/preferences/protected-payload.js', ['protectPayload', 'unprotectPayload']],
     ['dialog-location persistence', 'backend/preferences/dialog-location-store.js', ['DialogLocationStore']],
+    ['local model/projector history persistence', 'backend/preferences/local-model-history-store.js', ['LocalModelHistoryStore', 'LOCAL_MODEL_HISTORY_KEYS']],
     ['native window theme application', 'backend/preferences/window-theme.js', ['applyWindowTheme']],
 
     ['GGUF model discovery', 'backend/runtime/models.js', ['walkModels']],
+    ['local GGUF filesystem browser', 'backend/runtime/model-filesystem.js', ['browseModelFiles', 'validateModelFilePath', 'filesystemRoots']],
     ['GGUF metadata parsing', 'backend/runtime/gguf-metadata.js', ['readGgufModelMetadata', 'detectReasoningCapabilities', "tokenizer.chat_template"]],
     ['model selection normalization', 'backend/runtime/models.js', ['normalizeModelLoadRequest', 'resolveModelSelection']],
     ['model lifecycle load/unload', 'backend/runtime/model-lifecycle.js', ['loadModel', 'unloadModel']],
+    ['model idle unload lifecycle', 'backend/runtime/model-idle-unload.js', ['class ModelIdleUnloadController', 'normalizeModelIdleUnloadSeconds', 'hasPendingDecision']],
+    ['runtime status projection', 'backend/runtime/runtime-status.js', ['runtimeStatus', 'modelIdleUnloadSeconds', 'loadedProjectorPath']],
     ['llama backend runtime selection', 'backend/runtime/backend-selection.js', ['initializeBackendRuntime', 'selectRuntimeBackend', 'prepareBackendLaunch', 'buildBackendEnvironment']],
     ['llama server configuration', 'backend/runtime/server-config.js', ['buildSharedArgs', 'buildRouterArgs', 'buildLegacyArgs']],
     ['native context shifting disabled', 'backend/runtime/server-config.js', ["args.push('--no-context-shift')", 'Auto-compact remain the only mechanisms']],
@@ -7890,6 +8103,7 @@ const features = [
     ['Python provider registry', 'backend/agent/python-provider-registry.js', ['PythonProviderRegistry']],
     ['Python tool execution host', 'backend/agent/python-tool-host.js', ['PythonToolHost']],
     ['tool schema validation', 'backend/agent/tool-schema.js', ['normalizeDefinition', 'validateToolArguments']],
+    ['model vision tool capability projection', 'backend/agent/tool-capabilities.js', ['projectVisionDefinition', 'runtimeProviderTools', 'VISION_ONLY_ACTIONS']],
     ['tool service execution', 'backend/agent/tool-service.js', ['class ToolService', 'validateToolArguments']],
     ['tool-call timeout', 'backend/agent/tool-runtime.js', ['timeoutToolCallTimeoutMs']],
     ['safe tool environment', 'backend/agent/safe-environment.js', ['sanitizedEnvironment', 'sanitizedPythonEnvironment', 'isSensitiveEnvironmentKey']],
@@ -7898,7 +8112,11 @@ const features = [
     ['Skill supporting-file discovery', 'backend/agent/skill-support.js', ['listSupportingFiles', "require('../filesystem/path-utils')"]],
     ['Skill service', 'backend/agent/skill-service.js', ['class SkillService']],
     ['module tool loading', 'backend/agent/module-tool-loader.js', ['class ModuleToolLoader', 'providerFromModule']],
-    ['built-in file tools', 'backend/agent/builtin/file-tools.js', ['createFileToolProvider']],
+    ['Core-owned model action permission policy', 'backend/agent/permission-policy.js', ['class PermissionPolicyService', 'resolveToolPermission', 'gateToolCall', 'PERMISSION_LEVELS']],
+    ['Core-owned filesystem access policy', 'backend/agent/filesystem-access-policy.js', ['class FilesystemAccessPolicyService', 'resolveFilesystemContract', 'assertToolExecution', 'FILESYSTEM_ACCESS_LEVELS']],
+    ['attention request service', 'backend/agent/attention-request-service.js', ['class AttentionRequestService', 'registerAction', 'async request(options', 'respond(requestId']],
+    ['attention action registry', 'backend/agent/attention-actions.js', ['registerWorkspaceAttentionAction', 'registerUserQuestionAttentionAction', 'resolveUserQuestionAction', 'USER_YES_NO_ATTENTION_KIND']],
+    ['built-in file tools', 'backend/agent/builtin/file-tools.js', ['createFileToolProvider', 'search_files']],
     ['built-in terminal tools', 'backend/agent/builtin/terminal-tools.js', ['createTerminalToolProvider']],
     ['Application Interface model contract', 'backend/agent/builtin/uip-tools.js', ['UIP_CHROMIUM_INTERFACE_DEFINITION', 'UIP_WINDOWS_UIA_DEFINITION', 'UIP_CONNECTED_APPLICATION_MEMORY_DEFINITION', 'createApplicationInterfaceCapability']],
     ['connected-application memory model contract', 'backend/agent/builtin/uip-memory-tool.js', ['UIP_CONNECTED_APPLICATION_MEMORY_DEFINITION', 'memoryTarget']],
@@ -7949,12 +8167,12 @@ const features = [
     ['sandboxed renderer preload bridge', 'backend/shell/preload.js', ['contextBridge.exposeInMainWorld', 'CHANNELS', 'customNodeApi', 'PLUGINS_EVENT', 'darkstar']],
     ['project shell and asset path ownership', 'backend/app/project-layout.js', ['projectRootFromShell', 'shellDirectory', 'shellFile', 'assetFile']],
     ['crash diagnostics', 'backend/app/crash-diagnostics.js', ['CrashDiagnostics']],
-    ['power protection', 'backend/app/run-main-app.js', ['createPowerProtection']],
+    ['power protection and Windows app identity', 'backend/app/run-main-app.js', ['createPowerProtection', 'configureWindowsAppIdentity']],
     ['runtime Windows icon generation', 'backend/app/runtime-icon.js', ['generateRuntimeIcon', 'encodeIco', 'WINDOWS_ICON_SIZES']],
 
     ['llama runtime facade', 'backend/llama-runtime.js', ['class LlamaRuntime', 'injectSkillCatalog', 'walkModels']],
     ['diagnostics directory resolution', 'backend/app/diagnostics-path.js', ['resolveDiagnosticsDirectory', 'directoryProbe']],
-    ['main window creation/security', 'backend/app/main-window.js', ['createMainWindow', 'installMainWindowSecurity', 'installEditableContextMenu']],
+    ['main window creation/security and Windows taskbar identity', 'backend/app/main-window.js', ['createMainWindow', 'installMainWindowSecurity', 'installEditableContextMenu', 'applyWindowsWindowIdentity']],
     ['legacy brand/session migration', 'backend/app/brand-migration.js', ['migrateLegacyUserData', 'copyLegacySessionAlias']],
     ['runtime service composition', 'backend/app/services.js', ['createRuntimeServices', 'createPluginManager']],
     ['tool result side-effect actions', 'backend/agent/tool-runtime.js', ['resolveToolResultAction', 'SCREENSHOT_ACTION', 'BROWSER_CONTROL_ACTION']],
@@ -7968,7 +8186,7 @@ const features = [
     ['Python provider enablement filtering', 'backend/agent/python-provider.js', ['normalizeProviderDescription', 'filterEnabledTools']],
     ['IPC error normalization', 'backend/ipc/error-response.js', ['errorMessage', 'errorResponse']],
     ['chat body image sanitization', 'backend/runtime/chat-completion.js', ['sanitizeChatBody', 'sanitizeContent', 'delete sanitized.excludeFromContext']],
-    ['model directory monitoring', 'backend/runtime/models.js', ['class ModelDirectoryMonitor', 'inventorySignature']],
+    ['model directory monitoring', 'backend/runtime/model-directory-monitor.js', ['class ModelDirectoryMonitor', 'inventorySignature']],
     ['runtime number/boolean normalization', 'backend/runtime/normalize.js', ['normalizeInteger', 'normalizeFloat', 'normalizeBoolean']],
     ['tool activity records', 'backend/runtime/agent-loop.js', ['createToolActivity']],
     ['runtime process execution/termination', 'backend/runtime/process-utils.js', ['DEFAULT_MAX_CAPTURE_BYTES', 'runProcessCapture', 'killProcessTree']],
@@ -8080,12 +8298,12 @@ function harness() {
         'toggleDarkstarUiMuted', 'toggleDarkstarTheme', 'resetNodeGraph', 'switchView', 'toggleStatusView', 'createNewTab',
         'toggleOfflineBrowser', 'toggleWorkspace', 'createNewProject', 'offlineBrowserBack',
         'offlineBrowserForward', 'offlineBrowserReload', 'openOfflineBrowserAddress', 'chooseOfflineBrowserFile',
-        'resetSecureBrowser', 'toggleQueue', 'removeImage', 'chooseActiveProjectDirectory',
+        'resetBrowser', 'toggleQueue', 'removeImage', 'chooseActiveProjectDirectory',
         'handleGenerationAction', 'stopGeneration', 'sendMessage', 'closeProjectDeleteModal',
         'confirmProjectDeleteModal', 'closeWorkspaceDeleteModal', 'confirmWorkspaceDeleteModal',
         'editMessage', 'retryMessage', 'copyAssistantMessage', 'continueGeneration', 'deleteChatMessage', 'removeScheduled',
         'removeQueuedGenerationById', 'toggleUipTarget', 'disconnectUipTarget', 'closeTab',
-        'onNodeSearchInput', 'onNodeSearchKeydown', 'onOfflineBrowserAddressKeydown', 'handleImageSelect',
+        'onNodeSearchInput', 'onNodeSearchKeydown', 'onOfflineBrowserAddressKeydown', 'chooseComposerImage',
         'handleKeydown', 'updateScheduleButton', 'handleComposerImagePaste', 'setGenerationControlHeld',
         'closeEditModal',
     ];
@@ -8123,7 +8341,7 @@ const staticCases = [
     ['Reset Graph', 'nodeResetGraphButton', [['resetNodeGraph', []]]],
     ['hidden node-editor nav', 'tabNav', [['switchView', ['settings']]]],
     ['new tab', 'newTabButton', [['createNewTab', []]]],
-    ['Secure Browser toggle', 'offlineBrowserToggle', [['toggleOfflineBrowser', []]]],
+    ['Browser toggle', 'offlineBrowserToggle', [['toggleOfflineBrowser', []]]],
     ['workspace toggle', 'workspaceToggle', [['toggleWorkspace', []]]],
     ['new project', 'projectAddButton', [['createNewProject', []]]],
     ['browser Back', 'offlineBrowserBack', [['offlineBrowserBack', []]]],
@@ -8131,7 +8349,7 @@ const staticCases = [
     ['browser Reload', 'offlineBrowserReload', [['offlineBrowserReload', []]]],
     ['browser Go', 'offlineBrowserOpenButton', [['openOfflineBrowserAddress', []]]],
     ['browser choose local HTML', 'offlineBrowserChooseFileButton', [['chooseOfflineBrowserFile', []]]],
-    ['browser reset private session', 'offlineBrowserReset', [['resetSecureBrowser', []]]],
+    ['browser reset session', 'offlineBrowserReset', [['resetBrowser', []]]],
     ['browser Close', 'offlineBrowserCloseButton', [['toggleOfflineBrowser', [false]]]],
     ['queue toggle', 'queueToggle', [['toggleQueue', []]]],
     ['remove image', 'removeImageButton', [['removeImage', []]]],
@@ -8188,10 +8406,54 @@ test('button execution: browser Enter-address affordance focuses the address inp
     assert.equal(h.elements.get('offlineBrowserAddress').focusCalls, 1);
 });
 
-test('button execution: image upload affordance clicks the hidden image input', () => {
+test('button execution: image upload affordance opens the Darkstar image browser entry point', () => {
     const h = harness();
     h.elements.get('imageUploadButton').listener('click')({});
-    assert.equal(h.elements.get('imageInput').nativeClicks, 1);
+    assert.deepEqual(h.calls, [{ name: 'chooseComposerImage', args: [] }]);
+    assert.equal(h.elements.get('imageInput').nativeClicks, 0, 'the native hidden file input must never be opened by the composer button');
+});
+
+test('composer scrollbar is suppressed while auto-growing and restored only above the 200px cap', () => {
+    const h = harness();
+    const input = h.elements.get('messageInput');
+    const onInput = input.listener('input');
+    assert.equal(typeof onInput, 'function');
+
+    input.scrollHeight = 40;
+    onInput.call(input);
+    assert.equal(input.style.height, '40px');
+    assert.equal(input.style.overflowY, 'hidden', 'short composer must not instantiate native scrollbar chrome at fractional Windows DPI');
+
+    input.scrollHeight = 320;
+    onInput.call(input);
+    assert.equal(input.style.height, '200px');
+    assert.equal(input.style.overflowY, 'auto', 'long drafts must retain a real vertical scrollbar');
+
+    input.scrollHeight = 60;
+    onInput.call(input);
+    assert.equal(input.style.overflowY, 'hidden', 'shrinking a long draft must remove the scrollbar again');
+});
+
+test('composer CSS avoids the standardized/native scrollbar path while preserving the custom long-text scrollbar', () => {
+    const styles = fs.readFileSync(path.join(root, 'backend', 'shell', 'styles.css'), 'utf8');
+    const composerRule = styles.match(/\.input-wrapper textarea\s*\{([^}]*)\}/m);
+    assert.ok(composerRule);
+    assert.match(composerRule[1], /overflow-y\s*:\s*hidden\s*;/u);
+    assert.doesNotMatch(composerRule[1], /scrollbar-(?:width|color)\s*:/u,
+        'standard scrollbar properties must not override the Chromium author scrollbar rules');
+    assert.match(styles, /\.input-wrapper textarea::-webkit-scrollbar\s*\{[^}]*width\s*:\s*6px\s*;/u);
+    assert.match(styles, /\.input-wrapper textarea::-webkit-scrollbar-button\s*\{[^}]*display\s*:\s*none\s*;[^}]*width\s*:\s*0\s*;[^}]*height\s*:\s*0\s*;/u);
+});
+
+test('every composer reset returns overflow to the short-draft hidden state', () => {
+    const renderer = fs.readFileSync(path.join(root, 'backend', 'Darkstar_Renderer.js'), 'utf8');
+    const resetWrites = [...renderer.matchAll(/(?:input|scheduledInput)\.style\.height = 'auto';([^\n]*)/gu)];
+    assert.ok(resetWrites.length >= 12, 'expected all composer clear/restore paths to remain covered');
+    for (const match of resetWrites) {
+        assert.match(match[1], /overflowY\s*=\s*'hidden'/u, 'composer height reset must synchronously suppress native vertical scrollbar chrome');
+    }
+    assert.match(renderer, /Math\.min\(input\.scrollHeight(?: \|\| 0)?, 200\) \+ 'px'; input\.style\.overflowY = \(?input\.scrollHeight/u,
+        'programmatic composer insertion/restore must restore overflow only when content exceeds the cap');
 });
 
 test('static HTML contains no executable inline event attributes', () => {
@@ -8276,10 +8538,32 @@ test('button: UIP picker Close keeps its feature-owned close handler', () => {
     assert.match(read('backend/renderer/uip.js'), /getElementById\('uipWindowPickerClose'\)[\s\S]*?addEventListener\('click', closePicker\)/u);
 });
 
+test('buttons: Authorization and Filesystem Access controls remain owned by their security modules', () => {
+    for (const id of ['nodePermissionPolicyButton', 'permissionPolicyClose', 'nodeFilesystemAccessButton', 'filesystemAccessClose']) {
+        assert.doesNotMatch(openingTag(buttonMarkup(`id="${id}"`)), /\son[a-z]+\s*=/iu);
+    }
+    const source = read('backend/renderer/permission-policy.js');
+    assert.match(source, /nodePermissionPolicyButton'[\s\S]*?addEventListener\('click'/u);
+    assert.match(source, /permissionPolicyClose'[\s\S]*?addEventListener\('click'/u);
+    const filesystemSource = read('backend/renderer/filesystem-access-policy.js');
+    assert.match(filesystemSource, /nodeFilesystemAccessButton'[\s\S]*?addEventListener\('click'/u);
+    assert.match(filesystemSource, /filesystemAccessClose'[\s\S]*?addEventListener\('click'/u);
+});
+
 test('button: workflow modal Abort keeps its workflow-owned handler', () => {
     const markup = buttonMarkup('id="workflowFileAbortButton"');
     assert.doesNotMatch(openingTag(markup), /\son[a-z]+\s*=/iu);
     assert.match(read('backend/renderer/workflow-file-modal.js'), /workflowFileAbortButton[\s\S]*?addEventListener\('click', abort\)/u);
+});
+
+test('button: workflow filesystem history buttons keep their feature-owned handlers', () => {
+    const back = buttonMarkup('id="workflowFileBackButton"');
+    const forward = buttonMarkup('id="workflowFileForwardButton"');
+    assert.doesNotMatch(openingTag(back), /\son[a-z]+\s*=/iu);
+    assert.doesNotMatch(openingTag(forward), /\son[a-z]+\s*=/iu);
+    const modal = read('backend/renderer/workflow-file-modal.js');
+    assert.match(modal, /workflowFileBackButton[\s\S]*?navigateFilesystemHistory\(-1\)/u);
+    assert.match(modal, /workflowFileForwardButton[\s\S]*?navigateFilesystemHistory\(1\)/u);
 });
 
 test('button: workflow modal Commit keeps its workflow-owned handler', () => {
@@ -8288,9 +8572,21 @@ test('button: workflow modal Commit keeps its workflow-owned handler', () => {
     assert.match(read('backend/renderer/workflow-file-modal.js'), /workflowFileCommitButton[\s\S]*?addEventListener\('click',[\s\S]*?commit\(\)/u);
 });
 
-test('button inventory: all 44 current static buttons are explicit type=button controls with no inline JavaScript', () => {
+test('buttons: model-attention decisions keep their reusable feature-owned handlers', () => {
+    for (const id of ['agentAttentionAllow', 'agentAttentionReject']) {
+        assert.doesNotMatch(openingTag(buttonMarkup(`id="${id}"`)), /\son[a-z]+\s*=/iu);
+    }
+    const source = read('backend/renderer/attention.js');
+    assert.match(source, /agentAttentionAllow'[\s\S]*?resolveAgentAttentionDecision\('allow'\)/u);
+    assert.match(source, /agentAttentionReject'[\s\S]*?resolveAgentAttentionDecision\('reject'\)/u);
+    assert.match(source, /request\.decisionMode === 'yes-no' \? 'Yes' : 'Allow'/u);
+    assert.match(source, /request\.decisionMode === 'yes-no' \? 'No' : 'Reject'/u);
+    assert.doesNotMatch(source, /agentAttentionRedirect|beginAgentAttentionRedirect|decision: 'redirect'/u);
+});
+
+test('button inventory: all 59 current static buttons are explicit type=button controls with no inline JavaScript', () => {
     const buttons = html.match(/<button\b[^>]*>[\s\S]*?<\/button>/gu) || [];
-    assert.equal(buttons.length, 44);
+    assert.equal(buttons.length, 59);
     for (const button of buttons) {
         const tag = openingTag(button);
         assert.match(tag, /\btype="button"/u, `button is missing type=button: ${tag}`);
@@ -8343,6 +8639,8 @@ test('renderer loads every current feature module in the dependency-sensitive or
         'backend/renderer/generation-ui.js',
         'backend/renderer/modal-coordinator.js',
         'backend/renderer/preferences.js',
+        'backend/renderer/permission-policy.js',
+        'backend/renderer/filesystem-access-policy.js',
         'backend/renderer/nodes/sdk.js',
         'backend/renderer/nodes/control-renderers.js',
         'backend/renderer/nodes/services.js',
@@ -8372,6 +8670,7 @@ test('renderer loads every current feature module in the dependency-sensitive or
         'backend/renderer/context-contract.js',
         'backend/renderer/projects.js',
         'backend/renderer/workspace.js',
+        'backend/renderer/attention.js',
         'backend/renderer/uip.js',
         'backend/renderer/chat-session.js',
         'backend/renderer/offline-browser.js',
@@ -8449,7 +8748,7 @@ const vm = require('node:vm');
 const ROOT = path.join(__dirname, '..', '..', '..');
 function source(rel) { return fs.readFileSync(path.join(ROOT, rel), 'utf8'); }
 
-function samplerHarness() {
+function samplerHarness(completeOverrides = {}) {
     let completeListener = null;
     let errorListener = null;
     let chunkListener = null;
@@ -8476,7 +8775,7 @@ function samplerHarness() {
                     finishReason: 'stop',
                     agentRounds: 1,
                     toolRounds: 0,
-                    contextUsage: { promptTokens: 12, completionTokens: 2, totalTokens: 14 }
+                    contextUsage: { promptTokens: 12, completionTokens: 2, totalTokens: 14 }, ...completeOverrides
                 });
             }
             return { success: true };
@@ -8487,6 +8786,7 @@ function samplerHarness() {
         setTimeout,
         clearTimeout,
         AbortController,
+        structuredClone,
         CustomEvent: function CustomEvent(type, init) { this.type = type; this.detail = init && init.detail; },
         dispatchEvent() {},
         document: { getElementById() { return null; } },
@@ -8548,6 +8848,23 @@ test('core generation captures a stable chat runtime and survives loss of Darkst
     assert.equal(calls.request.model, 'model.gguf');
     assert.equal(result.text, 'hello world');
     assert.equal(result.finishReason, 'stop');
+});
+
+test('permission decisions stay inside tool execution and are not transported as sampler completion metadata', async () => {
+    const { getDefinition } = samplerHarness({ finishReason: 'stop', stopDetails: null });
+    const sampler = getDefinition();
+    const messages = [{ role: 'user', content: 'change directory' }];
+    messages._darkstarContextOverflowPolicy = 'off';
+    const sampled = await sampler.execute({
+        model: { id: 'model.gguf', multimodal: false }, text: messages, while: { nameConversations: false },
+        tools: { providers: [], maxRounds: 'auto', toolChoice: 'auto' }, skills: { skills: [] }
+    }, sampler.factory('sampler-permission-boundary', 0, 0), { tabId: 1, projectId: 1, workspaceId: 'workspace', uipScopeId: 'project-1', parallelSlots: 1 });
+    assert.equal(sampled.finishReason, 'stop');
+    assert.equal(Object.hasOwn(sampled, 'attentionRequestId'), false);
+    const samplerSource = source('backend/renderer/nodes/builtin/sampler.js');
+    const graphSource = source('backend/renderer/graph-execution.js');
+    assert.doesNotMatch(samplerSource, /attentionRequestId|attention_required/u);
+    assert.doesNotMatch(graphSource, /attentionRequestId|attention_required/u);
 });
 
 test('generation, title generation, and compaction never dereference the mutable node-services stream API at execution time', () => {
@@ -10101,7 +10418,7 @@ test('slot monitor publishes factual rises and native-shift drops exactly as /sl
         }]),
         onUsage(usage) { emitted.push(usage.activeContextTokens); },
     });
-    await sleep(28);
+    for (let attempt = 0; attempt < 100 && !emitted.includes(15003); attempt += 1) await sleep(4);
     await monitor.stop();
     assert.ok(emitted.includes(21955));
     assert.ok(emitted.includes(21974));
@@ -10454,6 +10771,9 @@ test('message bubble is the primary reveal target and controls remain stable out
         'icon controls must not inherit text line-height that can clip below the gutter');
     assert.match(button[1], /border-radius: 8px;/u);
     assert.match(button[1], /border: 1px solid transparent;/u);
+    assert.match(button[1], /-webkit-user-select: none;/u);
+    assert.match(button[1], /user-select: none;/u,
+        'message action controls must never become part of copied/selected chat text');
     assert.match(css, /\.btn-action svg \{ width: 16px; height: 16px;/u,
         'vector action glyphs must share the enlarged compact optical size');
 });
@@ -10536,7 +10856,8 @@ test('every rendered chat message role gets the same minus delete action below t
         assert.match(html, /data-ui-action="delete-message"/u, `${role} is missing delete`);
         assert.match(html, /data-message-id="message-3"/u);
         assert.match(html, /aria-label="Delete message"/u);
-        assert.match(html, />−<\/span>/u);
+        assert.match(html, /<svg[\s\S]*?<path d="M7 12h10"\/><\/svg>/u);
+        assert.doesNotMatch(html, /[↻−]/u, 'message action icons must not expose selectable text glyphs');
     }
     assert.match(context.messageActionsHtml('user', 3, 'message-3'), /data-ui-action="edit-message"/u);
     assert.match(context.messageActionsHtml('assistant', 3, 'message-3'), /data-ui-action="copy-message"/u);
@@ -10816,7 +11137,7 @@ test('conversation naming is a user-only internal harness request with reasoning
     assert.match(titleSource, /DARKSTAR INTERNAL TITLE TASK/u);
     assert.match(titleSource, /return \[\{ role: 'user', content: userContent \}\]/u);
     assert.doesNotMatch(titleSource, /role:\s*'system'/u);
-    assert.match(send, /control:\s*\{ reasoning:\s*'off', reasoningFormat:\s*'none' \}/u);
+    assert.match(send, /control:\s*\{ reasoning:\s*'off', reasoningFormat:\s*'none', modelIdleUnloadSeconds:\s*request && request\.control \? Number\(request\.control\.modelIdleUnloadSeconds\) \|\| 0 : 0 \}/u);
 });
 
 test('compaction is a user-only harness task isolated from Sampler reasoning settings', () => {
@@ -11615,7 +11936,7 @@ test('Load Server backend-specific controls never expose CUDA selection for Vulk
     const vulkanHtml = definition.buildContentHTML(vulkan);
     assert.match(vulkanHtml, /Vulkan devices/u);
     assert.match(vulkanHtml, /Flash Attention[\s\S]*Off — Vulkan correctness safeguard/u);
-    assert.doesNotMatch(vulkanHtml, /boolean:Flash Attention/u, 'Vulkan must not expose an unsafe Flash Attention toggle for pinned b10520');
+    assert.doesNotMatch(vulkanHtml, /boolean:Flash Attention/u, 'Vulkan must not expose an unsafe Flash Attention toggle for pinned b10645');
     assert.doesNotMatch(vulkanHtml, /select:CUDA devices|Multi-GPU loading|CUDA visibility/u);
 
     const cpu = definition.factory('server-cpu', 10, 20);
@@ -11655,7 +11976,7 @@ test('server config normalizes CPU/Vulkan/CUDA semantics instead of treating bac
     assert.equal(vulkan.backend, 'vulkan');
     assert.equal(vulkan.gpuLayers, 'all');
     assert.equal(vulkan.multiGpuMode, 'sequential');
-    assert.equal(vulkan.flashAttention, false, 'pinned b10520 Vulkan must force Flash Attention off for correctness');
+    assert.equal(vulkan.flashAttention, false, 'pinned b10645 Vulkan must force Flash Attention off for correctness');
     assert.deepEqual(vulkan.gpuDeviceIds, []);
     const vulkanArgs = buildSharedArgs(vulkan, modernCapabilities, '127.0.0.1');
     assert.equal(argValue(vulkanArgs, '--flash-attn'), 'off');
@@ -12137,17 +12458,24 @@ function runtimeContext() {
     context.window = context;
     vm.createContext(context);
     vm.runInContext(viewsSource, context, { filename: 'views.js' });
+    vm.runInContext(controlsSource, context, { filename: 'controls.js' });
     return { context, unloadCalls, invalidations: () => invalidations };
 }
 
 test('runtime-owning node edits defer model unload until Nodes -> Chat, with Sampler limited to context size', async () => {
     const { context, unloadCalls, invalidations } = runtimeContext();
 
-    const control = { type: 'control', params: { nameConversations: true } };
+    const control = { type: 'control', params: { nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: false } };
     let before = context.nodeRuntimeUnloadRelevantSignature(control);
-    control.params.futureSetting = 'future-compatible';
-    assert.equal(context.noteNodeRuntimeConfigMutation(control, before), true, 'any current or future Control param must dirty the runtime');
+    control.params.nameConversations = false;
+    assert.equal(context.noteNodeRuntimeConfigMutation(control, before), true, 'Control settings that affect inference behavior must still dirty the runtime');
     assert.equal(unloadCalls.length, 0, 'editing while still in Nodes must never unload immediately');
+
+    context.nodeRuntimeUnloadPending = false;
+    before = context.nodeRuntimeUnloadRelevantSignature(control);
+        control.params.futureSetting = 'future-compatible';
+    assert.equal(context.noteNodeRuntimeConfigMutation(control, before), false, 'unknown Control metadata must not silently acquire model-reload semantics');
+    context.nodeRuntimeUnloadPending = true;
 
     await context.unloadModelForDeferredNodeChanges();
     assert.deepEqual(unloadCalls, ['actually-loaded.gguf'], 'deferred unload must target the model the runtime says is actually loaded');
@@ -12176,6 +12504,41 @@ test('runtime-owning node edits defer model unload until Nodes -> Chat, with Sam
     sampler.params.contextSize = 32000;
     assert.equal(context.noteNodeRuntimeConfigMutation(sampler, before), true, 'KSampler context-size changes must defer an unload');
 
+    const loader = context.nodeEditorState.nodes[0];
+    loader.params = { projectorPath: 'C:\\Models\\vision-a.mmproj', projectorSource: 'manual' };
+    context.getNodeDef = () => null;
+    context.nodeRuntimeUnloadPending = false;
+    assert.equal(context.setNodeParamValue(loader.id, 'projectorPath', 'string', 'C:\\Models\\vision-b.mmproj'), true);
+    assert.equal(context.nodeRuntimeUnloadPending, true, 'changing the selected projector must dirty the loaded runtime');
+    context.nodeRuntimeUnloadPending = false;
+    assert.equal(context.setNodeParamValue(loader.id, 'projectorPath', 'string', 'C:\\Models\\vision-b.mmproj'), true);
+    assert.equal(context.nodeRuntimeUnloadPending, false, 're-selecting the same projector must not trigger a redundant unload');
+    assert.equal(context.setNodeParamValue(loader.id, 'projectorPath', 'string', ''), true);
+    assert.equal(context.nodeRuntimeUnloadPending, true, 'selecting No Projector must dirty a runtime that had a projector');
+
+    const skills = { id: 7, type: 'skills', params: { skills: [{ path: 'C:\\Skills\\alpha\\SKILL.md' }] }, status: 'active', statusMessage: '' };
+    context.nodeEditorState.nodes.push(skills);
+    context.getNodeDef = (type) => type === 'skills' ? {
+        async onAction(node, action) {
+            if (action === 'add-skill-file') node.params.skills.push({ path: 'C:\\Skills\\beta\\SKILL.md' });
+            if (action === 'remove-skill-file:1') node.params.skills.splice(1, 1);
+        },
+        async onFilesDropped(node, paths) { node.params.skills.push({ path: paths[0] }); },
+    } : null;
+    context.nodeRuntimeUnloadPending = false;
+    await context.runNodeAction(null, { disabled: false, dataset: { nodeId: '7', action: 'add-skill-file' } });
+    assert.equal(context.nodeRuntimeUnloadPending, true, 'adding a skill through the normal node action must dirty the runtime');
+    context.nodeRuntimeUnloadPending = false;
+    await context.runNodeAction(null, { disabled: false, dataset: { nodeId: '7', action: 'remove-skill-file:1' } });
+    assert.equal(context.nodeRuntimeUnloadPending, true, 'removing a skill must dirty the runtime');
+    context.nodeRuntimeUnloadPending = false;
+    await context.runNodeFileDrop({
+        preventDefault() {}, stopPropagation() {}, dataTransfer: { files: [{ path: 'C:\\Skills\\gamma\\SKILL.md' }] },
+    }, {
+        dataset: { nodeId: '7' }, classList: { remove() {} }, setAttribute() {},
+    });
+    assert.equal(context.nodeRuntimeUnloadPending, true, 'adding a skill by drag-and-drop must use the same dirty-runtime policy');
+
     const settingsView = {
         classList: {
             active: true,
@@ -12199,6 +12562,8 @@ test('runtime-owning node edits defer model unload until Nodes -> Chat, with Sam
         'the deferred unload must be consumed specifically on the Nodes -> Chat transition');
     assert.match(controlsSource, /runtimeSignatureBefore[\s\S]*noteNodeRuntimeConfigMutation\(node, runtimeSignatureBefore\)/u,
         'generic parameter/action plumbing must own mutation detection so future protected settings inherit the policy');
+    assert.match(controlsSource, /runNodeFileDrop[\s\S]*runtimeSignatureBefore[\s\S]*noteNodeRuntimeConfigMutation\(node, runtimeSignatureBefore\)/u,
+        'file-drop mutations must participate in the same deferred runtime invalidation path');
     assert.match(contextContractSource, /function invalidateContextContractForModelUnload\([\s\S]*setContextContractRuntimeContextReady\(false\)[\s\S]*clearComposerContextContract/u,
         'model unload must clear context authority and stale per-tab contract latches');
 });
@@ -12385,7 +12750,7 @@ test('reset does not remove local tools later in the same agent round', async ()
     assert.equal(state.workingMessages.some((message) => /ONLINE_BROWSER_CAPABILITY_BOUNDARY/u.test(String(message.content || ''))), false);
 });
 
-test('actual HTTPS page observation still activates the browser-only security boundary', async () => {
+test('actual HTTPS page observation still activates the browser-only boundary', async () => {
     const state = await executePair(
         { action: 'open', url: 'https://example.com/' },
         { success: true, action: 'open', mode: 'online', url: 'https://example.com/' },
@@ -12470,7 +12835,7 @@ function fixture() {
         consoleMessages,
         maxWaitMs: 10_000,
         untrustedWarning: 'UNTRUSTED',
-        sanitizeStatus(value) { return { ...value, secure: true }; },
+        sanitizeStatus(value) { return { ...value }; },
     };
     return {
         calls,
@@ -12491,7 +12856,7 @@ test('online browser control routes open/status through explicit dependencies', 
     assert.equal(state.calls.snapshots, 1);
 
     const status = await state.control({ action: 'status' });
-    assert.equal(status.status.secure, true);
+    assert.equal(status.status.url, 'https://open.example/');
     assert.equal(status.pointer.x, 10);
 });
 
@@ -12555,6 +12920,7 @@ const { EventEmitter } = require('node:events');
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 const { TabbedBrowserService } = require(path.join(ROOT, 'backend', 'browser', 'tabbed-browser-service.js'));
 const { ToolService } = require(path.join(ROOT, 'backend', 'agent', 'tool-service.js'));
+const { resolveToolResultAction } = require(path.join(ROOT, 'backend', 'agent', 'tool-runtime.js'));
 
 class FakeSession extends EventEmitter {
     constructor() {
@@ -12703,6 +13069,57 @@ test('browser work routed to an inactive tab stays in that tab and cannot replac
     assert.equal(status.visible, true);
 
     await service.destroy();
+});
+
+test('first agent browser interaction opens once per chat tab and manual close remains respected', async () => {
+    const { service, window } = fixture();
+
+    service.activate('11');
+    assert.equal(service.getStatus({ browserId: '11' }).visible, false);
+
+    const firstUse = service.showOnFirstAgentBrowserInteraction({ browserId: '11' });
+    assert.equal(firstUse.visible, true, 'the first model browser interaction should expose the browser for that chat tab');
+    const firstView = service.sessions.get('11').service.offline.view;
+    assert.equal(window.attached, firstView, 'the active tab browser should be attached immediately on first model browser use');
+
+    service.setVisible(false, { browserId: '11' });
+    assert.equal(service.getStatus({ browserId: '11' }).visible, false);
+    const laterUse = service.showOnFirstAgentBrowserInteraction({ browserId: '11' });
+    assert.equal(laterUse.visible, false, 'later model browser actions must not reopen a browser the user manually closed');
+
+    service.activate('22');
+    assert.equal(service.getStatus({ browserId: '22' }).visible, false, 'each chat tab starts with independent first-use state');
+    assert.equal(service.showOnFirstAgentBrowserInteraction({ browserId: '22' }).visible, true, 'a different chat tab gets its own one-time auto-open');
+
+    service.activate('23');
+    service.setVisible(true, { browserId: '23' });
+    const alreadyOpenFirstUse = service.showOnFirstAgentBrowserInteraction({ browserId: '23' });
+    assert.equal(alreadyOpenFirstUse.visible, true, 'first use must not disturb a browser that is already open');
+    service.setVisible(false, { browserId: '23' });
+    assert.equal(service.showOnFirstAgentBrowserInteraction({ browserId: '23' }).visible, false, 'an already-open first use is still consumed exactly once');
+
+    await service.destroy();
+});
+
+test('browser tool result actions trigger the per-tab first-use visibility hook before browser work', async () => {
+    const calls = [];
+    const browser = {
+        showOnFirstAgentBrowserInteraction(options) { calls.push(['show', String(options.browserId)]); },
+        controlBrowser(result, options) { calls.push(['control', String(options.browserId), result.action]); return Promise.resolve({ success: true }); },
+        captureHtml(result, options) { calls.push(['capture', String(options.browserId), result.path]); return Promise.resolve({ success: true }); },
+    };
+
+    await resolveToolResultAction({ __darkstarAction: 'browser_control', action: 'reset' }, {
+        offlineBrowser: browser, toolName: 'browser_control', browserId: '31', visionEnabled: false,
+    });
+    await resolveToolResultAction({ __darkstarAction: 'screenshot_html', path: 'page.html' }, {
+        offlineBrowser: browser, toolName: 'screenshot_html', browserId: '32', visionEnabled: true,
+    });
+
+    assert.deepEqual(calls, [
+        ['show', '31'], ['control', '31', 'reset'],
+        ['show', '32'], ['capture', '32', 'page.html'],
+    ]);
 });
 
 test('closing a tab releases only that tab browser and leaves sibling browser instances alive', async () => {
@@ -12885,7 +13302,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const { createMainWindow } = require('../../app/main-window');
-const { createPowerProtection } = require('../../app/run-main-app');
+const { configureWindowsAppIdentity, createPowerProtection, focusExistingMainWindow } = require('../../app/run-main-app');
 
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 
@@ -12917,6 +13334,44 @@ test('main renderer explicitly disables Chromium background throttling', () => {
         'Darkstar main renderer must remain unthrottled when Windows locks/occludes the window');
     assert.equal(window.webContents.listenerCount('preload-error'), 1,
         'sandboxed preload failures must be surfaced to the launching terminal');
+});
+
+test('Windows process identity uses Darkstar app ID instead of Electron identity', () => {
+    const ids = [];
+    const app = { setAppUserModelId(id) { ids.push(id); } };
+    assert.equal(configureWindowsAppIdentity(app, 'win32'), true);
+    assert.deepEqual(ids, ['com.darkstar.chat']);
+    assert.equal(configureWindowsAppIdentity(app, 'linux'), false);
+    assert.deepEqual(ids, ['com.darkstar.chat'], 'non-Windows platforms must not receive Windows shell identity calls');
+});
+
+test('single-instance window handoff restores, shows, and focuses the existing Darkstar window', () => {
+    const calls = [];
+    const window = {
+        isDestroyed: () => false,
+        isMinimized: () => true,
+        restore: () => calls.push('restore'),
+        isVisible: () => false,
+        show: () => calls.push('show'),
+        focus: () => calls.push('focus'),
+    };
+    assert.equal(focusExistingMainWindow(window), true);
+    assert.deepEqual(calls, ['restore', 'show', 'focus']);
+    assert.equal(focusExistingMainWindow({ isDestroyed: () => true }), false,
+        'destroyed windows must never be targeted by a second-instance handoff');
+});
+
+test('main app acquires Electron single-instance lock before runtime services and focuses the primary on relaunch', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'backend', 'app', 'run-main-app.js'), 'utf8');
+    const identity = source.indexOf('configureWindowsAppIdentity(app);');
+    const lock = source.indexOf('app.requestSingleInstanceLock()');
+    const services = source.indexOf('const services = createRuntimeServices');
+    assert.ok(identity >= 0 && lock > identity && services > lock,
+        'Windows app identity and single-instance ownership must be established before Darkstar initializes runtime services');
+    assert.match(source, /if \(typeof app\.requestSingleInstanceLock === 'function' && !app\.requestSingleInstanceLock\(\)\) \{[\s\S]*?app\.quit\(\);[\s\S]*?return null;/u,
+        'secondary launches must quit before constructing another Darkstar app instance');
+    assert.match(source, /app\.on\('second-instance', \(\) => \{ focusPrimaryWindow\(\); \}\);/u,
+        'a second launch must hand focus back to the primary Darkstar window');
 });
 
 test('application power guard requests prevent-app-suspension exactly once and releases it on shutdown', () => {
@@ -14731,6 +15186,7 @@ function loadControlDefinition() {
     let definition = null;
     const controls = {
         toggle(label, value, _id, param) { return `[toggle:${label}:${value}:${param}]`; },
+        numberInput(label, value, _id, param) { return `[number:${label}:${value}:${param}]`; },
         status() { return '[status]'; },
     };
     const nodes = {
@@ -14790,18 +15246,29 @@ test('reasoning-pruning runtime module and model-facing Control settings are phy
     });
 });
 
-test('Control node exposes conversation naming and Auto-compact without any pruning controls', async () => {
+test('Control node exposes a default-OFF model idle unload toggle with a fixed 10-minute timeout', async () => {
     const definition = loadControlDefinition();
     const node = definition.factory('control-1', 0, 0);
-    assert.deepEqual(Object.keys(node.params).sort(), ['autoCompact', 'nameConversations']);
+    assert.deepEqual(Object.keys(node.params).sort(), ['autoCompact', 'modelIdleUnloadEnabled', 'nameConversations']);
     const html = definition.buildContentHTML(node);
     assert.match(html, /Name Conversations/u);
     assert.match(html, /Auto-compact/u);
+    assert.match(html, /Model idle unload/u);
     assert.equal(/Context Pruning|Image Pruning|headroom/u.test(html), false);
 
     const output = await definition.execute({}, node);
-    assert.deepEqual(Object.keys(output.while).sort(), ['autoCompact', 'nameConversations']);
+    assert.deepEqual(Object.keys(output.while).sort(), ['autoCompact', 'modelIdleUnloadSeconds', 'nameConversations']);
     assert.equal(output.while.autoCompact, false);
+    assert.equal(node.params.modelIdleUnloadEnabled, false, 'model idle unload must default OFF');
+    assert.equal(output.while.modelIdleUnloadSeconds, 0);
+
+    node.params.modelIdleUnloadEnabled = true;
+    const enabledOutput = await definition.execute({}, node);
+    assert.equal(enabledOutput.while.modelIdleUnloadSeconds, 600, 'ON must use the fixed 10-minute timeout');
+
+    const legacyEnabled = { id: 'legacy-idle', params: { nameConversations: true, autoCompact: false, modelIdleUnloadSeconds: 45 } };
+    definition.normalizeNode(legacyEnabled);
+    assert.equal(legacyEnabled.params.modelIdleUnloadEnabled, true, 'legacy positive idle timeouts must migrate to ON');
 });
 
 test('old workflow pruning fields are discarded instead of influencing the normalized Control node', () => {
@@ -14819,6 +15286,7 @@ test('old workflow pruning fields are discarded instead of influencing the norma
     assert.deepEqual(JSON.parse(JSON.stringify(old.params)), {
         nameConversations: false,
         autoCompact: false,
+        modelIdleUnloadEnabled: false,
     });
 });
 });
@@ -14875,7 +15343,7 @@ function actionableRendererFiles() {
 
 test('completeness: every renderer JavaScript module has an explicit feature regression contract', () => {
     const files = jsFiles('backend/renderer');
-    assert.equal(files.length, 59, 'renderer source inventory changed; add regression coverage for the new/removed module');
+    assert.equal(files.length, 63, 'renderer source inventory changed; add regression coverage for the new/removed module');
     for (const file of files) {
         assert.ok(featureInventory.includes(`'${file}'`), `${file} has no explicit feature regression contract`);
     }
@@ -14883,7 +15351,7 @@ test('completeness: every renderer JavaScript module has an explicit feature reg
 
 test('completeness: every first-party backend JavaScript module has an explicit feature regression contract', () => {
     const files = jsFiles('backend', (file) => !file.includes('/python_vendor/') && !file.startsWith('backend/renderer/') && !file.startsWith('backend/scripts/') && !file.startsWith('backend/vendor/') && !file.startsWith('backend/Dev/'));
-    assert.equal(files.length, 111, 'backend source inventory changed; add regression coverage for the new/removed module');
+    assert.equal(files.length, 121, 'backend source inventory changed; add regression coverage for the new/removed module');
     for (const file of files) {
         assert.ok(featureInventory.includes(`'${file}'`), `${file} has no explicit feature regression contract`);
     }
@@ -14899,7 +15367,7 @@ test('completeness: every built-in node module is explicitly represented in the 
 
 test('completeness: every renderer module that creates or listens to actionable UI is covered', () => {
     const files = actionableRendererFiles();
-    assert.equal(files.length, 28, 'actionable renderer file inventory changed; add direct control tests for the changed surface');
+    assert.equal(files.length, 31, 'actionable renderer file inventory changed; add direct control tests for the changed surface');
     const allControlTests = staticInventory + '\n' + dynamicInventory + '\n' + staticExecutionInventory + '\n' + delegatedExecutionInventory + '\n' + featureInventory;
     for (const file of files) {
         assert.ok(allControlTests.includes(`'${file}'`), `${file} exposes UI actions but is absent from the exhaustive regression layer`);
@@ -14909,20 +15377,20 @@ test('completeness: every renderer module that creates or listens to actionable 
 test('completeness: static button count and external wiring are mechanically locked', () => {
     const buttons = html.match(/<button\b[^>]*>[\s\S]*?<\/button>/gu) || [];
     const inline = buttons.filter((button) => /\bonclick=/u.test((button.match(/^<button\b[^>]*>/u) || [''])[0]));
-    assert.equal(buttons.length, 44);
+    assert.equal(buttons.length, 59);
     assert.equal(inline.length, 0);
-    assert.ok(staticInventory.includes('all 44 current static buttons'));
+    assert.ok(staticInventory.includes('all 59 current static buttons'));
     assert.ok(staticExecutionInventory.includes('static HTML contains no executable inline event attributes'));
     assert.ok(delegatedExecutionInventory.includes('workspace Choose Directory invokes chooser'));
     assert.ok(delegatedExecutionInventory.includes('UIP Connect application opens the picker'));
     assert.ok(delegatedExecutionInventory.includes('UIP picker Close hides the picker'));
 });
 
-test('completeness: dynamic actionable-family inventory is locked to the current 58 families', () => {
-    assert.ok(dynamicInventory.includes('assert.equal(contracts.length, 58)'));
+test('completeness: dynamic actionable-family inventory is locked to the current 60 families', () => {
+    assert.ok(dynamicInventory.includes('assert.equal(contracts.length, 60)'));
     const body = dynamicInventory.split('const contracts = [', 2)[1].split('\n];', 1)[0];
     const declared = body.split('\n').filter((line) => line.trimStart().startsWith("['")).length;
-    assert.equal(declared, 58, 'dynamic control manifest changed without updating its completeness contract');
+    assert.equal(declared, 60, 'dynamic control manifest changed without updating its completeness contract');
 });
 });
 
@@ -14945,7 +15413,7 @@ const {
     runtimeIconPath,
     sourceIconPath,
 } = require('../../app/runtime-icon');
-const { createMainWindow } = require('../../app/main-window');
+const { DARKSTAR_APP_USER_MODEL_ID, createMainWindow } = require('../../app/main-window');
 
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 const PNG_SIGNATURE = Buffer.from('89504e470d0a1a0a', 'hex');
@@ -14989,9 +15457,11 @@ class FakeBrowserWindow extends EventEmitter {
         super();
         this.webContents = new FakeWebContents();
         FakeBrowserWindow.options = options;
+        FakeBrowserWindow.appDetails = null;
     }
     loadFile() {}
     setMenuBarVisibility() {}
+    setAppDetails(details) { FakeBrowserWindow.appDetails = { ...details }; }
 }
 
 test('runtime icon paths keep the PNG in backend and the generated ICO in app data', () => {
@@ -15036,15 +15506,21 @@ test('ICO encoder rejects malformed frames instead of emitting a corrupt runtime
     assert.throws(() => encodeIco([{ size: 257, png: fakePng(1) }]), /Invalid Windows icon size/u);
 });
 
-test('main BrowserWindow accepts the generated runtime ICO path explicitly', () => {
+test('main BrowserWindow binds the generated ICO to the Windows taskbar identity explicitly', () => {
     const generated = path.join(ROOT, 'generated', 'darkstar.ico');
-    createMainWindow(FakeBrowserWindow, ROOT, null, { iconPath: generated });
+    createMainWindow(FakeBrowserWindow, ROOT, null, { iconPath: generated, platform: 'win32' });
     assert.equal(FakeBrowserWindow.options.icon, generated);
+    assert.deepEqual(FakeBrowserWindow.appDetails, {
+        appId: DARKSTAR_APP_USER_MODEL_ID,
+        appIconPath: path.resolve(generated),
+        appIconIndex: 0,
+    });
 });
 
 test('package and renderer reference only the backend PNG source, never a repository ICO', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'package.json'), 'utf8'));
     const html = fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'index.html'), 'utf8');
+    assert.equal(pkg.build?.appId, DARKSTAR_APP_USER_MODEL_ID, 'packaged and runtime Windows identities must remain identical');
     assert.equal(pkg.build?.win?.icon, undefined);
     assert.equal(pkg.build.files.includes('icon.png'), false);
     assert.equal(pkg.build.files.includes('icon.ico'), false);
@@ -15720,9 +16196,9 @@ function loadCommands(options = {}) {
     return { sandbox, tab, input, menu, streamed, sent, continued, scheduled, interrupted, cancelled, graphPreparations, renderSnapshots, compactionActivities, lifecycle };
 }
 
-test('slash command catalog is alphabetical and exposes adversary, compact, continue, then hug', () => {
+test('slash command catalog is alphabetical and exposes adversary, compact, then continue', () => {
     const { sandbox } = loadCommands();
-    assert.deepEqual(Array.from(sandbox.Darkstar.systemCommands.catalog(), (item) => item.name), ['adversary', 'compact', 'continue', 'hug']);
+    assert.deepEqual(Array.from(sandbox.Darkstar.systemCommands.catalog(), (item) => item.name), ['adversary', 'compact', 'continue']);
     const source = read('backend/shell/styles.css');
     assert.match(source, /\.slash-command-menu[\s\S]*max-height:\s*236px[\s\S]*overflow-y:\s*auto/u);
     assert.match(read('backend/shell/index.html'), /id="slashCommandMenu"[^>]*role="listbox"/u);
@@ -15915,44 +16391,7 @@ test('/compact runtime failure is owned by the command API: command bubble first
     assert.match(failure.error, /Synthetic model startup failure/u);
 });
 
-test('/hug persists the supportive event as a user turn and triggers generation without a duplicate user append', async () => {
-    const { sandbox, tab, sent } = loadCommands();
-    const result = await sandbox.Darkstar.systemCommands.invoke('/hug', { tab, input: { value: '/hug', style: {}, focus() {}, setSelectionRange() {} } });
-    assert.equal(result.success, true);
-    assert.equal(result.intervention, false);
-    const hug = tab.history.at(-1);
-    assert.equal(hug.role, 'user');
-    assert.equal(hug.content, '**The user hugged you** You are doing great, keep going!');
-    assert.equal(hug.systemCommand, 'hug');
-    assert.equal(sent.length, 1);
-    assert.equal(sent[0].messageOverride, hug.content);
-    assert.equal(sent[0].userMessageAlreadyAppended, true);
-    assert.equal(sent[0].commandBypass, true);
-    assert.equal(sent[0].replaceActiveGeneration, false);
-});
 
-test('/hug during generation is an immediate user intervention, not an idle-only command', async () => {
-    const activeSession = { id: 'generation-7', tabId: 1, responseText: 'partial assistant reply', cancelled: false };
-    const { sandbox, tab, sent, scheduled, interrupted, cancelled } = loadCommands({ activeSession });
-    const input = { value: '/hug', style: {}, focus() {}, setSelectionRange() {} };
-    const result = await sandbox.Darkstar.systemCommands.invoke('/hug', { tab, input });
-    assert.equal(result.success, true);
-    assert.equal(result.intervention, true);
-    assert.equal(input.value, '');
-    assert.equal(scheduled.length, 0, '/hug must intervene immediately rather than waiting in FIFO');
-    assert.equal(interrupted.length, 1, 'current partial assistant output must be persisted first');
-    assert.equal(cancelled.length, 1);
-    assert.equal(cancelled[0].reason, 'hug-command-intervention');
-    const hug = tab.history.at(-1);
-    assert.equal(hug.role, 'user');
-    assert.equal(hug.intervention, true);
-    assert.equal(hug.systemCommand, 'hug');
-    assert.equal(sent.length, 1);
-    assert.equal(sent[0].userMessageAlreadyAppended, true);
-    assert.equal(sent[0].commandBypass, true);
-    assert.equal(sent[0].replaceActiveGeneration, true);
-    assert.equal(sent[0].intervention, true);
-});
 
 test('model-owning slash commands entered during generation queue behind it instead of throwing an idle-only error', async () => {
     const activeSession = { id: 'generation-9', tabId: 1, responseText: 'still generating', cancelled: false };
@@ -15988,7 +16427,7 @@ test('scheduled dispatch reserves capacity before a generation session exists', 
         activeGenerationCount() { return 0; },
         configuredParallelSlots() { return 1; },
         generationCapacityAvailable() { return true; },
-        isRecognizedSlashCommand(value) { return /^\/(?:adversary|compact|continue|hug)(?:\s|$)/u.test(String(value || '')); },
+        isRecognizedSlashCommand(value) { return /^\/(?:adversary|compact|continue)(?:\s|$)/u.test(String(value || '')); },
         scheduleChatSessionSave() {},
         renderQueue() {},
         collapseScheduledQueueUi() {},
@@ -16267,6 +16706,17 @@ test('Control node defaults Auto-compact OFF and emits the flag', () => {
     assert.match(source, /controls\.toggle\('Auto-compact'/u);
     assert.match(source, /90% of the context window[\s\S]*earliest 50%/u);
     assert.match(source, /autoCompact:\s*node\.params\.autoCompact === true/u);
+});
+
+test('Auto-compact trigger threshold is scoped in send.js and matches the commands policy', () => {
+    const send = read('backend/renderer/send.js');
+    const commands = read('backend/renderer/commands.js');
+    const sendMatch = send.match(/AUTO_COMPACT_TRIGGER_FRACTION\s*=\s*([0-9.]+)/u);
+    const commandsMatch = commands.match(/AUTO_COMPACT_TRIGGER_FRACTION\s*=\s*([0-9.]+)/u);
+    assert.ok(sendMatch, 'send.js must define the threshold it reads during generation');
+    assert.ok(commandsMatch, 'commands.js must define the threshold used by compaction');
+    assert.equal(Number(sendMatch[1]), 0.90);
+    assert.equal(Number(commandsMatch[1]), Number(sendMatch[1]), 'send and commands must not drift to different Auto-compact thresholds');
 });
 
 test('Context node gathers persisted system commands into one leading system message for template compatibility', () => {
@@ -17430,7 +17880,7 @@ test('Chromium Interface fill uses Chromium key/input domains instead of mutatin
 test('Chromium Interface screenshot uses Page.captureScreenshot and the agent provider returns it multimodally', async () => {
     const { service, cdp } = serviceFixture('chromium');
     const toolService = new ToolService({ baseDir: root, uipService: service });
-    const runtime = await toolService.buildRuntime({ workspaceId: 'project-1', uipScopeId: 'project-1', providers: [] });
+    const runtime = await toolService.buildRuntime({ workspaceId: 'project-1', uipScopeId: 'project-1', providers: [], visionEnabled: true });
     const response = await toolService.execute(runtime, { id: 'shot', function: { name: 'UIP_Chromium_Interface_Element', arguments: JSON.stringify({ action: 'screenshot', target_id: 'uip-1' }) } }, { visionEnabled: true });
     assert.ok(cdp.calls.some((call) => call.method === 'Page.captureScreenshot'));
     assert.equal(response.rawResult.__darkstarMultimodal, true);
@@ -18761,15 +19211,18 @@ function read(relativePath) {
     return fs.readFileSync(path.join(root, relativePath), 'utf8');
 }
 
-test('Darkstar.bat is a root-level, location-independent entrypoint that bootstraps pinned Electron and llama.cpp runtimes', () => {
-    const source = read('Darkstar.bat');
+test('Launch_Darkstar.bat is the root-level, location-independent entrypoint that bootstraps pinned Python, Electron and llama.cpp dependencies', () => {
+    const source = read('Launch_Darkstar.bat');
     assert.match(source, /set "DARKSTAR_ROOT=%~dp0"/u);
     assert.match(source, /backend\\vendor\\electron\\win32-x64\\electron\.exe/u);
+    assert.match(source, /backend\\scripts\\bootstrap-python\.ps1/u);
+    assert.match(source, /backend\\vendor\\python\\python-3\.11\.9-amd64\.exe/u);
     assert.match(source, /backend\\scripts\\bootstrap-electron\.ps1/u);
     assert.match(source, /backend\\scripts\\bootstrap-llamacpp\.ps1/u);
     assert.match(source, /backend\\bin\\backends\\cpu\\llama-server\.exe/u);
     assert.match(source, /backend\\bin\\backends\\vulkan\\llama-server\.exe/u);
     assert.match(source, /backend\\bin\\backends\\cuda\\llama-server\.exe/u);
+    assert.match(source, /powershell\.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%DARKSTAR_PYTHON_BOOTSTRAP%"/u);
     assert.match(source, /powershell\.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%DARKSTAR_BOOTSTRAP%"/u);
     assert.match(source, /powershell\.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%DARKSTAR_LLAMA_BOOTSTRAP%"/u);
     assert.match(source, /43\.2\.0/u);
@@ -18778,52 +19231,89 @@ test('Darkstar.bat is a root-level, location-independent entrypoint that bootstr
     assert.match(source, /"%DARKSTAR_ELECTRON%" "%DARKSTAR_LAUNCHER%" --darkstar-debug %\*/u);
 });
 
-test('Darkstar.exe is a root-level Windows GUI launcher with an embedded native resource section', () => {
-    const executable = fs.readFileSync(path.join(root, 'Darkstar.exe'));
-    assert.ok(executable.length > 256 * 1024, 'launcher executable must be a real PE image, not a script shim');
-    assert.equal(executable.toString('ascii', 0, 2), 'MZ');
-    const peOffset = executable.readUInt32LE(0x3c);
-    assert.equal(executable.toString('ascii', peOffset, peOffset + 4), 'PE\0\0');
-    assert.equal(executable.readUInt16LE(peOffset + 4), 0x8664, 'launcher must target Windows x64');
-    const optional = peOffset + 24;
-    assert.equal(executable.readUInt16LE(optional), 0x20b, 'launcher must be PE32+');
-    assert.equal(executable.readUInt16LE(optional + 68), 2, 'launcher must use the Windows GUI subsystem so normal startup has no console');
-    const resourceRva = executable.readUInt32LE(optional + 112 + (2 * 8));
-    const resourceSize = executable.readUInt32LE(optional + 112 + (2 * 8) + 4);
-    assert.ok(resourceRva > 0 && resourceSize > 1024, 'launcher must embed the Darkstar icon as native Windows resources');
+test('root native launcher and all shortcut creation are removed while bootstrap remains visible only when required', () => {
+    assert.equal(fs.existsSync(path.join(root, 'Darkstar.exe')), false, 'obsolete root native launcher must remain absent');
+    assert.equal(fs.existsSync(path.join(root, 'Darkstar.bat')), false, 'obsolete BAT filename must remain absent');
+    assert.equal(fs.existsSync(path.join(root, 'launcher')), false, 'obsolete native launcher source tree must remain absent');
+    assert.equal(fs.existsSync(path.join(root, 'backend', 'scripts', 'build-windows-launcher.ps1')), false, 'obsolete launcher build helper must remain absent');
+    assert.equal(fs.existsSync(path.join(root, 'backend', 'scripts', 'create-first-launch-shortcut.ps1')), false, 'legacy one-time shortcut helper must remain absent');
+    assert.equal(fs.existsSync(path.join(root, 'backend', 'scripts', 'ensure-darkstar-shortcut.ps1')), false, 'shortcut creation helper must remain removed');
+    assert.equal(fs.existsSync(path.join(root, 'Darkstar.lnk')), false, 'repository must not ship a Darkstar shortcut');
+
+    const batch = read('Launch_Darkstar.bat');
+    const hiddenLauncher = read('backend/scripts/launch-darkstar-hidden.vbs');
+    const setupLauncher = read('backend/scripts/launch-darkstar-setup.vbs');
+    const pythonBootstrap = read('backend/scripts/bootstrap-python.ps1');
+    const electronBootstrap = read('backend/scripts/bootstrap-electron.ps1');
+    const llamaBootstrap = read('backend/scripts/bootstrap-llamacpp.ps1');
+
+    assert.doesNotMatch(batch, /DARKSTAR_SHORTCUT|ensure-darkstar-shortcut|Darkstar\.lnk|Start Menu|start-menu-shortcut/u);
+    assert.match(batch, /set "DARKSTAR_HIDDEN_HELPER=%DARKSTAR_ROOT%\\backend\\scripts\\launch-darkstar-hidden\.vbs"/u);
+    assert.match(batch, /set "DARKSTAR_SETUP_HELPER=%DARKSTAR_ROOT%\\backend\\scripts\\launch-darkstar-setup\.vbs"/u);
+    assert.match(batch, /set "DARKSTAR_BOOTSTRAP_REQUIRED=0"/u);
+    assert.match(batch, /if \/I "%DARKSTAR_HIDDEN_LAUNCH%"=="1" if "%DARKSTAR_BOOTSTRAP_REQUIRED%"=="1"/u);
+    assert.match(batch, /start "" \/b "%DARKSTAR_WSCRIPT%" \/\/Nologo "%DARKSTAR_SETUP_HELPER%" %\*/u);
+    assert.match(batch, /Runtime setup complete\. Starting Darkstar/u);
+    assert.match(batch, /call :launch_hidden_async %\*/u);
+    assert.match(batch, /start "" \/b "%DARKSTAR_WSCRIPT%" \/\/Nologo "%DARKSTAR_HIDDEN_HELPER%" %\*/u);
+
+    assert.match(hiddenLauncher, /shell\.Run\(commandLine, 0, True\)/u);
+    assert.match(hiddenLauncher, /DARKSTAR_HIDDEN_LAUNCH/u);
+    assert.ok(hiddenLauncher.includes('& " /d /c call " &'), 'hidden launcher must invoke the BAT through cmd /c call');
+    assert.match(setupLauncher, /shell\.Run\(commandLine, 1, True\)/u);
+    assert.ok(setupLauncher.includes('& " /d /c call " &'), 'visible setup launcher must use cmd /c so its terminal closes with the BAT');
+    assert.match(setupLauncher, /DARKSTAR_HIDDEN_LAUNCH/u);
+
+    assert.match(pythonBootstrap, /\$ProgressPreference = 'SilentlyContinue'/u);
+    assert.match(pythonBootstrap, /python-3\.11\.9-amd64\.exe/u);
+    assert.match(pythonBootstrap, /Get-FileHash/u);
+    assert.match(pythonBootstrap, /Get-AuthenticodeSignature/u);
+    assert.match(pythonBootstrap, /Start-Process -FilePath \$InstallerPath -Wait -PassThru/u);
+    assert.doesNotMatch(pythonBootstrap, /\/quiet|\/passive|InstallAllUsers=|PrependPath=|Include_pip=|Shortcuts=/u);
+    assert.match(electronBootstrap, /\$ProgressPreference = 'SilentlyContinue'/u);
+    assert.match(llamaBootstrap, /\$ProgressPreference = 'SilentlyContinue'/u);
+    assert.match(electronBootstrap, /curl\.exe/u);
+    assert.match(electronBootstrap, /--progress-bar/u);
+    assert.match(llamaBootstrap, /curl\.exe/u);
+    assert.match(llamaBootstrap, /--progress-bar/u);
+    assert.ok(batch.includes('if /I "%DARKSTAR_HIDDEN_LAUNCH%"=="1" exit /b %DARKSTAR_EXIT_CODE%'), 'hidden BAT failures must return instead of pausing invisibly');
 });
 
-test('native Windows launcher hides normal BAT startup, logs it, and exposes an explicit troubleshooting console', () => {
-    const main = read('launcher/windows/main_windows.go');
-    const command = read('launcher/windows/command.go');
-    const build = read('backend/scripts/build-windows-launcher.ps1');
-    assert.match(main, /createNoWindow\s*=\s*0x08000000/u);
-    assert.match(main, /DARKSTAR_HIDDEN_LAUNCH=1/u);
-    assert.match(main, /backend["'], ["']Dev["'], ["']Diagnostics["'], ["']launcher\.log/u);
-    assert.match(main, /attachTroubleshootingConsole/u);
-    assert.match(main, /AllocConsole/u);
-    assert.match(main, /Darkstar\.exe --console/u);
-    assert.match(command, /strings\.EqualFold\(arg, "--console"\)/u);
-    assert.match(command, /buildCommandProcessorLine/u);
-    assert.match(command, /\/c["'], ["']call["'], batchEntrypoint/u, 'launcher must invoke the relative BAT through a controlled cmd.exe payload');
-    assert.match(main, /SysProcAttr\{CmdLine: commandLine\}/u, 'cmd.exe must receive a raw command line instead of os\/exec argument quoting');
-    assert.match(main, /cmd\.Args = nil/u, 'os\/exec must not synthesize cmd.exe arguments');
-    assert.match(command, /unsupported command-line character/u, 'cmd metacharacters must fail closed instead of becoming shell syntax');
-    assert.match(build, /-H=windowsgui/u);
-    assert.match(build, /GOARCH = 'amd64'/u);
-    assert.ok(fs.existsSync(path.join(root, 'backend', 'assets', 'Darkstar.ico')));
-    assert.ok(fs.existsSync(path.join(root, 'launcher', 'windows', 'rsrc_windows_amd64.syso')));
-});
-
-test('Darkstar.bat always enables runtime diagnostics for supported Windows launches', () => {
-    const source = read('Darkstar.bat');
+test('Launch_Darkstar.bat always enables runtime diagnostics for supported Windows launches', () => {
+    const source = read('Launch_Darkstar.bat');
     assert.match(source, /"%DARKSTAR_ELECTRON%" "%DARKSTAR_LAUNCHER%" --darkstar-debug %\*/u);
     assert.doesNotMatch(source, /"%DARKSTAR_ELECTRON%" "%DARKSTAR_LAUNCHER%" %\*/u);
 });
 
+test('Python bootstrap launches the pinned official 3.11.9 x64 installer interactively only when Python 3.11 x64 is absent', () => {
+    const source = read('backend/scripts/bootstrap-python.ps1');
+    const policy = JSON.parse(read('backend/runtime-component-policy.json'));
+    const expectedUrl = 'https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe';
+    const expectedSha = '5ee42c4eee1e6b4464bb23722f90b45303f79442df63083f05322f1785f5fdde';
+    assert.equal(policy.python.version, '3.11.9');
+    assert.equal(policy.python.requiredSeries, '3.11');
+    assert.equal(policy.python.architecture, 'amd64');
+    assert.equal(policy.python.installer, 'backend/vendor/python/python-3.11.9-amd64.exe');
+    assert.equal(policy.python.source, expectedUrl);
+    assert.equal(policy.python.sha256, expectedSha);
+    assert.ok(source.includes(expectedUrl));
+    assert.ok(source.toLowerCase().includes(expectedSha));
+    assert.match(source, /sys\.version_info\[:2\] == \(\$RequiredMajor, \$RequiredMinor\)/u);
+    assert.match(source, /struct\.calcsize\('P'\) \* 8 == \$RequiredBits/u);
+    assert.match(source, /py\.exe[\s\S]*'-3\.11'/u);
+    assert.match(source, /ProbeOnly/u);
+    assert.match(source, /Get-FileHash/u);
+    assert.match(source, /Get-AuthenticodeSignature/u);
+    assert.match(source, /Python Software Foundation/u);
+    assert.match(source, /Start-Process -FilePath \$InstallerPath -Wait -PassThru/u);
+    assert.doesNotMatch(source, /\/quiet|\/passive|InstallAllUsers=|PrependPath=|Include_pip=|Shortcuts=/u);
+    assert.equal(fs.existsSync(path.join(root, 'backend', 'vendor', 'python', 'PYTHON-LICENSE.txt')), true);
+    assert.equal(fs.existsSync(path.join(root, 'backend', 'vendor', 'python', 'python-installer.json')), true);
+});
+
 test('Electron bootstrap is pinned to one official v43.2.0 asset and verifies SHA-256 before extraction', () => {
     const source = read('backend/scripts/bootstrap-electron.ps1');
-    const policy = JSON.parse(read('RUNTIME_LICENSE_POLICY.json'));
+    const policy = JSON.parse(read('backend/runtime-component-policy.json'));
     const expectedUrl = 'https://github.com/electron/electron/releases/download/v43.2.0/electron-v43.2.0-win32-x64.zip';
     const expectedSha = 'eba5f5088af40ecb364fe258809c79a5234c6ece5a75c64722772eba01b02786';
     assert.equal(policy.electron.version, '43.2.0');
@@ -18840,24 +19330,24 @@ test('Electron bootstrap is pinned to one official v43.2.0 asset and verifies SH
     assert.doesNotMatch(source, /ELECTRON_MIRROR|npmmirror/u);
 });
 
-test('llama.cpp bootstrap is pinned to one b10520 CPU/Vulkan/CUDA 12.4 bundle and verifies every download before extraction', () => {
+test('llama.cpp bootstrap is pinned to one b10645 CPU/Vulkan/CUDA 12.4 bundle and verifies every download before extraction', () => {
     const source = read('backend/scripts/bootstrap-llamacpp.ps1');
-    const policy = JSON.parse(read('RUNTIME_LICENSE_POLICY.json'));
+    const policy = JSON.parse(read('backend/runtime-component-policy.json'));
     const bootstrap = policy.backendBin.bootstrap;
     assert.equal(bootstrap.bundleVersion, 2);
-    assert.equal(bootstrap.build, 'b10520');
-    assert.equal(bootstrap.commit, 'cd644c39545aac3dca63261f99a9bfc35956cb25');
+    assert.equal(bootstrap.build, 'b10645');
+    assert.equal(bootstrap.commit, 'c5fc7e34885ba31217e330809437afa993d27745');
     assert.equal(bootstrap.cudaRelease, '12.4');
     assert.deepEqual(bootstrap.backends.cpu.archives.map((entry) => [entry.asset, entry.sha256]), [[
-        'llama-b10520-bin-win-cpu-x64.zip',
-        'e91930be901cd7efd6fda1ed5343aea0aa77a5aac73a1a80e90e3b169677e874',
+        'llama-b10645-bin-win-cpu-x64.zip',
+        'd3a82793b79701cff48323ebf18d3f0a4384d54aacd502e13cc3c30fa09653b2',
     ]]);
     assert.deepEqual(bootstrap.backends.vulkan.archives.map((entry) => [entry.asset, entry.sha256]), [[
-        'llama-b10520-bin-win-vulkan-x64.zip',
-        '53d0ed54e6993c25f0a69f7924617ece72d3983e9c22475a5a7a288f2fb75eb6',
+        'llama-b10645-bin-win-vulkan-x64.zip',
+        '2dbb1b161252d0caf704a20a00a111fdc53b1f77812787e3ab87c3ef726b9666',
     ]]);
     assert.deepEqual(bootstrap.backends.cuda.archives.map((entry) => [entry.asset, entry.sha256]), [
-        ['llama-b10520-bin-win-cuda-12.4-x64.zip', 'ea9c64786333f8052056fb3735d3edb95d4b9a5e4c816390d81c45ec8e59780f'],
+        ['llama-b10645-bin-win-cuda-12.4-x64.zip', 'c172f30312a8830795fba4b08f4ac027777f62505d61653b07b896c43898c86a'],
         ['cudart-llama-bin-win-cuda-12.4-x64.zip', '8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6'],
     ]);
     assert.deepEqual(bootstrap.noticeDownloads.map((entry) => entry.asset), ['llama.cpp-LICENSE', 'NVIDIA-CUDA-12.4-EULA.pdf']);
@@ -18865,7 +19355,7 @@ test('llama.cpp bootstrap is pinned to one b10520 CPU/Vulkan/CUDA 12.4 bundle an
         '94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d',
         '6ada441ae5a45a4a3d51ade8850fa2229fc6dd95de0c9da6e2cdd7a46701b844',
     ]);
-    assert.match(source, /RUNTIME_LICENSE_POLICY\.json/u);
+    assert.match(source, /backend[\\\/]runtime-component-policy\.json/u);
     assert.match(source, /Get-FileHash/u);
     assert.match(source, /Expand-Archive/u);
     assert.match(source, /Test-LlamaBackend/u);
@@ -18882,14 +19372,15 @@ test('llama.cpp bootstrap is pinned to one b10520 CPU/Vulkan/CUDA 12.4 bundle an
     assert.doesNotMatch(source, /releases\/latest|http:\/\//u);
 });
 
-test('Darkstar.bat pauses only on startup or application failure and preserves the failing exit code', () => {
-    const source = read('Darkstar.bat');
+test('Launch_Darkstar.bat pauses only on startup or application failure and preserves the failing exit code', () => {
+    const source = read('Launch_Darkstar.bat');
     const successExit = source.indexOf('if not "%DARKSTAR_EXIT_CODE%"=="0" goto :launch_failed');
     const pause = source.indexOf('pause >nul');
     assert.ok(successExit >= 0);
     assert.ok(pause > successExit, 'pause must live only in the failure path');
     assert.match(source, /:startup_failed[\s\S]*set "DARKSTAR_EXIT_CODE=1"/u);
-    assert.match(source, /:hold_error[\s\S]*if defined DARKSTAR_HIDDEN_LAUNCH exit \/b %DARKSTAR_EXIT_CODE%[\s\S]*pause >nul[\s\S]*exit \/b %DARKSTAR_EXIT_CODE%/u);
+    assert.match(source, /:hold_error[\s\S]*pause >nul[\s\S]*exit \/b %DARKSTAR_EXIT_CODE%/u);
+    assert.ok(source.includes('if /I \"%DARKSTAR_HIDDEN_LAUNCH%\"==\"1\" exit /b %DARKSTAR_EXIT_CODE%'), 'hidden shortcut launches must return failure without waiting for an invisible keypress');
 });
 
 test('normal launcher strips Electron Node-mode and leaves diagnostics completely off without --darkstar-debug', async (t) => {
@@ -19941,6 +20432,1766 @@ test('queue cancellation preserves accepted user history and filesystem project 
 });
 });
 
+
+// ============================================================================
+// TEST MODULE: backend/Dev/tests/local-model-filesystem-browser-regression.test.js
+// ============================================================================
+TEST_FACTORIES.set("backend/Dev/tests/local-model-filesystem-browser-regression.test.js", function(module, exports, require, __filename, __dirname) {
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+const vm = require('node:vm');
+
+const { browseModelFiles, imageFileRecord, sidebarLocations, validateImageFilePath, validateModelFilePath, validateSkillFilePath, validateToolFilePath } = require('../../runtime/model-filesystem');
+const { DIALOG_LOCATION_KEYS, DialogLocationStore } = require('../../preferences/dialog-location-store');
+const { LOCAL_MODEL_HISTORY_KEYS, LocalModelHistoryStore } = require('../../preferences/local-model-history-store');
+const { normalizeModelLoadRequest, resolveModelSelection } = require('../../runtime/models');
+const { loadModel } = require('../../runtime/model-lifecycle');
+const { isProjectorFileName, listProjectorsForModel, validateProjectorPath } = require('../../vision/projector-service');
+const CHANNELS = require('../../protocol/channels');
+const ROOT = path.resolve(__dirname, '..', '..', '..');
+const read = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8');
+
+function writeEmptyGguf(filePath) {
+    const header = Buffer.alloc(24);
+    header.write('GGUF', 0, 'ascii');
+    header.writeUInt32LE(3, 4);
+    header.writeBigUInt64LE(0n, 8);
+    header.writeBigUInt64LE(0n, 16);
+    fs.writeFileSync(filePath, header);
+}
+
+test('model filesystem browsing exposes only directories and GGUF candidates and validates the final model path', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-model-browser-'));
+    const child = path.join(directory, 'nested');
+    const model = path.join(directory, 'selected.gguf');
+    const projector = path.join(directory, 'mmproj-vision.gguf');
+    const invalid = path.join(directory, 'broken.gguf');
+    fs.mkdirSync(child);
+    writeEmptyGguf(model);
+    writeEmptyGguf(projector);
+    fs.writeFileSync(invalid, 'not gguf');
+    fs.writeFileSync(path.join(directory, 'notes.txt'), 'hidden');
+    try {
+        const listing = browseModelFiles({ path: directory }, { defaultPath: directory });
+        assert.equal(listing.currentPath, fs.realpathSync(directory));
+        assert.deepEqual(listing.entries.map((entry) => [entry.name, entry.type]), [
+            ['nested', 'directory'],
+            ['selected.gguf', 'model'],
+        ]);
+        assert.equal(listing.entries.some((entry) => entry.name === 'notes.txt'), false);
+        assert.equal(listing.entries.some((entry) => entry.name === 'mmproj-vision.gguf'), false);
+
+        assert.equal(validateModelFilePath(model), fs.realpathSync(model));
+        assert.throws(() => validateModelFilePath(invalid), /not a valid GGUF model/u);
+        assert.throws(() => validateModelFilePath(projector), /projector GGUF files cannot be selected/u);
+        assert.throws(() => browseModelFiles({ path: 'relative/path' }, { defaultPath: directory }), /absolute local filesystem path/u);
+
+        const selection = resolveModelSelection(model, [], []);
+        assert.equal(selection.directFile, true);
+        assert.equal(selection.requested, fs.realpathSync(model));
+        assert.equal(selection.local.path, fs.realpathSync(model));
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('filesystem browser sidebar exposes exactly the requested Explorer locations with canonical targets and This PC root', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-browser-sidebar-'));
+    const ids = ['desktop', 'downloads', 'documents', 'pictures', 'music', 'videos'];
+    const specialPaths = {};
+    try {
+        for (const id of ids) {
+            specialPaths[id] = path.join(directory, id);
+            fs.mkdirSync(specialPaths[id]);
+        }
+        const listing = browseModelFiles({ path: specialPaths.downloads }, { defaultPath: directory, specialPaths });
+        assert.deepEqual(listing.sidebar.map((entry) => entry.id), [...ids, 'this-pc']);
+        assert.deepEqual(listing.sidebar.map((entry) => entry.label), ['Desktop', 'Downloads', 'Documents', 'Pictures', 'Music', 'Videos', 'This PC']);
+        assert.equal(listing.sidebar.find((entry) => entry.id === 'downloads').active, true);
+        assert.equal(listing.sidebar.find((entry) => entry.id === 'downloads').path, fs.realpathSync(specialPaths.downloads));
+        assert.equal(listing.sidebar.find((entry) => entry.id === 'this-pc').root, true);
+        assert.equal(listing.sidebar.find((entry) => entry.id === 'this-pc').available, true);
+
+        fs.rmSync(specialPaths.music, { recursive: true, force: true });
+        const degraded = sidebarLocations(specialPaths, specialPaths.desktop, false);
+        assert.equal(degraded.length, 7, 'missing known folders must remain visible rather than disappearing from the sidebar');
+        assert.equal(degraded.find((entry) => entry.id === 'music').available, false);
+        assert.equal(degraded.find((entry) => entry.id === 'music').path, '');
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('filesystem browser sidebar is static Darkstar UI with icons and is wired only through the privileged browse IPC', () => {
+    const html = read('backend/shell/index.html');
+    const styles = read('backend/shell/styles.css');
+    const modal = read('backend/renderer/workflow-file-modal.js');
+    const appMain = read('backend/app/run-main-app.js');
+    const llamaIpc = read('backend/ipc/register-llama-ipc.js');
+    const requested = ['desktop', 'downloads', 'documents', 'pictures', 'music', 'videos', 'this-pc'];
+    const locations = Array.from(html.matchAll(/data-filesystem-location="([^"]+)"/gu), (match) => match[1]);
+    assert.deepEqual(locations, requested);
+    assert.equal((html.match(/workflow-file-sidebar-item"[^>]*><svg/gu) || []).length, 7, 'every requested location must have its own inline icon');
+    assert.match(styles, /workflow-file-picker-section\.filesystem-mode[\s\S]*?grid-template-columns:[\s\S]*?workflow-file-sidebar-item svg/u);
+    assert.match(modal, /renderFilesystemSidebar\(response && response\.sidebar\)/u);
+    assert.match(modal, /data\.filesystemLocation|dataset\.filesystemLocation/u);
+    assert.match(modal, /navigateFilesystemDirectory\(String\(button\.dataset\.localPath \|\| ''\), button\.dataset\.rootView === 'true'/u);
+    assert.doesNotMatch(modal, /showOpenDialog|dialog\.showOpenDialog/u);
+    assert.match(appMain, /\['desktop', 'downloads', 'documents', 'pictures', 'music', 'videos'\][\s\S]*?app\.getPath\(name\)/u);
+    assert.match(llamaIpc, /model: DIALOG_LOCATION_KEYS\.MODELS, projector: DIALOG_LOCATION_KEYS\.PROJECTORS,[\s\S]*?tool: DIALOG_LOCATION_KEYS\.TOOLS, skill: DIALOG_LOCATION_KEYS\.SKILLS, image: DIALOG_LOCATION_KEYS\.IMAGES/u);
+    assert.match(llamaIpc, /getDirectory\(locationKey, fallback\)[\s\S]*?runtime\.browseModelFiles\(\{ \.\.\.request, kind \}, \{ specialPaths: options\.modelFileBrowserPaths \|\| \{\}, defaultPath \}\)[\s\S]*?rememberDirectory\(locationKey, result\.currentPath\)/u);
+});
+
+test('filesystem browser keeps one expanded scroll viewport across sparse, full, loading, and empty directories', () => {
+    const styles = read('backend/shell/styles.css');
+    assert.match(styles, /\.workflow-file-modal\.filesystem-mode\s*\{[^}]*--workflow-filesystem-viewport-height:\s*clamp\(260px,\s*calc\(100vh - 360px\),\s*340px\);/u,
+        'normal filesystem browsing must default to the existing expanded 340px viewport while retaining a bounded short-window fallback');
+    assert.match(styles, /\.workflow-file-sidebar\s*\{[^}]*height:\s*var\(--workflow-filesystem-viewport-height,\s*340px\);/u);
+    assert.match(styles, /\.workflow-file-picker-section\.filesystem-mode \.workflow-file-list-pane\s*\{[^}]*position:\s*relative;[^}]*height:\s*var\(--workflow-filesystem-viewport-height,\s*340px\);/u);
+    assert.match(styles, /\.workflow-file-picker-section\.filesystem-mode \.workflow-file-list\s*\{[^}]*height:\s*100%;[^}]*min-height:\s*0;[^}]*max-height:\s*none;/u,
+        'directory item count must never participate in filesystem viewport sizing');
+    assert.match(styles, /\.workflow-file-list\s*\{[^}]*overflow-y:\s*auto;/u, 'overflowing directories must scroll inside the fixed viewport');
+    assert.match(styles, /\.workflow-file-picker-section\.filesystem-mode \.workflow-file-empty\s*\{[^}]*position:\s*absolute;[^}]*inset:\s*0;/u,
+        'loading and empty states must overlay the viewport rather than changing modal height');
+});
+
+test('filesystem browser renders semantic vector entry icons without retrieving or persisting shell icon data', () => {
+    const styles = read('backend/shell/styles.css');
+    const modal = read('backend/renderer/workflow-file-modal.js');
+    assert.match(modal, /LOCAL_ENTRY_ICONS = Object\.freeze\([\s\S]*?folder:[\s\S]*?drive:[\s\S]*?model:[\s\S]*?projector:/u);
+    assert.match(modal, /document\.createElementNS\(namespace, 'svg'\)/u);
+    assert.match(modal, /rootListing \? 'drive' : 'folder'/u);
+    assert.match(styles, /\.workflow-file-entry-icon\s*\{[\s\S]*?stroke:\s*currentColor;/u);
+    assert.doesNotMatch(modal, /getFileIcon|nativeImage|localStorage|sessionStorage|indexedDB|caches\./u,
+        'filesystem icons must be derived from static Darkstar vectors only and must not touch OS icon retrieval or persistent browser caches');
+});
+
+test('filesystem browser maintains transactional Back and Forward history with disabled unavailable directions', () => {
+    const html = read('backend/shell/index.html');
+    const styles = read('backend/shell/styles.css');
+    const modal = read('backend/renderer/workflow-file-modal.js');
+    assert.match(html, /id="workflowFileBackButton"[^>]*aria-label="Back"[^>]*disabled[\s\S]*?id="workflowFileForwardButton"[^>]*aria-label="Forward"[^>]*disabled/u);
+    assert.match(styles, /\.workflow-file-history-button\s*\{[\s\S]*?border-radius:\s*50%;[\s\S]*?linear-gradient/u);
+    assert.match(styles, /\.workflow-file-history-button:disabled\s*\{[\s\S]*?color:\s*var\(--text-muted\)/u);
+    assert.match(modal, /navigationHistory = navigationHistory\.slice\(0, navigationHistoryIndex \+ 1\);[\s\S]*?navigationHistory\.push\(location\)/u,
+        'new navigation after Back must discard the stale Forward branch');
+    assert.match(modal, /function navigateFilesystemHistory\(offset\)[\s\S]*?targetIndex[\s\S]*?navigateFilesystemDirectory\(target\.path, target\.root === true, false, targetIndex\)/u);
+    assert.match(modal, /renderFilesystemDirectory\(response\);[\s\S]*?commitFilesystemHistory\(response, historyTargetIndex\)/u,
+        'history may advance only after the privileged filesystem navigation succeeds');
+    assert.match(modal, /navigationPending = true;[\s\S]*?updateFilesystemHistoryControls\(\)/u);
+    assert.match(modal, /backButton\.disabled = !enabled \|\| navigationHistoryIndex <= 0/u);
+    assert.match(modal, /forwardButton\.disabled = !enabled \|\| navigationHistoryIndex < 0 \|\| navigationHistoryIndex >= navigationHistory\.length - 1/u);
+});
+
+test('filesystem browser Back/Forward executes real navigation order and truncates Forward after a new branch', async () => {
+    function classList() {
+        const values = new Set();
+        return {
+            add(name) { values.add(name); }, remove(name) { values.delete(name); }, contains(name) { return values.has(name); },
+            toggle(name, force) { const enabled = force === undefined ? !values.has(name) : Boolean(force); if (enabled) values.add(name); else values.delete(name); },
+        };
+    }
+    function element(id) {
+        const listeners = new Map();
+        return {
+            id, dataset: {}, className: '', classList: classList(), hidden: false, disabled: false, value: '', placeholder: '', textContent: '', children: [], style: {},
+            setAttribute() {}, removeAttribute() {}, focus() {},
+            addEventListener(type, handler) { listeners.set(type, handler); }, listener(type) { return listeners.get(type); },
+            appendChild(child) { this.children.push(child); return child; },
+            querySelectorAll(selector) { return selector === '.workflow-file-list-item' ? this.children.filter((child) => child.className === 'workflow-file-list-item') : []; },
+            querySelector() { return this.children[0] || null; },
+        };
+    }
+    const ids = ['workflowFileModal', 'workflowFileModalTitle', 'workflowFileModalSubtitle', 'workflowFileNameSection', 'workflowFileNameInput',
+        'workflowFilePickerLabel', 'workflowFilePickerSection', 'workflowFileSidebar', 'workflowFileHistoryControls', 'workflowFileBackButton',
+        'workflowFileForwardButton', 'workflowFileList', 'workflowFileEmpty', 'workflowFileModalError', 'workflowFileAbortButton', 'workflowFileCommitButton'];
+    const elements = new Map(ids.map((id) => [id, element(id)]));
+    elements.get('workflowFileSidebar').querySelectorAll = () => [];
+    const label = element('location-label');
+    const requests = [];
+    const directory = (currentPath) => ({
+        success: true, currentPath, selectedPath: '', sidebar: [],
+        parentPath: currentPath === '/a' ? '/' : (currentPath === '/b' || currentPath === '/c' ? '/a' : ''),
+        entries: currentPath === '/a' ? [{ name: 'b', path: '/b', type: 'directory' }] : [],
+    });
+    const context = {
+        console, Promise, Object, Number, String, Boolean, Array,
+        document: {
+            body: element('body'), activeElement: null, addEventListener() {},
+            getElementById(id) { return elements.get(id) || null; },
+            querySelector(selector) { return selector.startsWith('label[') ? label : null; },
+            createElement(tag) { return element(tag); }, createElementNS(_namespace, tag) { return element(tag); },
+        },
+        darkstar: { nodes: { async browseModelFiles(request) { requests.push(request); return request.root ? directory('') : directory(request.path || '/a'); } } },
+        Darkstar: { modal: {
+            createModalCoordinator() { return { blockBackground() {}, setNativeOverlayBlocked() {}, restoreFocus() {}, focus() {} }; },
+            resolveElements(spec) { return Object.fromEntries(Object.entries(spec).map(([key, id]) => [key, elements.get(id) || null])); },
+        } },
+        showNodeEditorToast() {}, createWorkflowSnapshot() {}, restoreWorkflowDocument() {}, restoreWorkflowSnapshot() {}, scheduleWorkflowSessionSave() {},
+    };
+    context.globalThis = context;
+    vm.createContext(context);
+    vm.runInContext(read('backend/renderer/workflow-file-modal.js'), context, { filename: 'workflow-file-modal.js' });
+
+    context.Darkstar.modelFiles.open({ initialPath: '/a' });
+    await new Promise((resolve) => setImmediate(resolve));
+    const back = elements.get('workflowFileBackButton');
+    const forward = elements.get('workflowFileForwardButton');
+    assert.equal(back.disabled, true);
+    const folderB = elements.get('workflowFileList').children.find((button) => button.children.some((child) => child.textContent === 'b'));
+    assert.equal(folderB.classList.contains('selected'), false, 'directory rows must not inherit selected styling when no file is selected');
+    folderB.listener('click')();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(back.disabled, false);
+    assert.equal(forward.disabled, true);
+
+    back.listener('click')();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(back.disabled, true);
+    assert.equal(forward.disabled, false);
+
+    const location = elements.get('workflowFileNameInput');
+    location.value = '/c';
+    location.listener('keydown')({ key: 'Enter', preventDefault() {} });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(forward.disabled, true, 'new navigation after Back must remove the old Forward branch');
+    assert.deepEqual(requests.map((request) => request.path || '<root>'), ['/a', '/b', '/a', '/c']);
+    elements.get('workflowFileAbortButton').listener('click')();
+});
+
+test('absolute filesystem models always use direct legacy loading instead of the managed model router', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-direct-model-'));
+    const model = path.join(directory, 'direct.gguf');
+    writeEmptyGguf(model);
+    let legacyRequest = null;
+    let routerListed = false;
+    const runtime = {
+        server: { config: {} },
+        processMode: 'router',
+        process: { killed: false },
+        loadedModelId: null,
+        activeStreams: new Map(),
+        pendingStreams: new Map(),
+        normalizeModelLoadRequest(request) { return { modelId: String(request), projectorPath: '' }; },
+        resolveModelSelection(modelId) { return resolveModelSelection(modelId, [], []); },
+        async loadLegacyModel(modelId, projectorPath) {
+            legacyRequest = { modelId, projectorPath };
+            return { modelId, status: 'loaded' };
+        },
+        async listRouterModels() { routerListed = true; return []; },
+    };
+    try {
+        const result = await loadModel(runtime, model, {
+            delay: async () => {},
+            detectProjectorForModel: () => null,
+            loadTimeoutMs: 100,
+            requestJson: async () => ({ json: {} }),
+            validateProjectorPath: (value) => value,
+        });
+        assert.equal(result.status, 'loaded');
+        assert.deepEqual(legacyRequest, { modelId: model, projectorPath: null });
+        assert.equal(routerListed, false, 'direct filesystem models must never fall through to /models router discovery');
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('Load Model dropdown contains only model choices because local browsing has a dedicated adjacent button', () => {
+    const source = read('backend/renderer/nodes/builtin/common.js');
+    const modelSelect = {
+        options: [
+            { value: '', textContent: 'Select a model' },
+            { value: 'alpha', textContent: 'Alpha' },
+            { value: 'beta', textContent: 'Beta' },
+        ],
+    };
+    const sandbox = {
+        document: { getElementById(id) { return id === 'modelSelect' ? modelSelect : null; } },
+        Darkstar: { modelInventory: [], nodes: { controls: { dropdown() { return ''; } } } },
+    };
+    sandbox.window = sandbox;
+    sandbox.globalThis = sandbox;
+    vm.runInNewContext(source, vm.createContext(sandbox), { filename: 'backend/renderer/nodes/builtin/common.js' });
+    const common = sandbox.Darkstar.nodes.builtinCommon;
+    const options = common.listModelOptions('alpha');
+    assert.deepEqual(Array.from(options, (option) => option.value), ['', 'alpha', 'beta']);
+    assert.equal(options.some((option) => /Browse Local Filesystem/u.test(option.label)), false);
+    assert.equal(common.isAbsoluteModelPath('/models/external.gguf'), true);
+    assert.equal(common.isAbsoluteModelPath('C:\\Models\\external.gguf'), true);
+    assert.equal(common.isAbsoluteModelPath('managed/subdir.gguf'), false);
+});
+
+test('model browser IPC stays behind preload and the Darkstar modal rather than invoking a native file dialog', () => {
+    assert.equal(CHANNELS.MODEL_FILES_BROWSE, 'llama:nodes:browse-model-files');
+    assert.equal(CHANNELS.MODEL_INSPECT, 'llama:nodes:inspect-model');
+    const preload = read('backend/shell/preload.js');
+    const llamaIpc = read('backend/ipc/register-llama-ipc.js');
+    const modal = read('backend/renderer/workflow-file-modal.js');
+    const controls = read('backend/renderer/nodes/editor/controls.js');
+    assert.match(preload, /browseModelFiles:[\s\S]*?CHANNELS\.MODEL_FILES_BROWSE/u);
+    assert.match(preload, /inspectModel:[\s\S]*?CHANNELS\.MODEL_INSPECT/u);
+    assert.match(llamaIpc, /CHANNELS\.MODEL_FILES_BROWSE[\s\S]*?runtime\.browseModelFiles/u);
+    assert.match(llamaIpc, /CHANNELS\.MODEL_INSPECT[\s\S]*?runtime\.inspectModel/u);
+    assert.match(modal, /Browse Local Filesystem/u);
+    assert.match(modal, /Darkstar’s filesystem browser/u);
+    assert.match(modal, /browseModelFiles/u);
+    assert.match(modal, /inspectModel/u);
+    assert.doesNotMatch(modal, /showOpenDialog|dialog\.showOpenDialog/u);
+    assert.match(controls, /node-local-browser-button[\s\S]*?browseNodeLocalFilesystem[\s\S]*?browserKind === 'model'[\s\S]*?modelFiles[\s\S]*?setNodeModelValue\(nodeId, result\.path\)/u);
+});
+
+
+test('adjacent Model and Projector browse buttons use the canonical local-browser mutation paths', async () => {
+    const controlsSource = read('backend/renderer/nodes/editor/controls.js');
+    const rendererControlsSource = read('backend/renderer/nodes/control-renderers.js');
+    const modelPath = 'C:\\Models\\vision.gguf';
+    const projectorPath = 'C:\\Models\\vision.mmproj';
+    const node = { id: 17, type: 'modelLoader', selectedModel: '', params: { projectorPath: '' }, status: 'idle', statusMessage: '' };
+    let modelInitialPath = null;
+    let projectorInitialPath = null;
+    let cachedModel = null;
+    const definition = {
+        onModelChange() {},
+        onProjectorBrowse(_node, result) { return result.path; },
+        onParameterChange(current, param) {
+            if (param === 'projectorPath') current.params.projectorSource = current.params.projectorPath ? 'manual' : 'none';
+        },
+    };
+    const sandbox = {
+        document: { getElementById() { return null; } },
+        nodeEditorState: { nodes: [node], controlEventsBound: false },
+        getNodeDef() { return definition; },
+        updateModelReadyState() {},
+        setContextContractRuntimeContextReady() {},
+        syncHiddenModelSelectFromNode() {},
+        scheduleWorkflowSessionSave() {},
+        rerenderModelReasoningNodes() {},
+        rerenderNode() {},
+        renderConnections() {},
+        noteNodeRuntimeConfigMutation() {},
+        showNodeEditorToast(message) { throw new Error(message); },
+        console,
+    };
+    sandbox.window = {
+        Darkstar: {
+            nodes: {
+                builtinCommon: {
+                    isAbsoluteModelPath(value) { return /^[A-Za-z]:[\\\\/]/u.test(String(value || '')); },
+                    cacheModelRecord(model) { cachedModel = model; return model; },
+                    modelInventoryRecord() { return null; },
+                },
+                refreshLoadServerGpuLayerLimits() { return Promise.resolve(); },
+            },
+            modelFiles: {
+                async open(options) {
+                    modelInitialPath = options.initialPath;
+                    return { path: modelPath, model: { id: modelPath, displayName: 'vision.gguf' } };
+                },
+            },
+            projectorFiles: {
+                async open(options) {
+                    projectorInitialPath = options.initialPath;
+                    return { path: projectorPath, fileName: 'vision.mmproj' };
+                },
+            },
+        },
+    };
+    sandbox.globalThis = sandbox;
+    const context = vm.createContext(sandbox);
+    vm.runInContext(controlsSource, context, { filename: 'backend/renderer/nodes/editor/controls.js' });
+
+    const event = { preventDefault() {}, stopPropagation() {} };
+    const modelButton = { disabled: false, isConnected: true, dataset: { nodeId: '17', action: 'browse-local-model' } };
+    await sandbox.browseNodeLocalFilesystem(event, modelButton);
+    assert.equal(modelInitialPath, '');
+    assert.equal(node.selectedModel, modelPath);
+    assert.equal(cachedModel.id, modelPath);
+    assert.equal(modelButton.disabled, false);
+
+    const projectorButton = { disabled: false, isConnected: true, dataset: { nodeId: '17', action: 'browse-local-projector' } };
+    await sandbox.browseNodeLocalFilesystem(event, projectorButton);
+    assert.equal(projectorInitialPath, '', 'projector browsing must use its own remembered spawn location rather than inheriting the model directory');
+    assert.equal(node.params.projectorPath, projectorPath);
+    assert.equal(node.params.projectorSource, 'manual');
+    assert.equal(projectorButton.disabled, false);
+
+    const rendererSandbox = { Darkstar: { dom: { escapeHtml(value) { return String(value); } }, nodes: {} } };
+    rendererSandbox.window = rendererSandbox;
+    rendererSandbox.globalThis = rendererSandbox;
+    vm.runInNewContext(rendererControlsSource, rendererSandbox, { filename: 'backend/renderer/nodes/control-renderers.js' });
+    const buttonHtml = rendererSandbox.Darkstar.nodes.controls.button('⋯', 17, 'browse-local-model', {
+        className: 'node-local-browser-button',
+        title: 'Browse Local Filesystem …',
+        ariaLabel: 'Browse Local Filesystem for Model',
+    });
+    assert.match(buttonHtml, /class="node-action-button node-local-browser-button"/u);
+    assert.match(buttonHtml, /data-action="browse-local-model"/u);
+    assert.match(buttonHtml, /aria-label="Browse Local Filesystem for Model"/u);
+});
+
+test('projector discovery recognizes .mmproj and the filesystem browser exposes only valid projector candidates', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-projector-browser-'));
+    const child = path.join(directory, 'nested');
+    const model = path.join(directory, 'vision-model.gguf');
+    const matchingMmproj = path.join(directory, 'vision-model.mmproj');
+    const legacyMproj = path.join(directory, 'legacy.mproj');
+    const ggufProjector = path.join(directory, 'mmproj-vision-model.gguf');
+    const ordinaryGguf = path.join(directory, 'ordinary.gguf');
+    fs.mkdirSync(child);
+    writeEmptyGguf(model);
+    fs.writeFileSync(matchingMmproj, 'projector');
+    fs.writeFileSync(legacyMproj, 'projector');
+    writeEmptyGguf(ggufProjector);
+    writeEmptyGguf(ordinaryGguf);
+    fs.writeFileSync(path.join(directory, 'notes.txt'), 'hidden');
+    try {
+        assert.equal(isProjectorFileName('vision-model.mmproj'), true);
+        assert.equal(validateProjectorPath(matchingMmproj), fs.realpathSync(matchingMmproj));
+        const listing = browseModelFiles({ path: directory, kind: 'projector' }, { defaultPath: directory });
+        assert.deepEqual(listing.entries.map((entry) => [entry.name, entry.type]), [
+            ['nested', 'directory'],
+            ['legacy.mproj', 'projector'],
+            ['mmproj-vision-model.gguf', 'projector'],
+            ['vision-model.mmproj', 'projector'],
+        ]);
+        assert.equal(listing.entries.some((entry) => entry.name === 'ordinary.gguf'), false);
+        assert.equal(listing.entries.some((entry) => entry.name === 'notes.txt'), false);
+
+        const anchored = browseModelFiles({ path: model, kind: 'projector', parentOfFile: true }, { defaultPath: directory });
+        assert.equal(anchored.currentPath, fs.realpathSync(directory));
+        assert.equal(anchored.selectedPath, '');
+        const selected = browseModelFiles({ path: matchingMmproj, kind: 'projector' }, { defaultPath: directory });
+        assert.equal(selected.selectedPath, fs.realpathSync(matchingMmproj));
+
+        const projectors = listProjectorsForModel(model);
+        assert.equal(projectors.length, 3);
+        assert.equal(projectors[0].recommended, true);
+        assert.ok(projectors.some((candidate) => candidate.path === fs.realpathSync(matchingMmproj)));
+        assert.ok(projectors.some((candidate) => candidate.path === fs.realpathSync(ggufProjector)));
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('explicit No Projector suppresses Core auto-detection while the default request still auto-detects', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-no-projector-'));
+    const model = path.join(directory, 'vision.gguf');
+    const projector = path.join(directory, 'vision.mmproj');
+    writeEmptyGguf(model);
+    fs.writeFileSync(projector, 'projector');
+    let detectCalls = 0;
+    let legacyRequest = null;
+    const runtime = {
+        server: { config: {} },
+        processMode: 'router',
+        process: { killed: false },
+        loadedModelId: null,
+        activeStreams: new Map(),
+        pendingStreams: new Map(),
+        normalizeModelLoadRequest,
+        resolveModelSelection(modelId) { return resolveModelSelection(modelId, [], []); },
+        async loadLegacyModel(modelId, projectorPath) {
+            legacyRequest = { modelId, projectorPath };
+            return { modelId, status: 'loaded' };
+        },
+        async listRouterModels() { return []; },
+    };
+    const dependencies = {
+        delay: async () => {},
+        detectProjectorForModel() { detectCalls += 1; return projector; },
+        loadTimeoutMs: 100,
+        requestJson: async () => ({ json: {} }),
+        validateProjectorPath,
+    };
+    try {
+        const disabled = normalizeModelLoadRequest({ modelId: model, projectorPath: '', autoDetectProjector: false });
+        assert.equal(disabled.autoDetectProjector, false);
+        await loadModel(runtime, disabled, dependencies);
+        assert.equal(detectCalls, 0);
+        assert.deepEqual(legacyRequest, { modelId: model, projectorPath: null });
+
+        legacyRequest = null;
+        await loadModel(runtime, model, dependencies);
+        assert.equal(detectCalls, 1);
+        assert.deepEqual(legacyRequest, { modelId: model, projectorPath: fs.realpathSync(projector) });
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('Load Model projector dropdown auto-selects detected projectors, exposes No Projector, and keeps local browse on adjacent buttons', async () => {
+    const commonSource = read('backend/renderer/nodes/builtin/common.js');
+    const loadModelSource = read('backend/renderer/nodes/builtin/load-model.js');
+    let definition = null;
+    let projectorOptions = [];
+    let loadArguments = null;
+    const detectedPath = '/models/vision.mmproj';
+    const bridge = {
+        async detectProjector() {
+            return { success: true, projectorPath: detectedPath, projectors: [{ path: detectedPath, fileName: 'vision.mmproj', recommended: true }] };
+        },
+        async loadModel(modelId, projectorPath, options) {
+            loadArguments = { modelId, projectorPath, options };
+            return { success: true, modelId, status: 'loaded', projectorPath: projectorPath || null, multimodal: Boolean(projectorPath) };
+        },
+    };
+    const controls = {
+        dropdown(label, _value, _nodeId, _param, options) {
+            if (label === 'Projector') projectorOptions = options.slice();
+            return '';
+        },
+        button(label, _nodeId, action, options) {
+            return `<button class="${options && options.className || ''}" data-action="${action}" aria-label="${options && options.ariaLabel || ''}">${label}</button>`;
+        },
+        status() { return ''; },
+        escapeHtml(value) { return String(value); },
+    };
+    const sandbox = {
+        document: { getElementById() { return null; } },
+        darkstar: { nodes: bridge },
+        Darkstar: {
+            modelInventory: [],
+            nodes: {
+                controls,
+                PORT_TYPES: { SERVER: 'server', MODEL: 'model' },
+                registerNode(value) { definition = value; },
+            },
+        },
+        setContextContractRuntimeContextReady() {},
+        updateTokenCounter() {},
+    };
+    sandbox.window = sandbox;
+    sandbox.globalThis = sandbox;
+    const context = vm.createContext(sandbox);
+    vm.runInContext(commonSource, context, { filename: 'backend/renderer/nodes/builtin/common.js' });
+    vm.runInContext(loadModelSource, context, { filename: 'backend/renderer/nodes/builtin/load-model.js' });
+    assert.ok(definition);
+
+    const node = definition.factory(1, 0, 0);
+    node.selectedModel = '/models/vision.gguf';
+    await definition.onModelChange(node, node.selectedModel);
+    assert.equal(node.params.projectorPath, detectedPath);
+    assert.equal(node.params.projectorSource, 'detected');
+    const initialHtml = definition.buildContentHTML(node);
+    assert.equal(projectorOptions[0].value, '');
+    assert.equal(projectorOptions[0].label, 'No Projector');
+    assert.equal(projectorOptions.some((option) => /Browse Local Filesystem/u.test(option.label)), false);
+    assert.match(initialHtml, /data-action="browse-local-model"[\s\S]*?aria-label="Browse Local Filesystem for Model"/u);
+    assert.match(initialHtml, /data-action="browse-local-projector"[\s\S]*?aria-label="Browse Local Filesystem for Projector"/u);
+
+    node.params.projectorPath = '';
+    definition.onParameterChange(node, 'projectorPath');
+    assert.equal(node.params.projectorSource, 'none');
+    await definition.execute({ server: { running: true } }, node, {});
+    assert.equal(node.params.projectorSource, 'none');
+    assert.equal(loadArguments.projectorPath, '');
+    assert.equal(loadArguments.options.autoDetectProjector, false);
+
+    const manualPath = '/external/custom.mmproj';
+    assert.equal(definition.onProjectorBrowse(node, { path: manualPath, fileName: 'custom.mmproj' }), manualPath);
+    node.params.projectorPath = manualPath;
+    definition.onParameterChange(node, 'projectorPath');
+    definition.buildContentHTML(node);
+    assert.equal(node.params.projectorPath, manualPath);
+    assert.equal(node.params.projectorSource, 'manual');
+    assert.ok(projectorOptions.some((option) => option.value === manualPath && /Local file/u.test(option.label)));
+    assert.equal(projectorOptions.some((option) => /Browse Local Filesystem/u.test(option.label)), false);
+    await definition.execute({ server: { running: true } }, node, {});
+    assert.equal(loadArguments.projectorPath, manualPath);
+    assert.equal(loadArguments.options.autoDetectProjector, true);
+
+    const rememberedPath = '/external/remembered.mmproj';
+    sandbox.Darkstar.projectorInventory = [{ path: rememberedPath, fileName: 'remembered.mmproj' }];
+    node.params.projectorCandidates = [];
+    node.params.projectorPath = rememberedPath;
+    node.params.projectorSource = '';
+    node.params.projectorModel = node.selectedModel;
+    definition.onParameterChange(node, 'projectorPath');
+    definition.buildContentHTML(node);
+    assert.equal(node.params.projectorSource, 'manual', 'an explicit remembered-projector dropdown choice must remain authoritative');
+    assert.ok(projectorOptions.some((option) => option.value === rememberedPath && /Local file/u.test(option.label)));
+    await definition.execute({ server: { running: true } }, node, {});
+    assert.equal(loadArguments.projectorPath, rememberedPath, 'execution must not replace a remembered custom projector during auto-detection');
+
+    const restoredPath = '/external/restored.mmproj';
+    const restoredNode = definition.factory(2, 0, 0);
+    restoredNode.selectedModel = '/models/restored.gguf';
+    restoredNode.params.projectorPath = restoredPath;
+    restoredNode.params.projectorSource = 'detected';
+    restoredNode.params.projectorModel = '';
+    definition.normalizeNode(restoredNode, { title: definition.title });
+    assert.equal(restoredNode.params.projectorSource, 'manual', 'a projector persisted by an older build must migrate to an authoritative restored selection');
+    assert.equal(restoredNode.params.projectorModel, restoredNode.selectedModel);
+    bridge.detectProjector = async () => ({ success: true, projectors: [], projectorPath: '' });
+    await definition.execute({ server: { running: true } }, restoredNode, {});
+    assert.equal(loadArguments.projectorPath, restoredPath, 'restart migration must not clear a visibly selected custom projector before model load');
+
+    let resolveOldDetection;
+    let resolveNewDetection;
+    bridge.detectProjector = (modelId) => new Promise((resolve) => {
+        if (/old\.gguf$/u.test(modelId)) resolveOldDetection = resolve;
+        else resolveNewDetection = resolve;
+    });
+    node.selectedModel = '/models/old.gguf';
+    const oldDetection = definition.onModelChange(node, node.selectedModel);
+    node.selectedModel = '/models/new.gguf';
+    const newDetection = definition.onModelChange(node, node.selectedModel);
+    resolveOldDetection({ success: true, projectorPath: '/models/old.mmproj', projectors: [{ path: '/models/old.mmproj', fileName: 'old.mmproj', recommended: true }] });
+    await oldDetection;
+    assert.notEqual(node.params.projectorPath, '/models/old.mmproj', 'a stale detection result must not overwrite the newer model selection');
+    resolveNewDetection({ success: true, projectorPath: '/models/new.mmproj', projectors: [{ path: '/models/new.mmproj', fileName: 'new.mmproj', recommended: true }] });
+    await newDetection;
+    assert.equal(node.params.projectorModel, '/models/new.gguf');
+    assert.equal(node.params.projectorPath, '/models/new.mmproj');
+});
+
+test('projector Browse Local Filesystem is routed through Darkstar modal and existing privileged filesystem IPC', () => {
+    const preload = read('backend/shell/preload.js');
+    const modal = read('backend/renderer/workflow-file-modal.js');
+    const controls = read('backend/renderer/nodes/editor/controls.js');
+    const loadModelNode = read('backend/renderer/nodes/builtin/load-model.js');
+    assert.match(preload, /loadModel:[\s\S]*?autoDetectProjector/u);
+    assert.match(modal, /root\.Darkstar\.projectorFiles/u);
+    assert.match(modal, /kind: 'projector'/u);
+    assert.match(modal, /Select Projector/u);
+    assert.match(modal, /No native file dialog is opened/u);
+    assert.doesNotMatch(modal, /showOpenDialog|dialog\.showOpenDialog/u);
+    assert.match(controls, /browserKind !== 'projector'[\s\S]*?projectorFiles[\s\S]*?onProjectorBrowse[\s\S]*?setNodeParamValue\(nodeId, 'projectorPath'/u);
+    assert.match(loadModelNode, /label: 'No Projector'/u);
+    assert.match(loadModelNode, /localBrowseField\(common\.modelDropdown\(node\), node\.id, 'browse-local-model', 'Model'\)[\s\S]*?localBrowseField\(controls\.dropdown\('Projector'[\s\S]*?node\.id, 'browse-local-projector', 'Projector'\)/u);
+    assert.doesNotMatch(loadModelNode, /options\.push\(\{ value: .*Browse Local Filesystem/u);
+});
+
+
+test('tool filesystem browsing exposes only canonical Python files and never accepts non-tool paths', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-tool-browser-'));
+    const child = path.join(directory, 'nested');
+    const alpha = path.join(directory, 'alpha.py');
+    const beta = path.join(directory, 'beta.PY');
+    const text = path.join(directory, 'notes.txt');
+    fs.mkdirSync(child);
+    fs.writeFileSync(alpha, 'print("alpha")');
+    fs.writeFileSync(beta, 'print("beta")');
+    fs.writeFileSync(text, 'hidden');
+    try {
+        const listing = browseModelFiles({ path: directory, kind: 'tool' }, { defaultPath: directory });
+        assert.deepEqual(listing.entries.map((entry) => [entry.name, entry.type]), [
+            ['nested', 'directory'], ['alpha.py', 'tool'], ['beta.PY', 'tool'],
+        ]);
+        assert.equal(listing.entries.some((entry) => entry.name === 'notes.txt'), false);
+        assert.equal(validateToolFilePath(alpha), fs.realpathSync(alpha));
+        assert.throws(() => validateToolFilePath(text), /\.py extension/u);
+        assert.throws(() => validateToolFilePath(child), /not a directory/u);
+        const selected = browseModelFiles({ path: alpha, kind: 'tool' }, { defaultPath: directory });
+        assert.equal(selected.currentPath, fs.realpathSync(directory));
+        assert.equal(selected.selectedPath, fs.realpathSync(alpha));
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+
+test('skill and image filesystem modes expose only valid files and image selection returns canonical in-memory payload data', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-skill-image-browser-'));
+    const child = path.join(directory, 'nested');
+    const skill = path.join(directory, 'SKILL.md');
+    const otherMarkdown = path.join(directory, 'notes.md');
+    const image = path.join(directory, 'photo.png');
+    const other = path.join(directory, 'notes.txt');
+    fs.mkdirSync(child);
+    fs.writeFileSync(skill, '---\nname: Example\ndescription: Test\n---\n');
+    fs.writeFileSync(otherMarkdown, '# not a skill');
+    const imageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    fs.writeFileSync(image, imageBytes);
+    fs.writeFileSync(other, 'hidden');
+    try {
+        const skills = browseModelFiles({ path: directory, kind: 'skill' }, { defaultPath: directory });
+        assert.deepEqual(skills.entries.map((entry) => [entry.name, entry.type]), [
+            ['nested', 'directory'], ['SKILL.md', 'skill'],
+        ]);
+        assert.equal(validateSkillFilePath(skill), fs.realpathSync(skill));
+        assert.throws(() => validateSkillFilePath(otherMarkdown), /named SKILL\.md/u);
+
+        const images = browseModelFiles({ path: directory, kind: 'image' }, { defaultPath: directory });
+        assert.deepEqual(images.entries.map((entry) => [entry.name, entry.type]), [
+            ['nested', 'directory'], ['photo.png', 'image'],
+        ]);
+        assert.equal(validateImageFilePath(image), fs.realpathSync(image));
+        assert.throws(() => validateImageFilePath(other), /supported local image/u);
+
+        const selected = browseModelFiles({ path: image, kind: 'image', includeData: true }, { defaultPath: directory });
+        assert.equal(selected.currentPath, fs.realpathSync(directory));
+        assert.equal(selected.selectedPath, fs.realpathSync(image));
+        assert.deepEqual(selected.selectedFile, imageFileRecord(image));
+        assert.equal(selected.selectedFile.mimeType, 'image/png');
+        assert.equal(selected.selectedFile.base64, imageBytes.toString('base64'));
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('custom model and projector history persists outside workflows and prunes deleted assets on validation', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-model-history-'));
+    const storePath = path.join(directory, 'local-model-history.json');
+    const model = path.join(directory, 'remembered.gguf');
+    const projector = path.join(directory, 'remembered.mmproj');
+    writeEmptyGguf(model);
+    fs.writeFileSync(projector, 'projector');
+    try {
+        const store = new LocalModelHistoryStore({ filePath: storePath });
+        store.remember(LOCAL_MODEL_HISTORY_KEYS.MODELS, model);
+        store.remember(LOCAL_MODEL_HISTORY_KEYS.PROJECTORS, projector);
+        const restored = new LocalModelHistoryStore({ filePath: storePath });
+        assert.deepEqual(restored.list(LOCAL_MODEL_HISTORY_KEYS.MODELS), [path.normalize(model)]);
+        assert.deepEqual(restored.list(LOCAL_MODEL_HISTORY_KEYS.PROJECTORS), [path.normalize(projector)]);
+        assert.deepEqual(restored.prune(LOCAL_MODEL_HISTORY_KEYS.MODELS, validateModelFilePath), [fs.realpathSync(model)]);
+        assert.deepEqual(restored.prune(LOCAL_MODEL_HISTORY_KEYS.PROJECTORS, validateProjectorPath), [fs.realpathSync(projector)]);
+
+        fs.unlinkSync(model);
+        assert.deepEqual(restored.prune(LOCAL_MODEL_HISTORY_KEYS.MODELS, validateModelFilePath), [], 'deleted custom models must be forgotten rather than retained forever');
+        const afterDelete = new LocalModelHistoryStore({ filePath: storePath });
+        assert.deepEqual(afterDelete.list(LOCAL_MODEL_HISTORY_KEYS.MODELS), []);
+        assert.deepEqual(afterDelete.list(LOCAL_MODEL_HISTORY_KEYS.PROJECTORS), [fs.realpathSync(projector)]);
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('custom model parent directories participate in the same stable filesystem-watch refresh contract as the managed models directory', async () => {
+    const { EventEmitter } = require('node:events');
+    const { ModelDirectoryMonitor } = require('../../runtime/models');
+    let records = [{ id: 'custom', fileName: 'custom.gguf', size: 1, modifiedAt: '1' }];
+    const callbacks = new Map();
+    const scheduled = [];
+    const published = [];
+    const watchers = new Map();
+    const monitor = new ModelDirectoryMonitor({
+        watchPaths: ['C:/managed-models', 'D:/external-models'], intervalMs: 250, debounceMs: 25, stableScans: 2,
+        listModels: () => records,
+        onChange: async (next) => published.push(next.map((item) => item.id)),
+        watchFn(target, options, callback) {
+            assert.equal(options.recursive, true);
+            callbacks.set(target, callback);
+            const watcher = new EventEmitter(); watcher.close = () => {}; watcher.unref = () => {}; watchers.set(target, watcher); return watcher;
+        },
+        setIntervalFn() { throw new Error('polling must not start when every watched directory supports fs.watch'); }, clearIntervalFn() {},
+        setTimeoutFn(fn, delay) { const timer = { fn, delay, unref() {} }; scheduled.push(timer); return timer; },
+        clearTimeoutFn(timer) { const index = scheduled.indexOf(timer); if (index >= 0) scheduled.splice(index, 1); },
+    }).start();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(Array.from(callbacks.keys()), ['C:/managed-models', 'D:/external-models']);
+    records = [];
+    callbacks.get('D:/external-models')('rename', 'custom.gguf');
+    const first = scheduled.shift(); assert.equal(first.delay, 25); first.fn(); await new Promise((resolve) => setImmediate(resolve));
+    const confirmation = scheduled.shift(); assert.equal(confirmation.delay, 250); confirmation.fn(); await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(published, [[]], 'external deletion events must publish through the same stable-scan path');
+    monitor.stop();
+});
+
+test('persistent custom model/projector inventory is wired into startup listing and renderer dropdowns without changing workflow authority', () => {
+    const main = read('backend/app/run-main-app.js');
+    const ipc = read('backend/ipc/register-llama-ipc.js');
+    const uiIpc = read('backend/ipc/register-ui-ipc.js');
+    const serverProcess = read('backend/runtime/server-process.js');
+    const server = read('backend/renderer/server.js');
+    const loadModel = read('backend/renderer/nodes/builtin/load-model.js');
+    assert.match(main, /local-model-history\.json[\s\S]*?localModelHistory/u);
+    assert.match(ipc, /const path = require\('node:path'\);/u, 'llama IPC must bind node:path before model-path processing');
+    assert.match(serverProcess, /const path = require\('node:path'\);/u, 'server process must bind node:path before executable-path inspection');
+    assert.match(ipc, /const \{ LOCAL_MODEL_HISTORY_KEYS \} = require\('\.\.\/preferences\/local-model-history-store'\);/u, 'llama IPC must import the history keys it reads during startup');
+    assert.doesNotMatch(uiIpc, /rememberProjector/u, 'UI projector detection must not reference llama IPC private history helpers');
+    assert.match(ipc, /rememberedModels[\s\S]*?allModels[\s\S]*?projectors: rememberedProjectors/u);
+    assert.match(ipc, /watchPaths: modelWatchPaths\(\)[\s\S]*?watchPaths: projectorWatchPaths\(\)/u);
+    assert.match(server, /projectorInventory[\s\S]*?response\.projectors[\s\S]*?applyModelInventory\(records, projectors\)/u);
+    assert.match(loadModel, /root\.Darkstar\.projectorInventory[\s\S]*?\(Unavailable\)/u);
+    assert.match(loadModel, /rememberProjectorSelection[\s\S]*?browseModelFiles\(\{ kind: 'projector', path: projectorPath \}\)[\s\S]*?onParameterChange[\s\S]*?rememberProjectorSelection\(params\.projectorPath\)/u, 'choosing a detected projector from the dropdown must persist it immediately, even before model load');
+});
+
+test('local browser spawn locations persist independently for model, projector, tools, skills, and images', () => {
+    const rootDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-browser-locations-'));
+    const storePath = path.join(rootDirectory, 'dialog-locations.json');
+    const kinds = [
+        [DIALOG_LOCATION_KEYS.MODELS, 'models'],
+        [DIALOG_LOCATION_KEYS.PROJECTORS, 'projectors'],
+        [DIALOG_LOCATION_KEYS.TOOLS, 'tools'],
+        [DIALOG_LOCATION_KEYS.SKILLS, 'skills'],
+        [DIALOG_LOCATION_KEYS.IMAGES, 'images'],
+    ];
+    try {
+        const store = new DialogLocationStore({ filePath: storePath });
+        const expected = new Map();
+        for (const [key, name] of kinds) {
+            const directory = path.join(rootDirectory, name);
+            fs.mkdirSync(directory);
+            expected.set(key, directory);
+            store.rememberDirectory(key, directory);
+        }
+        const restored = new DialogLocationStore({ filePath: storePath });
+        for (const [key] of kinds) {
+            assert.equal(restored.getDirectory(key), expected.get(key), `${key} must restore only its own last-used directory`);
+        }
+        assert.equal(new Set(kinds.map(([key]) => restored.getDirectory(key))).size, kinds.length,
+            'one picker must never inherit another picker’s remembered spawn location');
+
+        const ipcSource = read('backend/ipc/register-llama-ipc.js');
+        assert.match(ipcSource, /model: DIALOG_LOCATION_KEYS\.MODELS, projector: DIALOG_LOCATION_KEYS\.PROJECTORS,[\s\S]*?tool: DIALOG_LOCATION_KEYS\.TOOLS, skill: DIALOG_LOCATION_KEYS\.SKILLS, image: DIALOG_LOCATION_KEYS\.IMAGES/u);
+        assert.match(ipcSource, /getDirectory\(locationKey, fallback\)[\s\S]*?rememberDirectory\(locationKey, result\.currentPath\)/u);
+    } finally {
+        fs.rmSync(rootDirectory, { recursive: true, force: true });
+    }
+});
+
+test('Skills and composer image loading use the Darkstar browser with mode-appropriate selection semantics', async () => {
+    const skillsSource = read('backend/renderer/nodes/builtin/skills.js');
+    const imageSource = read('backend/renderer/image.js');
+    const listenerSource = read('backend/renderer/event-listeners.js');
+    const modalSource = read('backend/renderer/workflow-file-modal.js');
+    assert.doesNotMatch(skillsSource, /chooseSkill/u);
+    assert.match(skillsSource, /skillFiles[\s\S]*?open\(\{ multiple: true \}\)/u);
+    assert.match(imageSource, /imageFiles[\s\S]*?open\(\{ multiple: false \}\)/u);
+    assert.match(modalSource, /return \(mode === 'tool' \|\| mode === 'skill'\) && filesystemMultiple/u,
+        'only Tools and Skills may enable filesystem multi-selection');
+    assert.match(modalSource, /root\.Darkstar\.skillFiles[\s\S]*?open: function\(options\) \{ return open\('skill'/u);
+    assert.match(modalSource, /root\.Darkstar\.imageFiles[\s\S]*?open: function\(options\) \{ return open\('image'/u);
+    assert.doesNotMatch(listenerSource, /bindClickById\('imageUploadButton'[\s\S]{0,300}?imageInput[\s\S]{0,120}?\.click\(\)/u);
+
+    let definition = null;
+    const selected = ['C:/Skills/One/SKILL.md', 'C:/Skills/Two/SKILL.md'];
+    const inspected = [];
+    const sandbox = {
+        document: { getElementById() { return null; } },
+        darkstar: { agent: { async inspectSkill(skillPath) {
+            inspected.push(skillPath);
+            return { success: true, skill: { path: skillPath, name: path.basename(path.dirname(skillPath)), description: 'Loaded', compatible: true } };
+        } } },
+        Darkstar: {
+            skillFiles: { async open(options) { assert.equal(options.multiple, true); return { paths: selected.slice(), path: selected[0] }; } },
+            nodes: {
+                controls: { button() { return ''; }, status() { return ''; }, escapeHtml(value) { return String(value); } },
+                PORT_TYPES: { SKILLS: 'SKILLS' }, registerNode(value) { definition = value; },
+            },
+        },
+        rerenderNode() {}, console,
+    };
+    sandbox.window = sandbox;
+    sandbox.globalThis = sandbox;
+    const context = vm.createContext(sandbox);
+    vm.runInContext(read('backend/renderer/nodes/builtin/common.js'), context, { filename: 'backend/renderer/nodes/builtin/common.js' });
+    vm.runInContext(skillsSource, context, { filename: 'backend/renderer/nodes/builtin/skills.js' });
+    const node = definition.factory('skills-browser', 0, 0);
+    await definition.onAction(node, 'add-skill-file');
+    assert.deepEqual(inspected, selected, 'every browser-selected skill must still pass through the existing skill inspector');
+    assert.deepEqual(Array.from(node.params.skills, (skill) => skill.path), selected);
+});
+
+test('tool browser multi-select supports normal, Ctrl, Shift, and empty-area drag selection without affecting other filesystem modes', async () => {
+    function classList() {
+        const values = new Set();
+        return {
+            add(name) { values.add(name); }, remove(name) { values.delete(name); }, contains(name) { return values.has(name); },
+            toggle(name, force) { const enabled = force === undefined ? !values.has(name) : Boolean(force); if (enabled) values.add(name); else values.delete(name); },
+        };
+    }
+    function element(id) {
+        const listeners = new Map();
+        const attributes = new Map();
+        const item = {
+            id, dataset: {}, className: '', classList: classList(), hidden: false, disabled: false, value: '', placeholder: '', children: [], style: {}, parentNode: null,
+            setAttribute(name, value) { attributes.set(name, String(value)); }, removeAttribute(name) { attributes.delete(name); }, getAttribute(name) { return attributes.get(name); }, focus() {},
+            addEventListener(type, handler) { listeners.set(type, handler); }, listener(type) { return listeners.get(type); },
+            appendChild(child) { child.parentNode = this; this.children.push(child); return child; },
+            removeChild(child) { const index = this.children.indexOf(child); if (index >= 0) this.children.splice(index, 1); child.parentNode = null; return child; },
+            querySelectorAll(selector) { return selector === '.workflow-file-list-item' ? this.children.filter((child) => child.className === 'workflow-file-list-item') : []; },
+            querySelector() { return this.children[0] || null; },
+            getBoundingClientRect() { return this.rect || { left: 0, top: 0, right: 320, bottom: 220, width: 320, height: 220 }; },
+        };
+        let text = '';
+        Object.defineProperty(item, 'textContent', { get() { return text; }, set(value) { text = String(value); if (text === '') item.children = []; } });
+        return item;
+    }
+    const ids = ['workflowFileModal', 'workflowFileModalTitle', 'workflowFileModalSubtitle', 'workflowFileNameSection', 'workflowFileNameInput',
+        'workflowFilePickerLabel', 'workflowFilePickerSection', 'workflowFileSidebar', 'workflowFileHistoryControls', 'workflowFileBackButton',
+        'workflowFileForwardButton', 'workflowFileList', 'workflowFileEmpty', 'workflowFileModalError', 'workflowFileAbortButton', 'workflowFileCommitButton'];
+    const elements = new Map(ids.map((id) => [id, element(id)]));
+    elements.get('workflowFileSidebar').querySelectorAll = () => [];
+    elements.get('workflowFileList').rect = { left: 0, top: 0, right: 320, bottom: 220, width: 320, height: 220 };
+    const documentListeners = new Map();
+    const label = element('location-label');
+    const files = ['/tools/alpha.py', '/tools/beta.py', '/tools/gamma.py'];
+    const listing = {
+        success: true, currentPath: '/tools', displayPath: '/tools', selectedPath: '', parentPath: '/', sidebar: [],
+        entries: files.map((filePath) => ({ name: path.basename(filePath), path: filePath, type: 'tool' })),
+    };
+    const requests = [];
+    const context = {
+        console, Promise, Object, Number, String, Boolean, Array, Math,
+        document: {
+            body: element('body'), activeElement: null,
+            addEventListener(type, handler) { if (!documentListeners.has(type)) documentListeners.set(type, []); documentListeners.get(type).push(handler); },
+            getElementById(id) { return elements.get(id) || null; },
+            querySelector(selector) { return selector.startsWith('label[') ? label : null; },
+            createElement(tag) { return element(tag); }, createElementNS(_namespace, tag) { return element(tag); },
+        },
+        darkstar: { nodes: { async browseModelFiles(request) {
+            requests.push(request);
+            if (request.kind !== 'tool') return { success: false, error: 'wrong mode' };
+            if (files.includes(request.path)) return { ...listing, selectedPath: request.path };
+            return listing;
+        } } },
+        Darkstar: { modal: {
+            createModalCoordinator() { return { blockBackground() {}, setNativeOverlayBlocked() {}, restoreFocus() {}, focus() {} }; },
+            resolveElements(spec) { return Object.fromEntries(Object.entries(spec).map(([key, id]) => [key, elements.get(id) || null])); },
+        } },
+        showNodeEditorToast() {}, createWorkflowSnapshot() {}, restoreWorkflowDocument() {}, restoreWorkflowSnapshot() {}, scheduleWorkflowSessionSave() {},
+    };
+    context.globalThis = context;
+    vm.createContext(context);
+    vm.runInContext(read('backend/renderer/workflow-file-modal.js'), context, { filename: 'workflow-file-modal.js' });
+
+    const completion = context.Darkstar.toolFiles.open({ multiple: true, initialPath: '/tools' });
+    await new Promise((resolve) => setImmediate(resolve));
+    const list = elements.get('workflowFileList');
+    const toolButtons = list.children.filter((button) => button.dataset.localPath);
+    assert.equal(toolButtons.length, 3);
+    assert.equal(list.getAttribute('aria-multiselectable'), 'true');
+    toolButtons.forEach((button, index) => { button.rect = { left: 8, right: 300, top: 10 + index * 45, bottom: 45 + index * 45 }; });
+
+    toolButtons[0].listener('click')({ ctrlKey: false, metaKey: false, shiftKey: false });
+    toolButtons[2].listener('click')({ ctrlKey: false, metaKey: false, shiftKey: true });
+    assert.deepEqual(toolButtons.map((button) => button.classList.contains('selected')), [true, true, true], 'Shift-click must select the inclusive anchor range');
+    toolButtons[1].listener('click')({ ctrlKey: true, metaKey: false, shiftKey: false });
+    assert.deepEqual(toolButtons.map((button) => button.classList.contains('selected')), [true, false, true], 'Ctrl-click must toggle one tool without disturbing the others');
+
+    list.listener('mousedown')({ button: 0, target: list, clientX: 120, clientY: 200, ctrlKey: false, metaKey: false, preventDefault() {} });
+    for (const handler of documentListeners.get('mousemove') || []) handler({ clientX: 180, clientY: 5, preventDefault() {} });
+    for (const handler of documentListeners.get('mouseup') || []) handler({});
+    assert.deepEqual(toolButtons.map((button) => button.classList.contains('selected')), [true, true, true], 'dragging from empty list space must select every intersected tool row');
+
+    elements.get('workflowFileCommitButton').listener('click')();
+    const result = await completion;
+    assert.deepEqual(Array.from(result.paths), files);
+    assert.equal(result.path, files[0]);
+    assert.equal(requests.filter((request) => files.includes(request.path)).length, 3, 'every chosen tool must be revalidated before the browser returns it');
+});
+
+test('Tools and Load Tool use Darkstar tool browser instead of the native chooser, and Tools loads every selected file', async () => {
+    const toolsSource = read('backend/renderer/nodes/builtin/tools.js');
+    const loadToolSource = read('backend/renderer/nodes/builtin/load-tool.js');
+    assert.doesNotMatch(toolsSource, /chooseToolFile/u);
+    assert.doesNotMatch(loadToolSource, /chooseToolFile/u);
+    assert.match(toolsSource, /toolFiles[\s\S]*?open\(\{ multiple: true \}\)/u);
+    assert.match(loadToolSource, /toolFiles[\s\S]*?open\(\{ multiple: false/u);
+
+    let definition = null;
+    const selected = ['C:/Tools/alpha.py', 'C:/Tools/beta.py'];
+    const sandbox = {
+        document: { getElementById() { return null; } },
+        darkstar: { agent: { async inspectToolProvider(reference) {
+            return { success: true, provider: { kind: 'python', path: reference.path, name: path.basename(reference.path), tools: [{ function: { name: path.basename(reference.path, '.py') } }] } };
+        } } },
+        Darkstar: {
+            toolFiles: { async open(options) { assert.equal(options.multiple, true); return { paths: selected.slice(), path: selected[0] }; } },
+            nodes: {
+                controls: { dropdown() { return ''; }, button() { return ''; }, status() { return ''; }, escapeHtml(value) { return String(value); } },
+                PORT_TYPES: { TOOLS: 'TOOLS' }, registerNode(value) { definition = value; },
+            },
+        },
+        rerenderNode() {}, console,
+    };
+    sandbox.window = sandbox;
+    sandbox.globalThis = sandbox;
+    const context = vm.createContext(sandbox);
+    vm.runInContext(read('backend/renderer/nodes/builtin/common.js'), context, { filename: 'backend/renderer/nodes/builtin/common.js' });
+    vm.runInContext(toolsSource, context, { filename: 'backend/renderer/nodes/builtin/tools.js' });
+    const node = definition.factory('tools-browser', 0, 0);
+    await definition.onAction(node, 'add-tool-file');
+    assert.ok(node.params.providers.some((provider) => provider.path === selected[0]));
+    assert.ok(node.params.providers.some((provider) => provider.path === selected[1]));
+});
+});
+
+// ============================================================================
+// TEST MODULE: backend/Dev/tests/attention-working-directory-regression.test.js
+// ============================================================================
+TEST_FACTORIES.set("backend/Dev/tests/attention-working-directory-regression.test.js", function(module, exports, require, __filename, __dirname) {
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+const vm = require('node:vm');
+const { AttentionRequestService } = require('../../agent/attention-request-service');
+const { registerWorkspaceAttentionAction, registerToolPermissionAttentionAction, registerUserQuestionAttentionAction, USER_YES_NO_ATTENTION_KIND, WORKSPACE_CHANGE_ATTENTION_KIND } = require('../../agent/attention-actions');
+const { PermissionPolicyService, PERMISSION_LEVELS, gateToolCall, resolveToolPermission, USER_REJECTED_COMMAND_MESSAGE } = require('../../agent/permission-policy');
+const { FilesystemAccessPolicyService, FILESYSTEM_ACCESS_LEVELS, resolveFilesystemContract } = require('../../agent/filesystem-access-policy');
+const { createFileToolProvider } = require('../../agent/builtin/file-tools');
+const { registerAppIpc } = require('../../ipc/register-app-ipc');
+const { inspectPythonProvider } = require('../../agent/python-tool-host');
+const { ToolService } = require('../../agent/tool-service');
+const { executeToolCalls } = require('../../runtime/agent-loop');
+const { ModelIdleUnloadController, normalizeModelIdleUnloadSeconds } = require('../../runtime/model-idle-unload');
+const { WorkspaceRegistry } = require('../../workspace/workspace-service');
+
+const root = path.resolve(__dirname, '..', '..', '..');
+const read = (file) => fs.readFileSync(path.join(root, file), 'utf8');
+const runnerPath = path.join(root, 'backend', 'agent', 'python-tool-runner.py');
+const workingDirectoryTool = path.join(root, 'agent_assets', 'tools', 'change_working_directory.py');
+const askUserYesNoTool = path.join(root, 'agent_assets', 'tools', 'ask_user_yes_no.py');
+
+async function waitForActive(attention) {
+    for (let index = 0; index < 100; index += 1) {
+        const request = attention.listActive()[0];
+        if (request) return request;
+        await new Promise((resolve) => setImmediate(resolve));
+    }
+    throw new Error('Permission request did not become active.');
+}
+
+function simpleRuntime(handler, name = 'custom_tool', ids = {}) {
+    const definition = { type: 'function', function: { name, parameters: { type: 'object', properties: { value: { type: 'integer' } }, additionalProperties: false } } };
+    return {
+        handlers: new Map([[name, { definition, permission: { risk: 'read' }, execute: handler, reference: { kind: 'module', id: 'test-provider' } }]]),
+        definitions: [definition], workspaceId: ids.workspaceId || 'workspace-test', projectId: ids.projectId ?? 7, tabId: ids.tabId ?? 11,
+        workspaceRoot: root, skillsRoot: null,
+    };
+}
+
+function simpleCall(name = 'custom_tool', value = 1) {
+    return { id: `${name}-call`, type: 'function', function: { name, arguments: JSON.stringify({ value }) } };
+}
+
+test('Filesystem Access exposes exactly three ordered levels and defaults new workflows to the user-profile boundary', async () => {
+    assert.deepEqual(FILESYSTEM_ACCESS_LEVELS.map((level) => level.id), ['1', '2', '3']);
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-filesystem-policy-'));
+    const home = path.join(temporary, 'home');
+    const workspace = path.join(home, 'project');
+    const homeSibling = path.join(home, 'Documents');
+    const outside = path.join(temporary, 'outside');
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.mkdirSync(homeSibling, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(workspace, 'inside.txt'), 'inside');
+    fs.writeFileSync(path.join(homeSibling, 'home.txt'), 'home');
+    fs.writeFileSync(path.join(outside, 'outside.txt'), 'outside');
+    const policy = new FilesystemAccessPolicyService({ baseDir: root, homeDir: home });
+    try {
+        assert.equal(policy.snapshot().level, '2');
+        assert.equal(await policy.resolvePath('inside.txt', workspace), fs.realpathSync(path.join(workspace, 'inside.txt')));
+        assert.equal(await policy.resolvePath(path.join(homeSibling, 'home.txt'), workspace), fs.realpathSync(path.join(homeSibling, 'home.txt')));
+
+        policy.setLevel('3');
+        await assert.rejects(policy.resolvePath(path.join(homeSibling, 'home.txt'), workspace), /outside the Filesystem Access Level 3 boundary/u);
+
+        policy.setLevel('2');
+        assert.equal(await policy.resolvePath(path.join(homeSibling, 'home.txt'), workspace), fs.realpathSync(path.join(homeSibling, 'home.txt')));
+        await assert.rejects(policy.resolvePath(path.join(outside, 'outside.txt'), workspace), /outside the Filesystem Access Level 2 boundary/u);
+
+        policy.setLevel('1');
+        assert.equal(await policy.resolvePath(path.join(outside, 'outside.txt'), workspace), path.resolve(outside, 'outside.txt'));
+    } finally {
+        fs.rmSync(temporary, { recursive: true, force: true });
+    }
+});
+
+test('built-in file tools honor Level 3 workspace, Level 2 user-profile, and Level 1 full-filesystem boundaries', async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-filesystem-file-tools-'));
+    const home = path.join(temporary, 'home');
+    const workspaceRoot = path.join(home, 'project');
+    const homeSibling = path.join(home, 'Documents');
+    const outside = path.join(temporary, 'outside');
+    fs.mkdirSync(workspaceRoot, { recursive: true }); fs.mkdirSync(homeSibling, { recursive: true }); fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(workspaceRoot, 'inside.txt'), 'workspace');
+    fs.writeFileSync(path.join(homeSibling, 'home.txt'), 'profile');
+    fs.writeFileSync(path.join(outside, 'outside.txt'), 'outside');
+    const policy = new FilesystemAccessPolicyService({ baseDir: root, homeDir: home, level: '3' });
+    const provider = createFileToolProvider({ getRoot() { return workspaceRoot; }, requireRoot() { return workspaceRoot; } }, { filesystemAccess: policy });
+    const readTool = provider.tools.find((entry) => entry.definition.function.name === 'read_file');
+    try {
+        assert.match(await readTool.execute({ path: 'inside.txt', offset: 1, limit: 10 }), /workspace/u);
+        await assert.rejects(readTool.execute({ path: path.join(homeSibling, 'home.txt'), offset: 1, limit: 10 }), /outside the Filesystem Access Level 3 boundary/u);
+        policy.setLevel('2');
+        assert.match(await readTool.execute({ path: path.join(homeSibling, 'home.txt'), offset: 1, limit: 10 }), /profile/u);
+        await assert.rejects(readTool.execute({ path: path.join(outside, 'outside.txt'), offset: 1, limit: 10 }), /outside the Filesystem Access Level 2 boundary/u);
+        policy.setLevel('1');
+        assert.match(await readTool.execute({ path: path.join(outside, 'outside.txt'), offset: 1, limit: 10 }), /outside/u);
+    } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
+});
+
+test('Filesystem Access resolves symlinks before authorizing a restricted path', async (t) => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-filesystem-symlink-'));
+    const home = path.join(temporary, 'home');
+    const workspace = path.join(home, 'project');
+    const outside = path.join(temporary, 'outside');
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'secret.txt'), 'secret');
+    try {
+        try { fs.symlinkSync(outside, path.join(workspace, 'escape'), process.platform === 'win32' ? 'junction' : 'dir'); }
+        catch (error) { if (error && ['EPERM', 'EACCES', 'ENOTSUP'].includes(error.code)) { t.skip(`symlinks unavailable: ${error.code}`); return; } throw error; }
+        const policy = new FilesystemAccessPolicyService({ baseDir: root, homeDir: home, level: '3' });
+        await assert.rejects(policy.resolvePath(path.join(workspace, 'escape', 'secret.txt'), workspace), /resolves outside the Filesystem Access Level 3 boundary/u);
+    } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
+});
+
+test('Filesystem Access fails closed for host shells and custom provider processes at restricted levels', async () => {
+    const policy = new FilesystemAccessPolicyService({ baseDir: root, homeDir: os.homedir(), level: '3' });
+    const runtime = { workspaceRoot: root };
+    const shellHandler = { reference: { kind: 'builtin', id: 'terminal' } };
+    assert.equal(resolveFilesystemContract('terminal', shellHandler, root), 'unrestricted');
+    await assert.rejects(policy.assertToolExecution(runtime, 'terminal', { command: 'echo test' }, shellHandler), (error) => error && error.code === 'FILESYSTEM_ACCESS_BLOCKED');
+
+    const runPythonHandler = { host: {}, reference: { kind: 'python', path: path.join(root, 'agent_assets', 'tools', 'run_python.py') } };
+    assert.equal(resolveFilesystemContract('run_python', runPythonHandler, root), 'unrestricted');
+    await assert.rejects(policy.assertToolExecution(runtime, 'run_python', { code: "print('x')" }, runPythonHandler), (error) => error && error.code === 'FILESYSTEM_ACCESS_BLOCKED');
+
+    const customPython = { host: {}, definition: { function: { 'x-darkstar-filesystem': 'scoped' } }, reference: { kind: 'python', path: path.join(os.tmpdir(), 'custom.py') } };
+    assert.equal(resolveFilesystemContract('custom_python_tool', customPython, root), 'unrestricted', 'custom Python providers must not self-assert a sandbox the host cannot prove');
+    await assert.rejects(policy.assertToolExecution(runtime, 'custom_python_tool', {}, customPython), (error) => error && error.code === 'FILESYSTEM_ACCESS_BLOCKED');
+
+    const customModule = { reference: { kind: 'module', path: path.join(os.tmpdir(), 'custom.js') } };
+    assert.equal(resolveFilesystemContract('custom_module_tool', customModule, root), 'unrestricted');
+    await assert.rejects(policy.assertToolExecution(runtime, 'custom_module_tool', {}, customModule), (error) => error && error.code === 'FILESYSTEM_ACCESS_BLOCKED');
+
+    policy.setLevel('1');
+    assert.equal(await policy.assertToolExecution(runtime, 'terminal', { command: 'echo test' }, shellHandler), true);
+    assert.equal(await policy.assertToolExecution(runtime, 'custom_python_tool', {}, customPython), true);
+});
+
+
+test('Filesystem Access Level 3 fails closed for scoped tools when no working directory is active', async () => {
+    const policy = new FilesystemAccessPolicyService({ baseDir: root, level: '3' });
+    const handler = { definition: { function: { name: 'read_file', 'x-darkstar-filesystem': 'scoped' } }, reference: { kind: 'builtin', id: 'file' } };
+    await assert.rejects(
+        policy.assertToolExecution({ workspaceRoot: null }, 'read_file', { path: 'notes.txt' }, handler),
+        (error) => error.code === 'FILESYSTEM_ACCESS_NO_WORKSPACE' && /active working directory/u.test(error.message),
+    );
+});
+
+test('permission policy exposes exactly five ordered security levels with Boundary Guard as the new-workflow default', () => {
+    const policy = new PermissionPolicyService();
+    assert.equal(policy.snapshot().level, 'boundary-guard');
+    assert.deepEqual(PERMISSION_LEVELS.map((level) => level.id), ['full-review', 'change-guard', 'connected-guard', 'boundary-guard', 'unrestricted']);
+    const risks = ['read', 'change', 'destructive', 'connected', 'external'];
+    const expected = {
+        'full-review': [true, true, true, true, true],
+        'change-guard': [false, true, true, true, true],
+        'connected-guard': [false, false, false, true, true],
+        'boundary-guard': [false, false, false, false, true],
+        'unrestricted': [false, false, false, false, false],
+    };
+    for (const [level, decisions] of Object.entries(expected)) {
+        policy.setLevel(level);
+        assert.deepEqual(risks.map((risk) => policy.shouldAsk(risk)), decisions, `${level} permission threshold drifted`);
+    }
+});
+
+test('Core imposes non-downgradable permission floors and unknown tools fail closed', () => {
+    assert.equal(resolveToolPermission('change_working_directory', { path: 'D:/elsewhere' }, { permission: { risk: 'read' } }).risk, 'external');
+    assert.equal(resolveToolPermission('change_working_directory', {}, { permission: { risk: 'read' } }).mode, 'self-gated');
+    assert.equal(resolveToolPermission('ask_user_yes_no', {}, { permission: { risk: 'read' } }).mode, 'self-gated');
+    assert.equal(resolveToolPermission('delete', { path: 'x' }, { permission: { risk: 'read' } }).risk, 'destructive');
+    assert.equal(resolveToolPermission('unknown_custom_tool', {}, {}).risk, 'external');
+    assert.throws(() => resolveToolPermission('unknown_custom_tool', {}, { permission: { risk: 'read', mode: 'self-gated' } }), /cannot assign a privileged execution mode/u);
+});
+
+test('Yes/No user questions always require a real decision even when Authorization is unrestricted', async () => {
+    const policy = new PermissionPolicyService({ level: 'unrestricted' });
+    const attention = new AttentionRequestService({ permissionPolicy: policy });
+    registerUserQuestionAttentionAction(attention);
+    try {
+        const pending = attention.requestDecision({ kind: USER_YES_NO_ATTENTION_KIND, workspaceId: 'w', projectId: 1, tabId: 2, prompt: 'Should I continue?' });
+        const request = await waitForActive(attention);
+        assert.equal(request.decisionMode, 'yes-no');
+        assert.equal(request.prompt, 'Should I continue?');
+        assert.equal(attention.hasPendingDecision(), true);
+        await attention.respond(request.id, { decision: 'reject' });
+        const outcome = await pending;
+        assert.equal(outcome.decision, 'reject');
+        assert.equal(attention.hasPendingDecision(), false);
+    } finally { attention.close(); }
+});
+
+test('ask_user_yes_no keeps one tool invocation pending and returns only Yes or No to the model', async () => {
+    const policy = new PermissionPolicyService({ level: 'unrestricted' });
+    const attention = new AttentionRequestService({ permissionPolicy: policy });
+    registerToolPermissionAttentionAction(attention); registerUserQuestionAttentionAction(attention);
+    const pythonEnvironment = { async ensure() { return { executable: process.env.DARKSTAR_PYTHON || 'python3', environment: {} }; } };
+    const service = new ToolService({ baseDir: root, attentionService: attention, permissionPolicy: policy, pythonEnvironment, runnerPath });
+    try {
+        const runtime = await service.buildRuntime({ workspaceId: 'question-tool', projectId: 4, tabId: 6, providers: [{ kind: 'python', path: askUserYesNoTool }] }, {});
+        assert.deepEqual(runtime.definitions.map((entry) => entry.function.name), ['ask_user_yes_no']);
+
+        const ask = (id, question) => service.execute(runtime, { id, type: 'function', function: { name: 'ask_user_yes_no', arguments: JSON.stringify({ question }) } });
+        let settled = false;
+        const yesPending = ask('question-yes', 'Should I continue with the migration?').then((value) => { settled = true; return value; });
+        const yesRequest = await waitForActive(attention);
+        assert.equal(settled, false, 'the original tool invocation must remain in flight until the user answers');
+        assert.equal(yesRequest.kind, USER_YES_NO_ATTENTION_KIND);
+        assert.equal(yesRequest.decisionMode, 'yes-no');
+        assert.equal(yesRequest.prompt, 'Should I continue with the migration?');
+        await attention.respond(yesRequest.id, { decision: 'allow' });
+        assert.deepEqual(JSON.parse((await yesPending).result), { answer: 'yes' });
+
+        const noPending = ask('question-no', 'Should I delete the optional draft?');
+        const noRequest = await waitForActive(attention);
+        await attention.respond(noRequest.id, { decision: 'reject' });
+        assert.deepEqual(JSON.parse((await noPending).result), { answer: 'no' }, 'No is an ordinary answer, not a rejected-command error');
+    } finally { await service.shutdown(); attention.close(); }
+});
+
+test('ask_user_yes_no schema explicitly requires one short Yes/No sentence and rejects malformed question shape', async () => {
+    const provider = await inspectPythonProvider(askUserYesNoTool, { runnerPath, pythonExecutable: process.env.DARKSTAR_PYTHON || 'python3' });
+    const definition = provider.description.tools.find((entry) => entry.function.name === 'ask_user_yes_no');
+    assert.ok(definition);
+    assert.match(definition.function.description, /MUST be exactly one sentence, directly answerable with Yes or No/iu);
+    assert.equal(definition.function.parameters.properties.question.maxLength, 240);
+    const policy = new PermissionPolicyService({ level: 'unrestricted' });
+    const attention = new AttentionRequestService({ permissionPolicy: policy });
+    registerUserQuestionAttentionAction(attention);
+    const pythonEnvironment = { async ensure() { return { executable: process.env.DARKSTAR_PYTHON || 'python3', environment: {} }; } };
+    const service = new ToolService({ baseDir: root, attentionService: attention, permissionPolicy: policy, pythonEnvironment, runnerPath });
+    try {
+        const runtime = await service.buildRuntime({ providers: [{ kind: 'python', path: askUserYesNoTool }] }, {});
+        await assert.rejects(() => service.execute(runtime, { id: 'bad-question', type: 'function', function: { name: 'ask_user_yes_no', arguments: JSON.stringify({ question: 'Should I continue? Are you sure?' }) } }), /single question mark|one sentence/iu);
+    } finally { await service.shutdown(); attention.close(); }
+});
+
+test('renderer attention cards and dispatch blocking are scoped to the owning execution tab', async () => {
+    const elements = new Map();
+    for (const id of ['agentAttentionCard', 'agentAttentionTitle', 'agentAttentionPrompt', 'agentAttentionCount', 'agentAttentionAllow', 'agentAttentionReject', 'agentAttentionError']) {
+        elements.set(id, { id, hidden: id !== 'agentAttentionCard' ? false : true, textContent: '', disabled: false, addEventListener() {} });
+    }
+    const responses = [];
+    const context = {
+        console, Map, Array, Number, String, Boolean, Promise,
+        activeTabId: 2,
+        document: { getElementById(id) { return elements.get(id) || null; } },
+        window: { darkstar: { attention: {
+            async respond(requestId, response) { responses.push({ requestId, response }); return { success: true }; },
+        } } },
+    };
+    context.globalThis = context;
+    vm.createContext(context);
+    vm.runInContext(read('backend/renderer/attention.js'), context, { filename: 'attention.js' });
+
+    context.rememberAgentAttentionRequest({ id: 'tab-1-request', status: 'active', kind: 'tool.execute', tabId: 1, projectId: 7, createdAt: '2026-08-25T10:00:00Z', title: 'Permission required: windows_cmd', prompt: 'Allow command?' });
+    assert.equal(elements.get('agentAttentionCard').hidden, true, 'a background tab request must not be visible in the active sibling tab');
+    assert.equal(context.agentAttentionBlocksAutomaticDispatch(1), true);
+    assert.equal(context.agentAttentionBlocksAutomaticDispatch(2), false, 'scheduled dispatch in a sibling tab must remain eligible');
+    assert.equal(context.agentAttentionBlocksFreshSend(1), true);
+    assert.equal(context.agentAttentionBlocksFreshSend(2), false);
+    assert.equal((await context.preflightAgentAttentionSend({ id: 2 }, '', {})).blocked, false, 'a sibling tab must be allowed to send normally');
+    assert.equal((await context.preflightAgentAttentionSend({ id: 1 }, '', {})).blocked, true, 'only the owning tab is blocked by its unresolved decision');
+    assert.equal(elements.get('agentAttentionError').textContent, '', 'background-tab preflight errors must not bleed into the visible tab');
+
+    context.rememberAgentAttentionRequest({ id: 'tab-2-request', status: 'active', kind: 'user.ask-yes-no', tabId: 2, projectId: 7, createdAt: '2026-08-25T10:01:00Z', decisionMode: 'yes-no', title: 'Question from the model', prompt: 'Should I continue?' });
+    assert.equal(elements.get('agentAttentionCard').hidden, false);
+    assert.equal(elements.get('agentAttentionTitle').textContent, 'Question from the model');
+    assert.equal(elements.get('agentAttentionCount').hidden, true, 'requests in other tabs must not inflate the visible-tab request count');
+    assert.equal(elements.get('agentAttentionAllow').textContent, 'Yes');
+    assert.equal(elements.get('agentAttentionReject').textContent, 'No');
+
+    context.activeTabId = 1;
+    context.renderAgentAttention();
+    assert.equal(elements.get('agentAttentionTitle').textContent, 'Permission required: windows_cmd');
+    assert.equal(elements.get('agentAttentionAllow').textContent, 'Allow');
+    assert.equal(elements.get('agentAttentionReject').textContent, 'Reject');
+    assert.equal(elements.get('agentAttentionError').textContent, 'Choose Allow or Reject before sending another message.');
+    assert.equal(await context.resolveAgentAttentionDecision('allow'), true);
+    assert.deepEqual(responses.map((entry) => entry.requestId), ['tab-1-request']);
+    assert.equal(elements.get('agentAttentionCard').hidden, true, 'resolving this tab must not expose another tab\'s pending request');
+
+    context.activeTabId = 2;
+    context.renderAgentAttention();
+    assert.equal(elements.get('agentAttentionCard').hidden, false);
+    assert.equal(elements.get('agentAttentionTitle').textContent, 'Question from the model');
+
+    const source = read('backend/renderer/attention.js');
+    assert.doesNotMatch(source, /agentAttentionPendingForProjectTab/u, 'project-wide attention coupling must not return');
+    assert.match(read('backend/renderer/tabs.js'), /function renderTabs\(\)[\s\S]*?renderAgentAttention\(\)/u, 'tab selection rendering must resynchronize the visible attention card');
+});
+
+test('background Yes/No questions use a Windows notification containing the actual question and focused Darkstar suppresses it', async () => {
+    const policy = new PermissionPolicyService({ level: 'unrestricted' });
+    const attention = new AttentionRequestService({ permissionPolicy: policy });
+    registerUserQuestionAttentionAction(attention);
+    const notifications = [];
+    class FakeNotification {
+        static isSupported() { return true; }
+        constructor(options) { this.options = options; this.listeners = new Map(); notifications.push(this); }
+        on(name, listener) { this.listeners.set(name, listener); }
+        show() { this.shown = true; }
+    }
+    let focused = false;
+    const window = { isDestroyed: () => false, isFocused: () => focused, isMinimized: () => false, webContents: { send() {} } };
+    const handlers = new Map();
+    registerAppIpc({
+        ipcMain: { handle(channel, handler) { handlers.set(channel, handler); }, on() {} },
+        dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) }, getWindow: () => window,
+        attention, permissionPolicy: policy, Notification: FakeNotification, platform: 'win32', baseDir: root,
+    });
+    try {
+        const firstPending = attention.requestDecision({ kind: USER_YES_NO_ATTENTION_KIND, workspaceId: 'w', projectId: 1, tabId: 2, prompt: 'Should I continue?' });
+        const first = await waitForActive(attention);
+        assert.equal(notifications.length, 1);
+        assert.equal(notifications[0].shown, true);
+        assert.deepEqual(notifications[0].options, { title: 'Darkstar has a question', body: 'Should I continue?', silent: false });
+        await attention.respond(first.id, { decision: 'allow' }); await firstPending;
+
+        focused = true;
+        const secondPending = attention.requestDecision({ kind: USER_YES_NO_ATTENTION_KIND, workspaceId: 'w', projectId: 1, tabId: 2, prompt: 'Should I proceed?' });
+        const second = await waitForActive(attention);
+        assert.equal(notifications.length, 1, 'Darkstar must not notify while its window is actively focused');
+        await attention.respond(second.id, { decision: 'reject' }); await secondPending;
+    } finally { attention.close(); }
+});
+
+test('browser permission classification distinguishes local inspection, mutation, cleanup and connected control', () => {
+    assert.equal(resolveToolPermission('browser_control', { action: 'open', path: 'C:/page.html' }, {}).risk, 'read');
+    assert.equal(resolveToolPermission('browser_control', { action: 'threejs_source_audit' }, {}).risk, 'read');
+    assert.equal(resolveToolPermission('browser_control', { action: 'threejs_open_debug' }, {}).risk, 'change');
+    assert.equal(resolveToolPermission('browser_control', { action: 'threejs_cleanup_debug' }, {}).risk, 'destructive');
+    assert.equal(resolveToolPermission('browser_control', { action: 'open', url: 'https://example.com' }, {}).risk, 'connected');
+});
+
+test('generic permission gate blocks the original tool call until Allow and does not create a retry grant', async () => {
+    const policy = new PermissionPolicyService({ level: 'full-review' });
+    const attention = new AttentionRequestService({ permissionPolicy: policy });
+    registerToolPermissionAttentionAction(attention);
+    const handler = { permission: { risk: 'read' }, definition: { function: { name: 'custom_read' } }, reference: { kind: 'module', id: 'test' } };
+    const runtime = { workspaceId: 'workspace-gate', projectId: 9, tabId: 12 };
+    const call = { id: 'gate-call', function: { name: 'custom_read', arguments: '{"value":1}' } };
+    try {
+        let resolved = false;
+        const pending = gateToolCall({ permissionPolicy: policy, attentionService: attention, runtime, handler, name: 'custom_read', args: { value: 1 }, call, executionOptions: {}, formatInvocation: () => 'custom_read(value=1)' }).then(() => { resolved = true; });
+        const request = await waitForActive(attention);
+        assert.equal(resolved, false, 'the same invocation must remain suspended until the user decides');
+        const response = await attention.respond(request.id, { decision: 'allow' });
+        assert.equal(response.success, true);
+        assert.equal(Object.hasOwn(response, 'modelMessage'), false, 'approval must never synthesize model context');
+        await pending;
+        assert.equal(resolved, true);
+        assert.equal(typeof policy.grantOneShot, 'undefined');
+        assert.equal(typeof policy.consumeGrant, 'undefined');
+    } finally { attention.close(); }
+});
+
+test('Reject fails only that in-flight command with the exact rejection error and a later call may ask again', async () => {
+    const policy = new PermissionPolicyService({ level: 'full-review' });
+    const attention = new AttentionRequestService({ permissionPolicy: policy });
+    registerToolPermissionAttentionAction(attention);
+    const handler = { permission: { risk: 'read' }, definition: { function: { name: 'repeatable' } }, reference: { kind: 'module', id: 'test' } };
+    const runtime = { workspaceId: 'w', projectId: 1, tabId: 2 };
+    const call = { id: 'same', function: { name: 'repeatable', arguments: '{}' } };
+    const gate = () => gateToolCall({ permissionPolicy: policy, attentionService: attention, runtime, handler, name: 'repeatable', args: {}, call, executionOptions: {}, formatInvocation: () => 'repeatable()' });
+    try {
+        const firstPending = gate();
+        const first = await waitForActive(attention);
+        await attention.respond(first.id, { decision: 'reject' });
+        await assert.rejects(firstPending, (error) => error.code === 'USER_REJECTED_COMMAND' && error.message === USER_REJECTED_COMMAND_MESSAGE);
+        const secondPending = gate();
+        const second = await waitForActive(attention);
+        assert.notEqual(second.id, first.id, 'rejection must never permanently latch the action');
+        await attention.respond(second.id, { decision: 'allow' });
+        await secondPending;
+    } finally { attention.close(); }
+});
+
+test('ToolService Allow resumes and executes the original handler exactly once with no permission metadata in its result', async () => {
+    const policy = new PermissionPolicyService({ level: 'full-review' });
+    const attention = new AttentionRequestService({ permissionPolicy: policy });
+    registerToolPermissionAttentionAction(attention);
+    let executions = 0;
+    const service = new ToolService({ baseDir: root, permissionPolicy: policy, attentionService: attention });
+    const runtime = simpleRuntime(async (args) => { executions += 1; return { success: true, value: args.value }; });
+    try {
+        const pending = service.execute(runtime, simpleCall());
+        const request = await waitForActive(attention);
+        assert.equal(executions, 0, 'the tool handler must not run before Allow');
+        await attention.respond(request.id, { decision: 'allow' });
+        const executed = await pending;
+        assert.equal(executions, 1, 'Allow must resume the original invocation rather than asking the model to issue another');
+        assert.deepEqual(JSON.parse(executed.result), { success: true, value: 1 });
+        assert.doesNotMatch(executed.result, /permission|approved|retry/iu);
+    } finally { await service.shutdown(); attention.close(); }
+});
+
+test('agent tool context on Reject is exactly the rejection sentence and the handler is never executed', async () => {
+    const policy = new PermissionPolicyService({ level: 'full-review' });
+    const attention = new AttentionRequestService({ permissionPolicy: policy });
+    registerToolPermissionAttentionAction(attention);
+    let executions = 0;
+    const service = new ToolService({ baseDir: root, permissionPolicy: policy, attentionService: attention });
+    const runtime = simpleRuntime(async () => { executions += 1; return { success: true }; });
+    const toolMessages = [], working = [], workingMessages = [];
+    try {
+        const pending = executeToolCalls({ toolService: service }, {
+            agentRuntime: runtime, calls: [simpleCall()], controller: new AbortController(), handlers: {}, preparations: [], toolMessages,
+            toolRound: 1, working, workingMessages, visionEnabled: false, interactionId: 'reject-test',
+        });
+        const request = await waitForActive(attention);
+        await attention.respond(request.id, { decision: 'reject' });
+        const result = await pending;
+        assert.equal(executions, 0);
+        assert.equal(result.completedCalls, 0);
+        assert.equal(toolMessages.length, 1);
+        assert.equal(toolMessages[0].content, USER_REJECTED_COMMAND_MESSAGE);
+    } finally { await service.shutdown(); attention.close(); }
+});
+
+test('Unrestricted bypasses the prompt and executes normally without permission sidebands', async () => {
+    const policy = new PermissionPolicyService({ level: 'unrestricted' });
+    const attention = new AttentionRequestService({ permissionPolicy: policy });
+    registerToolPermissionAttentionAction(attention);
+    let executions = 0;
+    const service = new ToolService({ baseDir: root, permissionPolicy: policy, attentionService: attention });
+    try {
+        const executed = await service.execute(simpleRuntime(async () => { executions += 1; return 'ok'; }), simpleCall());
+        assert.equal(executions, 1);
+        assert.equal(executed.result, 'ok');
+        assert.equal(attention.listActive().length, 0);
+        assert.equal(Object.hasOwn(executed, 'pauseForAttention'), false);
+        assert.equal(Object.hasOwn(executed, 'attentionRequestId'), false);
+    } finally { await service.shutdown(); attention.close(); }
+});
+
+test('working-directory permission is resolved inside the same ToolService invocation on Allow', async () => {
+    const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-tool-permission-'));
+    const first = path.join(fixture, 'first'), second = path.join(fixture, 'second');
+    fs.mkdirSync(first); fs.mkdirSync(second);
+    const workspace = new WorkspaceRegistry();
+    const policy = new PermissionPolicyService({ level: 'full-review' });
+    const attention = new AttentionRequestService({ permissionPolicy: policy });
+    registerToolPermissionAttentionAction(attention); registerWorkspaceAttentionAction(attention, workspace);
+    const pythonEnvironment = { async ensure() { return { executable: process.env.DARKSTAR_PYTHON || 'python3', environment: {} }; } };
+    const service = new ToolService({ baseDir: root, workspace, attentionService: attention, permissionPolicy: policy, pythonEnvironment, runnerPath });
+    try {
+        await workspace.setRoot('project-tool', first);
+        const runtime = await service.buildRuntime({ workspaceId: 'project-tool', projectId: 3, tabId: 2, providers: [{ kind: 'python', path: workingDirectoryTool }] }, {});
+        const pending = service.execute(runtime, { id: 'cwd-call', type: 'function', function: { name: 'change_working_directory', arguments: JSON.stringify({ path: second }) } });
+        const request = await waitForActive(attention);
+        assert.match(request.prompt, new RegExp(second.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&'), process.platform === 'win32' ? 'iu' : 'u'));
+        assert.equal(workspace.getRoot('project-tool'), fs.realpathSync(first));
+        await attention.respond(request.id, { decision: 'allow' });
+        const executed = await pending;
+        assert.equal(workspace.getRoot('project-tool'), fs.realpathSync(second));
+        const result = JSON.parse(executed.result);
+        assert.equal(result.success, true); assert.equal(result.changed, true); assert.equal(result.path, fs.realpathSync(second));
+        assert.equal(Object.hasOwn(result, 'permission'), false);
+        assert.equal(Object.hasOwn(result, 'approved'), false);
+        assert.equal(Object.hasOwn(result, 'retry'), false);
+    } finally { await service.shutdown(); attention.close(); workspace.close(); fs.rmSync(fixture, { recursive: true, force: true }); }
+});
+
+test('Filesystem Access is revalidated at workspace-change Allow time so a stricter slider change cannot race the pending action', async () => {
+    const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-filesystem-cwd-race-'));
+    const first = path.join(fixture, 'first'), second = path.join(fixture, 'second');
+    fs.mkdirSync(first); fs.mkdirSync(second);
+    const workspace = new WorkspaceRegistry();
+    const permissionPolicy = new PermissionPolicyService({ level: 'full-review' });
+    const filesystemAccess = new FilesystemAccessPolicyService({ baseDir: root, homeDir: fixture, level: '1' });
+    const attention = new AttentionRequestService({ permissionPolicy });
+    registerToolPermissionAttentionAction(attention); registerWorkspaceAttentionAction(attention, workspace, filesystemAccess);
+    const pythonEnvironment = { async ensure() { return { executable: process.env.DARKSTAR_PYTHON || 'python3', environment: {} }; } };
+    const service = new ToolService({ baseDir: root, workspace, attentionService: attention, permissionPolicy, filesystemAccess, pythonEnvironment, runnerPath });
+    try {
+        await workspace.setRoot('project-tool', first);
+        const runtime = await service.buildRuntime({ workspaceId: 'project-tool', projectId: 3, tabId: 2, providers: [{ kind: 'python', path: workingDirectoryTool }] }, {});
+        const pending = service.execute(runtime, { id: 'cwd-race', type: 'function', function: { name: 'change_working_directory', arguments: JSON.stringify({ path: second }) } });
+        const request = await waitForActive(attention);
+        filesystemAccess.setLevel('3');
+        const response = await attention.respond(request.id, { decision: 'allow' });
+        assert.equal(response.success, true);
+        assert.equal(response.decision, 'allow');
+        assert.equal(response.actionResult?.success, false);
+        assert.match(String(response.actionResult?.error || ''), /outside the Filesystem Access Level 3 boundary/u);
+        await assert.rejects(pending, (error) => error.code === 'ATTENTION_ACTION_FAILED' && /outside the Filesystem Access Level 3 boundary/u.test(error.message));
+        assert.equal(workspace.getRoot('project-tool'), fs.realpathSync(first));
+    } finally { await service.shutdown(); attention.close(); workspace.close(); fs.rmSync(fixture, { recursive: true, force: true }); }
+});
+
+test('working-directory Reject leaves the workspace unchanged and rejects the same invocation', async () => {
+    const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-tool-reject-'));
+    const first = path.join(fixture, 'first'), second = path.join(fixture, 'second');
+    fs.mkdirSync(first); fs.mkdirSync(second);
+    const workspace = new WorkspaceRegistry();
+    const policy = new PermissionPolicyService({ level: 'full-review' });
+    const attention = new AttentionRequestService({ permissionPolicy: policy });
+    registerToolPermissionAttentionAction(attention); registerWorkspaceAttentionAction(attention, workspace);
+    const pythonEnvironment = { async ensure() { return { executable: process.env.DARKSTAR_PYTHON || 'python3', environment: {} }; } };
+    const service = new ToolService({ baseDir: root, workspace, attentionService: attention, permissionPolicy: policy, pythonEnvironment, runnerPath });
+    try {
+        await workspace.setRoot('project-tool', first);
+        const runtime = await service.buildRuntime({ workspaceId: 'project-tool', projectId: 3, tabId: 2, providers: [{ kind: 'python', path: workingDirectoryTool }] }, {});
+        const pending = service.execute(runtime, { id: 'cwd-call', type: 'function', function: { name: 'change_working_directory', arguments: JSON.stringify({ path: second }) } });
+        const request = await waitForActive(attention);
+        await attention.respond(request.id, { decision: 'reject' });
+        await assert.rejects(pending, (error) => error.code === 'USER_REJECTED_COMMAND' && error.message === USER_REJECTED_COMMAND_MESSAGE);
+        assert.equal(workspace.getRoot('project-tool'), fs.realpathSync(first));
+    } finally { await service.shutdown(); attention.close(); workspace.close(); fs.rmSync(fixture, { recursive: true, force: true }); }
+});
+
+test('attention decisions expose no privileged payload and never return model-facing approval or rejection messages', async () => {
+    const attention = new AttentionRequestService();
+    let allowedPayload = null;
+    attention.registerAction('test.action', { allow(request) { allowedPayload = request.payload; return { actionResult: { success: true, value: request.payload.value } }; }, reject() { return {}; } });
+    try {
+        const pending = attention.requestDecision({ kind: 'test.action', workspaceId: 'project-1', projectId: 1, tabId: 1, prompt: 'Allow this?', payload: { value: 'private' } });
+        const request = await waitForActive(attention);
+        assert.equal(Object.hasOwn(request, 'payload'), false);
+        const response = await attention.respond(request.id, { decision: 'allow' });
+        assert.deepEqual(allowedPayload, { value: 'private' });
+        assert.equal(Object.hasOwn(response, 'modelMessage'), false);
+        const outcome = await pending;
+        assert.equal(outcome.decision, 'allow');
+        assert.equal(Object.hasOwn(outcome, 'modelMessage'), false);
+    } finally { attention.close(); }
+});
+
+test('cancelling a discarded tab future aborts an in-flight permission wait and removes its card', async () => {
+    const attention = new AttentionRequestService();
+    attention.registerAction('test.cancel', { allow() { return {}; } });
+    try {
+        const pending = attention.requestDecision({ kind: 'test.cancel', workspaceId: 'project-1', projectId: 1, tabId: 8, prompt: 'Allow?' });
+        await waitForActive(attention);
+        assert.equal(attention.cancelForTab(8, 'message-retried'), 1);
+        await assert.rejects(pending, (error) => error.name === 'AbortError');
+        assert.equal(attention.listActive().length, 0);
+    } finally { attention.close(); }
+});
+
+test('Python tool permission metadata reaches Core while privileged execution mode remains Core-owned', async () => {
+    const provider = await inspectPythonProvider(workingDirectoryTool, { runnerPath, pythonExecutable: process.env.DARKSTAR_PYTHON || 'python3' });
+    const definition = provider.description.tools.find((entry) => entry.function.name === 'change_working_directory');
+    assert.deepEqual(definition.function['x-darkstar-permission'], { risk: 'external' });
+    assert.equal(Object.hasOwn(definition.function['x-darkstar-permission'], 'mode'), false);
+});
+
+test('change_working_directory model description does not expose permission-review mechanics', async () => {
+    const provider = await inspectPythonProvider(workingDirectoryTool, { runnerPath, pythonExecutable: process.env.DARKSTAR_PYTHON || 'python3' });
+    const definition = provider.description.tools.find((entry) => entry.function.name === 'change_working_directory');
+    assert.equal(definition.function.description, "Change Darkstar's current project working directory. Use an absolute path or a path relative to the current project workspace.");
+    assert.doesNotMatch(definition.function.description, /permission|approval|allow|reject|review/iu);
+});
+
+test('change_working_directory remains an ordinary autodetected Python provider, never a permanent built-in tool', async () => {
+    const builtinNames = createFileToolProvider({}).tools.map((entry) => entry.definition.function.name);
+    assert.equal(builtinNames.includes('change_working_directory'), false);
+    const provider = await inspectPythonProvider(workingDirectoryTool, { runnerPath, pythonExecutable: process.env.DARKSTAR_PYTHON || 'python3' });
+    assert.deepEqual(provider.description.tools.map((entry) => entry.function.name), ['change_working_directory']);
+});
+
+test('permission policy is workflow-owned durable state while execution enforcement remains Core-owned', async () => {
+    const services = read('backend/app/services.js');
+    const permissionUi = read('backend/renderer/permission-policy.js');
+    const filesystemUi = read('backend/renderer/filesystem-access-policy.js');
+    const workflow = read('backend/renderer/workflow.js');
+    const ipc = read('backend/ipc/register-app-ipc.js');
+    const preload = read('backend/shell/preload.js');
+    assert.doesNotMatch(services, /permission-policy\.json|filesystem-access\.json/u, 'security levels must not have a second persistence source outside the workflow');
+    assert.match(ipc, /PERMISSION_POLICY_GET[\s\S]*?permissionPolicy\.snapshot\(\)[\s\S]*?PERMISSION_POLICY_SET[\s\S]*?permissionPolicy\.setLevel/u);
+    assert.match(ipc, /FILESYSTEM_ACCESS_GET[\s\S]*?filesystemAccess\.snapshot\(\)[\s\S]*?FILESYSTEM_ACCESS_SET[\s\S]*?filesystemAccess\.setLevel/u);
+    assert.match(preload, /permissionPolicyApi[\s\S]*?permissionPolicy:\s*permissionPolicyApi/u);
+    assert.match(preload, /filesystemAccessApi[\s\S]*?filesystemAccess:\s*filesystemAccessApi/u);
+    assert.match(permissionUi, /workflowSecuritySnapshot[\s\S]*?modelActionPermissionLevel[\s\S]*?filesystemAccessLevel/u);
+    assert.match(filesystemUi, /restoreFilesystemAccessLevel[\s\S]*?DEFAULT_FILESYSTEM_ACCESS_LEVEL/u);
+    assert.match(permissionUi, /root\.getDarkstarWorkflowSecurity = workflowSecuritySnapshot/u);
+    assert.match(permissionUi, /root\.restoreDarkstarWorkflowSecurity = restoreWorkflowSecurity/u);
+    assert.match(workflow, /security:\s*workflowSecurity\(\)/u);
+    assert.match(workflow, /await restoreWorkflowSecurity\(snapshot\)/u);
+
+    const levels = ['full-review', 'change-guard', 'connected-guard', 'boundary-guard', 'unrestricted'].map((id) => ({ id, label: id, description: id }));
+    let restoredLevel = null;
+    let restoredFilesystemLevel = null;
+    const sandbox = {
+        console, structuredClone, WeakMap, Map, Set, Date, RegExp, ArrayBuffer, Number, String, Boolean, Object, Math,
+        setTimeout, clearTimeout,
+        nodeEditorState: { nodes: [], connections: [], nextNodeId: 1, panX: 0, panY: 0, zoom: 1 },
+        darkstar: {
+            permissionPolicy: {
+                async set(level) { restoredLevel = String(level); return { success: true, level: restoredLevel, levels }; },
+                async get() { return { success: true, level: restoredLevel || 'boundary-guard', levels }; },
+            },
+            filesystemAccess: {
+                async set(level) { restoredFilesystemLevel = String(level); return { success: true, level: restoredFilesystemLevel, homeRoot: '/virtual-profile', levels: ['1', '2', '3'].map((id) => ({ id, label: `Level ${id}`, description: id })) }; },
+                async get() { return { success: true, level: restoredFilesystemLevel || '3', homeRoot: '/virtual-profile', levels: ['1', '2', '3'].map((id) => ({ id, label: `Level ${id}`, description: id })) }; },
+            },
+        },
+        Darkstar: { async: { runBestEffort() {} } },
+        document: { getElementById() { return null; }, addEventListener() {} },
+    };
+    sandbox.globalThis = sandbox; sandbox.window = sandbox;
+    vm.createContext(sandbox);
+    vm.runInContext(permissionUi, sandbox, { filename: 'permission-policy.js' });
+    vm.runInContext(filesystemUi, sandbox, { filename: 'filesystem-access-policy.js' });
+    vm.runInContext(workflow, sandbox, { filename: 'workflow.js' });
+    await sandbox.restoreDarkstarPermissionPolicyLevel('unrestricted');
+    await sandbox.restoreDarkstarFilesystemAccessLevel('1');
+    const snapshot = sandbox.createWorkflowSnapshot();
+    assert.equal(snapshot.version, 2);
+    assert.equal(snapshot.security.modelActionPermissionLevel, 'unrestricted');
+    assert.equal(snapshot.security.filesystemAccessLevel, '1');
+    await sandbox.restoreWorkflowSnapshot({ format: 'darkstar-workflow-snapshot', version: 2, security: { modelActionPermissionLevel: 'full-review', filesystemAccessLevel: '2' }, editor: { nodes: [], connections: [] } });
+    assert.equal(restoredLevel, 'full-review');
+    assert.equal(restoredFilesystemLevel, '2');
+    restoredLevel = null; restoredFilesystemLevel = null;
+    await sandbox.restoreWorkflowSnapshot({ format: 'darkstar-workflow-snapshot', version: 1, editor: { nodes: [], connections: [] } });
+    assert.equal(restoredLevel, 'boundary-guard', 'legacy workflows must migrate Authorization to the secure default');
+    assert.equal(restoredFilesystemLevel, '3', 'legacy workflows must migrate Filesystem Access to the strict working-directory default');
+});
+
+test('Authorization slider uses a one-based five-step scale aligned independently from Filesystem Access', () => {
+    const html = read('backend/shell/index.html');
+    const renderer = read('backend/renderer/permission-policy.js');
+    const styles = read('backend/shell/styles.css');
+    assert.match(html, /id="permissionPolicySlider"[^>]*min="1"[^>]*max="5"[^>]*step="1"[^>]*value="2"/u);
+    assert.match(renderer, /function sliderValueForIndex\(index\)[\s\S]*?state\.levels\.length - Number\(index \|\| 0\)/u);
+    assert.match(renderer, /function levelFromSliderValue\(value\)[\s\S]*?state\.levels\[state\.levels\.length - sliderValue\]/u);
+    assert.match(renderer, /refs\.slider\.min = '1'; refs\.slider\.max = String\(state\.levels\.length\)/u);
+    assert.match(styles, /\.authorization-policy-stages\s*\{[^}]*repeat\(5, minmax\(52px, 1fr\)\)/u);
+    assert.match(styles, /\.authorization-policy-slider\s*\{[^}]*width:\s*248px;[^}]*margin:\s*130px 0 0 -109px;/u);
+    assert.match(html, /id="filesystemAccessSlider"[^>]*min="0"[^>]*max="2"[^>]*value="1"/u, 'Filesystem Access slider must remain unchanged');
+});
+
+test('Authorization and Filesystem Access sliders highlight the live preview stage before commit', () => {
+    const permissionUi = read('backend/renderer/permission-policy.js');
+    const filesystemUi = read('backend/renderer/filesystem-access-policy.js');
+
+    assert.match(permissionUi, /var previewIndex = previewLevel \? levelIndex\(previewLevel\) : currentIndex;/u);
+    assert.match(permissionUi, /stage\.className = 'permission-policy-stage' \+ \(index === previewIndex \? ' is-current' : ''\);/u,
+        'Authorization stage highlighting must follow the live input preview, not only the committed level');
+    assert.doesNotMatch(permissionUi, /stage\.className = 'permission-policy-stage' \+ \(index === currentIndex \? ' is-current' : ''\);/u);
+
+    assert.match(filesystemUi, /var previewIndex = previewLevel \? levelIndex\(previewLevel\) : currentIndex;/u);
+    assert.match(filesystemUi, /stage\.className = 'permission-policy-stage' \+ \(index === previewIndex \? ' is-current' : ''\);/u,
+        'Filesystem Access stage highlighting must follow the live input preview, not only the committed level');
+    assert.doesNotMatch(filesystemUi, /stage\.className = 'permission-policy-stage' \+ \(index === currentIndex \? ' is-current' : ''\);/u);
+});
+
+test('Auth Controls and Filesystem Access share one Nodes sidebar subsection using standard stacked labels', () => {
+    const html = read('backend/shell/index.html');
+    const styles = read('backend/shell/styles.css');
+    const sidebarMatch = html.match(/<nav class="node-workflow-sidebar"[\s\S]*?<\/nav>/u);
+    assert.ok(sidebarMatch, 'the Nodes workflow sidebar must still exist');
+    const sidebar = sidebarMatch[0];
+    const divider = '<div class="node-editor-sidebar-divider" aria-hidden="true"></div>';
+    assert.equal((sidebar.match(/class="node-editor-sidebar-divider"/gu) || []).length, 2,
+        'three sidebar subsections require exactly two dividers');
+    assert.match(sidebar, new RegExp(
+        divider.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+        '[\\s\\S]*?id="nodePermissionPolicyButton"[\\s\\S]*?<span class="node-editor-sidebar-label node-editor-sidebar-label-stacked"><span>Auth<\\/span><span>Controls<\\/span><\\/span>[\\s\\S]*?<\\/button>\\s*' +
+        '<button class="node-editor-sidebar-button" id="nodeFilesystemAccessButton"[\\s\\S]*?<span class="node-editor-sidebar-label node-editor-sidebar-label-stacked"><span>Filesystem<\\/span><span>Access<\\/span><\\/span>[\\s\\S]*?<\\/button>\\s*' +
+        divider.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+        'u'
+    ), 'Auth Controls and Filesystem Access must remain together between the same two sidebar dividers');
+    assert.match(styles, /\.node-workflow-sidebar\s*\{[^}]*width:\s*76px;/u);
+    assert.match(styles, /\.node-editor-sidebar-button\s*\{[^}]*width:\s*64px;/u);
+    assert.match(styles, /#nodePermissionPolicyButton \.node-editor-sidebar-label\s*\{[^}]*width:\s*max-content;[^}]*overflow:\s*visible;[^}]*text-overflow:\s*clip;/u);
+    assert.match(styles, /#nodeFilesystemAccessButton \.node-editor-sidebar-label\s*\{[^}]*width:\s*max-content;[^}]*overflow:\s*visible;[^}]*text-overflow:\s*clip;/u);
+    assert.match(styles, /\.node-editor-view \.grid-canvas\s*\{\s*left:\s*84px;\s*\}/u);
+});
+
+test('model idle unload normalizes control values and never unloads while an Authorization decision is pending', async () => {
+    assert.equal(normalizeModelIdleUnloadSeconds(undefined), 0);
+    assert.equal(normalizeModelIdleUnloadSeconds(-4), 0);
+    assert.equal(normalizeModelIdleUnloadSeconds(12.9), 600);
+    assert.equal(normalizeModelIdleUnloadSeconds(999999), 600);
+    let attentionListener = null;
+    const attention = {
+        pending: true,
+        hasPendingDecision() { return this.pending; },
+        onDidChange(listener) { attentionListener = listener; return () => { attentionListener = null; }; },
+    };
+    let unloads = 0;
+    const runtime = {
+        loadedModelId: 'model.gguf', activeStreams: new Map(), pendingStreams: new Map(),
+        async unloadModel(modelId) { assert.equal(modelId, 'model.gguf'); unloads += 1; this.loadedModelId = null; return { success: true, unloaded: true }; },
+    };
+    const controller = new ModelIdleUnloadController(runtime, { attentionService: attention });
+    try {
+        controller.configure(600);
+        assert.equal(controller.timer, null, 'pending Allow/Reject must suppress the idle-unload timer');
+        controller.inferenceStarted();
+        controller.inferenceStarted();
+        assert.equal(controller.activityDepth, 2);
+        controller.inferenceEnded();
+        assert.equal(controller.timer, null, 'one overlapping inference still active must keep the timer suppressed');
+        controller.inferenceEnded();
+        assert.equal(controller.activityDepth, 0);
+        assert.equal(controller.timer, null, 'pending Authorization still suppresses the timer after inference drains');
+        await controller._expire();
+        assert.equal(unloads, 0);
+        attention.pending = false; attentionListener();
+        assert.ok(controller.timer, 'resolving the Authorization decision must arm a fresh full idle interval');
+        controller._clearTimer();
+        await controller._expire();
+        assert.equal(unloads, 1);
+    } finally { controller.close(); }
+});
+
+test('Control node persists an OFF-by-default idle-unload toggle and sends only 0 or the fixed 600 seconds to the sampler', async () => {
+    const control = read('backend/renderer/nodes/builtin/control.js');
+    const sampler = read('backend/renderer/nodes/builtin/sampler.js');
+    assert.doesNotMatch(control, /controls\.numberInput\('Model idle unload \(seconds\)'[\s\S]*?modelIdleUnloadSeconds/u);
+    assert.match(control, /controls\.toggle\('Model idle unload'[\s\S]*?modelIdleUnloadEnabled/u);
+    assert.match(control, /modelIdleUnloadSeconds:\s*node\.params\.modelIdleUnloadEnabled === true \? FIXED_MODEL_IDLE_UNLOAD_SECONDS : 0/u);
+    assert.match(sampler, /var runtimeControl = Object\.assign\(\{\}, inputs\.while/u);
+    assert.match(sampler, /control:\s*runtimeControl/u);
+});
+
+test('workflow restoration applies the persisted model idle unload toggle immediately', async () => {
+    const configured = [];
+    const nodes = {
+        controls: { toggle() { return ''; }, numberInput() { return ''; }, status() { return ''; } },
+        PORT_TYPES: { CONTROL: 'control' },
+        builtinCommon: { baseNode(def, nodeId, x, y, extra) { return { id: nodeId, type: def.id, x, y, ...extra }; } },
+        registerNode() {},
+    };
+    const sandbox = {
+        console, String, Number, Array, Object,
+        nodeEditorState: { nodes: [{ type: 'control', params: { nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: true } }] },
+        Darkstar: {
+            nodes,
+            chatRuntime: { async configureModelIdleUnload(seconds) { configured.push(seconds); return seconds; } },
+            async: { runBestEffort(operation) { return Promise.resolve().then(operation); } },
+        },
+    };
+    sandbox.globalThis = sandbox;
+    vm.createContext(sandbox);
+    vm.runInContext(read('backend/renderer/nodes/builtin/control.js'), sandbox, { filename: 'control.js' });
+    sandbox.syncDarkstarModelIdleUnloadPolicy();
+    await Promise.resolve(); await Promise.resolve();
+    assert.deepEqual(configured, [600]);
+    sandbox.nodeEditorState.nodes = [];
+    sandbox.syncDarkstarModelIdleUnloadPolicy();
+    await Promise.resolve(); await Promise.resolve();
+    assert.deepEqual(configured, [600, 0], 'restoring a graph without Control must disable an older idle-unload policy');
+    assert.match(read('backend/renderer/workflow.js'), /syncDarkstarModelIdleUnloadPolicy/u);
+});
+
+test('renderer permission UI submits only Allow or Reject and never resumes the model with a synthetic message', () => {
+    const attentionUi = read('backend/renderer/attention.js');
+    const send = read('backend/renderer/send.js');
+    const agentLoop = read('backend/runtime/agent-loop.js');
+    const html = read('backend/shell/index.html');
+    assert.match(attentionUi, /resolveAgentAttentionDecision\('allow'\)/u);
+    assert.match(attentionUi, /resolveAgentAttentionDecision\('reject'\)/u);
+    assert.doesNotMatch(attentionUi, /sendMessage|modelMessage|resumeAfterAgentAttention|attentionResponse|activateAgentAttentionRequest/u);
+    assert.doesNotMatch(send, /attention_required|attentionRequestId|activateAgentAttentionRequest/u);
+    assert.doesNotMatch(agentLoop, /ATTENTION_PAUSE_BOUNDARY|attentionRequired|attention_required/u);
+    assert.match(agentLoop, /USER_REJECTED_COMMAND[\s\S]*?The user has rejected this command\./u);
+    assert.match(html, />Allow<\/button>[\s\S]*?>Reject<\/button>/u);
+    assert.doesNotMatch(html, /Tell the model to do something else|agentAttentionRedirect/u);
+});
+});
+
 const testSources = new Map();
 for (const [id, factory] of TEST_FACTORIES) testSources.set(id, factoryBody(factory));
 const allVirtualSources = new Map([...productionSources, ...testSources]);
@@ -20006,7 +22257,7 @@ fs.readFileSync = function readFileSync(filePath, options) {
         source += `\n<!-- regression logical-source projection; production executes the Core/Renderer monolith split\n${projection}\n-->\n`;
         return encoding ? source : Buffer.from(source, 'utf8');
     }
-    if (relative === 'Darkstar.bat') {
+    if (relative === 'Launch_Darkstar.bat') {
         let source = originalReadFileSync(filePath, 'utf8');
         source += '\nREM regression compatibility projection: backend\\scripts\\start-darkstar.js\n';
         return encoding ? source : Buffer.from(source, 'utf8');
@@ -20328,57 +22579,30 @@ Module._load = function load(request, parent, isMain) {
 }
 
 
-// Licensing machinery regression guards: keep the public GPL path, separate
-// proprietary licensing path, contributor rights chain, and public project name coherent.
+// Licensing regression guards: Darkstar first-party source has one Apache-2.0
+// license, while third-party components retain their own upstream terms.
 {
     const { test } = require('node:test');
     const assert = require('node:assert/strict');
     const readRoot = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8');
 
-    test('Darkstar Harness licensing documents use one rights-control model without ownership contradictions', () => {
-        const cla = readRoot('CLA.md');
-        const contributing = readRoot('CONTRIBUTING.md');
-        const licensing = readRoot('LICENSING.md');
-        const notices = readRoot('THIRD_PARTY_NOTICES.md');
-        assert.match(cla, /^# Darkstar Harness Contributor License Agreement/mu);
-        assert.match(licensing, /^# Darkstar Harness licensing/mu);
-        assert.match(contributing, /^# Contributing to Darkstar Harness/mu);
-        assert.match(licensing, /owns or controls sufficient rights to sublicense and relicense/u);
-        assert.match(notices, /owns or controls sufficient licensing and relicensing rights/u);
-        assert.match(readRoot('README.md'), /^# Darkstar Harness/mu);
-        const packageJson = JSON.parse(readRoot('backend/shell/package.json'));
-        assert.equal(packageJson.build.productName, 'Darkstar Harness');
-        assert.equal(packageJson.author, 'Darkstar Harness contributors');
-        assert.match(readRoot('backend/Darkstar_Core.js'), /productName: 'Darkstar Harness'/u);
-        for (const text of [cla, contributing, licensing, notices]) {
-            assert.doesNotMatch(text, /Darkstar-owned code/u);
-            assert.doesNotMatch(text, /first-party Darkstar code/u);
+    test('Darkstar Harness exposes one first-party Apache-2.0 license', () => {
+        const license = readRoot('LICENSE');
+        const readme = readRoot('README.md');
+        assert.match(license, /Apache License\s+Version 2\.0, January 2004/u);
+        assert.match(license, /TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION/u);
+        assert.match(readme, /released under the \*\*Apache License 2\.0\*\*/u);
+        assert.match(readme, /complete first-party source code is included/u);
+        for (const obsolete of ['LICENSING.md', 'COMMUNITY_LICENSE.md', 'COMMERCIAL_LICENSE.md', 'CLA.md', 'THIRD_PARTY_NOTICES.md', 'RUNTIME_LICENSE_POLICY.json']) {
+            assert.equal(fs.existsSync(path.join(ROOT, obsolete)), false, `${obsolete} must remain removed`);
         }
+        assert.equal(fs.existsSync(path.join(ROOT, 'backend', 'runtime-component-policy.json')), true, 'internal runtime component policy must remain available');
     });
 
-    test('CLA keeps public GPL grant exact and proprietary relicensing grant separate', () => {
-        const cla = readRoot('CLA.md');
-        assert.match(cla, /distributed as part of the public Darkstar Harness release under `GPL-3\.0-only`/u);
-        assert.match(cla, /under open-source, proprietary, commercial, or other license terms/u);
-        assert.doesNotMatch(cla, /compatible terms applicable to the relevant distribution/u);
-        assert.doesNotMatch(cla, /terminates as to you/u);
-    });
-
-    test('no-signature CLA acceptance is bounded to contribution channels that present conspicuous notice', () => {
-        const cla = readRoot('CLA.md');
-        const contributing = readRoot('CONTRIBUTING.md');
-        const template = readRoot('.github/PULL_REQUEST_TEMPLATE.md');
-        assert.match(cla, /"Official Contribution Channel"/u);
-        assert.match(cla, /issue, email, direct message, pasted snippet/u);
-        assert.match(cla, /accept this CLA by the act of submission itself/u);
-        assert.match(contributing, /You do not need to sign, comment, paste an acceptance statement/u);
-        assert.match(template, /Darkstar Harness Contributor License Agreement/u);
-        assert.match(template, /Submission itself is acceptance/u);
-    });
-
-    test('first-party executable source carries GPL SPDX identifiers while third-party code stays excluded', () => {
+    test('first-party executable source uses Apache-2.0 while third-party code retains upstream licensing', () => {
         const files = [
-            'Darkstar.bat',
+            'Launch_Darkstar.bat',
+            'backend/scripts/launch-darkstar-hidden.vbs',
             'backend/Darkstar_Core.js',
             'backend/Darkstar_Renderer.js',
             'backend/Dev/Darkstar_Tests.js',
@@ -20392,22 +22616,31 @@ Module._load = function load(request, parent, isMain) {
             'backend/uip/windows-uip.ps1',
             'backend/scripts/bootstrap-electron.ps1',
             'backend/scripts/bootstrap-llamacpp.ps1',
-            'backend/scripts/build-windows-launcher.ps1',
-            'launcher/windows/command.go',
-            'launcher/windows/main_windows.go',
-            'launcher/windows/command_test.go',
-            'launcher/windows/command_windows_test.go',
-            'launcher/windows/generate_resources.py',
             'backend/renderer/node-editor.css',
             'backend/shell/index.html',
             'backend/shell/styles.css',
             ...fs.readdirSync(path.join(ROOT, 'agent_assets', 'tools')).filter((name) => name.endsWith('.py')).map((name) => `agent_assets/tools/${name}`),
         ];
         for (const file of files) {
-            assert.match(readRoot(file).slice(0, 512), /SPDX-License-Identifier: GPL-3\.0-only/u, `${file} must identify the public GPL license`);
+            const head = readRoot(file).slice(0, 512);
+            assert.match(head, /SPDX-License-Identifier: Apache-2\.0/u, `${file} must identify Apache-2.0`);
+            assert.doesNotMatch(head, /LicenseRef-Darkstar-Harness/u, `${file} must not retain the retired proprietary identifier`);
         }
-        assert.doesNotMatch(readRoot('agent_assets/skills/Skill Manual/SKILL.md').slice(0, 1024), /SPDX-License-Identifier: GPL-3\.0-only/u,
-            'third-party Skill Manual must not be relabeled as first-party GPL code');
+        assert.match(readRoot('backend/vendor/three/r184/three.core.js').slice(0, 1024), /SPDX-License-Identifier: MIT/u, 'vendored three.js must retain its upstream MIT identifier');
+        assert.doesNotMatch(readRoot('agent_assets/skills/Skill Manual/SKILL.md').slice(0, 1024), /SPDX-License-Identifier: Apache-2\.0/u,
+            'third-party Skill Manual must not be relabeled as first-party Darkstar code');
+    });
+
+    test('package metadata and offline release identify Apache-2.0 and ship only the root first-party license', () => {
+        const packageJson = JSON.parse(readRoot('backend/shell/package.json'));
+        const build = productionSources.get('backend/scripts/build-offline.js');
+        assert.equal(packageJson.license, 'Apache-2.0');
+        assert.ok(packageJson.build.files.includes('LICENSE'));
+        for (const obsolete of ['LICENSING.md', 'COMMUNITY_LICENSE.md', 'COMMERCIAL_LICENSE.md', 'THIRD_PARTY_NOTICES.md', 'RUNTIME_LICENSE_POLICY.json']) {
+            assert.equal(packageJson.build.files.includes(obsolete), false, `${obsolete} must not be packaged as a root legal document`);
+            assert.equal(build.includes(`'${obsolete}'`), false, `${obsolete} must not be copied beside the offline executable`);
+        }
+        assert.match(build, /for \(const file of \['LICENSE'\]\)/u);
     });
 }
 
@@ -20428,8 +22661,8 @@ Module._load = function load(request, parent, isMain) {
 
     function runtimeLicenseFixture() {
         const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-runtime-license-'));
-        const policy = JSON.parse(fs.readFileSync(path.join(ROOT, 'RUNTIME_LICENSE_POLICY.json'), 'utf8'));
-        fs.writeFileSync(path.join(fixture, 'RUNTIME_LICENSE_POLICY.json'), `${JSON.stringify(policy, null, 2)}\n`);
+        const policy = JSON.parse(fs.readFileSync(path.join(ROOT, 'backend', 'runtime-component-policy.json'), 'utf8'));
+        writeFixture(fixture, 'backend/runtime-component-policy.json', `${JSON.stringify(policy, null, 2)}\n`);
         writeFixture(fixture, 'backend/vendor/electron/win32-x64/electron.exe', 'electron');
         writeFixture(fixture, 'backend/vendor/electron/win32-x64/version', '43.2.0');
         writeFixture(fixture, 'backend/vendor/electron/win32-x64/LICENSE', 'Permission is hereby granted, free of charge. THE SOFTWARE IS PROVIDED AS IS. '.repeat(2));
@@ -20484,15 +22717,15 @@ Module._load = function load(request, parent, isMain) {
                 id: 'fixture-extra', name: 'Fixture Extra', license: 'Fixture License', patterns: ['vendor-extra.dll'],
                 notices: ['backend/bin/licenses/FIXTURE-LICENSE'], redistributionReviewed: false,
             });
-            fs.writeFileSync(path.join(fixture, 'RUNTIME_LICENSE_POLICY.json'), `${JSON.stringify(policy, null, 2)}\n`);
+            writeFixture(fixture, 'backend/runtime-component-policy.json', `${JSON.stringify(policy, null, 2)}\n`);
             writeFixture(fixture, 'backend/bin/licenses/FIXTURE-LICENSE');
             assert.throws(() => auditRuntimeLicenses({ root: fixture, requireLlama: true }), /redistributionReviewed is not true/u);
             policy.backendBin.manualDeclarations[0].redistributionReviewed = true;
             policy.backendBin.manualDeclarations[0].notices = [];
-            fs.writeFileSync(path.join(fixture, 'RUNTIME_LICENSE_POLICY.json'), `${JSON.stringify(policy, null, 2)}\n`);
+            writeFixture(fixture, 'backend/runtime-component-policy.json', `${JSON.stringify(policy, null, 2)}\n`);
             assert.throws(() => auditRuntimeLicenses({ root: fixture, requireLlama: true }), /at least one preserved notice file/u);
             policy.backendBin.manualDeclarations[0].notices = ['backend/bin/licenses/FIXTURE-LICENSE'];
-            fs.writeFileSync(path.join(fixture, 'RUNTIME_LICENSE_POLICY.json'), `${JSON.stringify(policy, null, 2)}\n`);
+            writeFixture(fixture, 'backend/runtime-component-policy.json', `${JSON.stringify(policy, null, 2)}\n`);
             const manifest = auditRuntimeLicenses({ root: fixture, requireLlama: true });
             assert.equal(manifest.runtime.components.some((entry) => entry.id === 'fixture-extra'), true);
         } finally {
@@ -20505,7 +22738,6 @@ Module._load = function load(request, parent, isMain) {
         const packageJson = JSON.parse(fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'package.json'), 'utf8'));
         assert.match(build, /auditRuntimeLicenses\(\{ root, requireLlama: true \}\)/u);
         assert.match(build, /THIRD_PARTY_RUNTIME_MANIFEST\.json/u);
-        assert.match(build, /RUNTIME_LICENSE_POLICY\.json/u);
         assert.match(build, /licenses['"]?, ['"]runtime/u, 'release root must mirror runtime notices for discoverability');
         assert.equal(packageJson.scripts['runtime-license-audit'], 'node ../Darkstar_Core.js --darkstar-command=runtime-license-audit');
         assert.match(packageJson.scripts['bootstrap-electron'], /bootstrap-electron\.ps1/u);
@@ -20515,7 +22747,8 @@ Module._load = function load(request, parent, isMain) {
         assert.ok(packageJson.scripts.build.includes('npm run bootstrap-electron'));
         assert.ok(packageJson.scripts.build.includes('npm run bootstrap-llamacpp'));
         assert.ok(packageJson.scripts.verify.includes('npm run runtime-license-audit'));
-        assert.ok(packageJson.build.files.includes('RUNTIME_LICENSE_POLICY.json'));
+        assert.ok(packageJson.build.files.includes('backend/'));
+        assert.ok(fs.existsSync(path.join(ROOT, 'backend', 'runtime-component-policy.json')));
     });
 }
 

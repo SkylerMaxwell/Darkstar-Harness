@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Darkstar tool: atomically replace or append UTF-8 file content."""
 import hashlib
 import os
@@ -12,7 +12,7 @@ if _DARKSTAR_TOOL_DIRECTORY not in _darkstar_sys.path:
 from tools.registry import registry
 from _darkstar_tool_common import (
     ToolInputError, atomic_write_utf8, json_result, read_utf8, relative_display,
-    resolve_workspace_path, sha256_text, verify_expected_hash,
+    get_filesystem_access, resolve_workspace_path, sha256_text, verify_expected_hash,
 )
 
 MAX_TOTAL_CONTENT_CHARS = 8 * 1024 * 1024
@@ -64,7 +64,7 @@ def _file_backed_transfer(args):
     return None, None, ()
 
 
-def _load_content(args):
+def _load_content(args, kwargs):
     transfer_path, expected, accepted_prefixes = _file_backed_transfer(args)
     if transfer_path in (None, ""):
         return args.get("new_content"), False
@@ -73,17 +73,22 @@ def _load_content(args):
     if not isinstance(transfer_path, str):
         raise ToolInputError("Internal file-backed content path is invalid.")
 
-    candidate = _DarkstarPath(transfer_path).expanduser().resolve(strict=True)
-    temp_root = _DarkstarPath(tempfile.gettempdir()).resolve(strict=True)
-    try:
-        common = os.path.commonpath([str(temp_root), str(candidate)])
-    except ValueError as exc:
-        raise ToolInputError("Internal file-backed content path is invalid.") from exc
-    if (
-        common != str(temp_root)
-        or not any(candidate.parent.name.startswith(prefix) for prefix in accepted_prefixes)
-        or candidate.name != "payload.txt"
-    ):
+    candidate = _DarkstarPath(os.path.abspath(os.path.normpath(transfer_path)))
+    access = get_filesystem_access(kwargs)
+    internal_roots = tuple(access.get("internal_roots") or ())
+    if internal_roots:
+        if not any(os.path.normcase(str(candidate.parent)) == os.path.normcase(str(root)) for root in internal_roots):
+            raise ToolInputError("Internal file-backed content path is outside the Core-issued transfer area.")
+    else:
+        # Compatibility for direct/test hosts that predate Core-issued filesystem scopes.
+        temp_root = _DarkstarPath(tempfile.gettempdir()).resolve(strict=True)
+        try:
+            common = os.path.commonpath([str(temp_root), str(candidate)])
+        except ValueError as exc:
+            raise ToolInputError("Internal file-backed content path is invalid.") from exc
+        if common != str(temp_root):
+            raise ToolInputError("Internal file-backed content path is outside Darkstar's transfer area.")
+    if not any(candidate.parent.name.startswith(prefix) for prefix in accepted_prefixes) or candidate.name != "payload.txt":
         raise ToolInputError("Internal file-backed content path is outside Darkstar's transfer area.")
     if not candidate.is_file() or candidate.is_symlink():
         raise ToolInputError("Internal file-backed content is not a regular file.")
@@ -103,7 +108,7 @@ def _load_content(args):
 
 def handler(args, **kwargs):
     root, path = resolve_workspace_path(args.get("path"), kwargs, must_exist=False, allow_root=False)
-    new_content, file_backed = _load_content(args)
+    new_content, file_backed = _load_content(args, kwargs)
     if not isinstance(new_content, str):
         raise ToolInputError("new_content must be a string.")
     if len(new_content) > MAX_TOTAL_CONTENT_CHARS:

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: Apache-2.0
 """Darkstar tool: read a bounded UTF-8 line range."""
 import sys as _darkstar_sys
 from pathlib import Path as _DarkstarPath

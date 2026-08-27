@@ -1,4 +1,4 @@
-'use strict'; // SPDX-License-Identifier: GPL-3.0-only
+'use strict'; // SPDX-License-Identifier: Apache-2.0
 // ============================================================================
 // DARKSTAR 1.2.1 :: RENDERER MONOLITH
 // ============================================================================
@@ -1083,6 +1083,329 @@ function unregisterGenerationSession(session) {
     root.setTimeout(syncDarkstarPreferenceControls, 0);
 })(globalThis);
     // <DARKSTAR_SOURCE_END path="backend/renderer/preferences.js">
+    // RENDERER MODULE :: backend/renderer/permission-policy.js
+    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/permission-policy.js">
+(function initializePermissionPolicyUiModule(root) {
+    'use strict';
+
+    var DEFAULT_PERMISSION_LEVEL = 'boundary-guard';
+    var state = { level: '', levels: [], initialized: false, busy: false };
+    function bridge() { return root.darkstar && root.darkstar.permissionPolicy ? root.darkstar.permissionPolicy : null; }
+    function elements() {
+        return {
+            button: document.getElementById('nodePermissionPolicyButton'),
+            panel: document.getElementById('permissionPolicyPanel'),
+            close: document.getElementById('permissionPolicyClose'),
+            slider: document.getElementById('permissionPolicySlider'),
+            stages: document.getElementById('permissionPolicyStages'),
+            label: document.getElementById('permissionPolicyCurrentLabel'),
+            description: document.getElementById('permissionPolicyCurrentDescription'),
+            error: document.getElementById('permissionPolicyError')
+        };
+    }
+    function levelIndex(levelId) {
+        var index = state.levels.findIndex(function(level) { return level.id === levelId; });
+        return index >= 0 ? index : Math.max(0, state.levels.length - 2);
+    }
+    function sliderValueForIndex(index) {
+        return Math.max(1, state.levels.length - Number(index || 0));
+    }
+    function levelFromSliderValue(value) {
+        var sliderValue = Number(value);
+        if (!Number.isFinite(sliderValue)) return null;
+        return state.levels[state.levels.length - sliderValue] || null;
+    }
+    function setError(message) {
+        var target = elements().error;
+        if (target) target.textContent = String(message || '');
+    }
+    function render(previewLevel) {
+        var refs = elements();
+        if (!state.levels.length) return;
+        var currentIndex = levelIndex(state.level);
+        var previewIndex = previewLevel ? levelIndex(previewLevel) : currentIndex;
+        var preview = state.levels[previewIndex] || state.levels[currentIndex];
+        if (refs.slider) {
+            refs.slider.min = '1'; refs.slider.max = String(state.levels.length);
+            refs.slider.value = String(sliderValueForIndex(previewIndex));
+            refs.slider.disabled = state.busy;
+            refs.slider.setAttribute('aria-valuetext', preview.label);
+        }
+        if (refs.label) refs.label.textContent = preview.label;
+        if (refs.description) refs.description.textContent = preview.description;
+        if (refs.button) {
+            refs.button.dataset.level = state.level;
+            refs.button.title = 'Model action permissions · ' + (state.levels[currentIndex] ? state.levels[currentIndex].label : 'Authorization');
+            refs.button.setAttribute('aria-label', refs.button.title);
+        }
+        if (refs.stages) {
+            refs.stages.innerHTML = '';
+            state.levels.forEach(function(level, index) {
+                var stage = document.createElement('div');
+                stage.className = 'permission-policy-stage' + (index === previewIndex ? ' is-current' : '');
+                stage.dataset.permissionLevel = level.id; stage.tabIndex = 0; stage.setAttribute('role', 'button');
+                stage.setAttribute('aria-label', level.label + '. ' + level.description);
+                var strong = document.createElement('strong'); strong.textContent = level.label;
+                var detail = document.createElement('span'); detail.textContent = level.description;
+                stage.appendChild(strong); stage.appendChild(detail); refs.stages.appendChild(stage);
+            });
+        }
+    }
+    function applySnapshot(response) {
+        if (!response || response.success !== true || !Array.isArray(response.levels) || !response.levels.length) {
+            throw new Error(response && response.error ? response.error : 'Permission policy is unavailable.');
+        }
+        state.levels = response.levels.map(function(level) {
+            return { id: String(level.id || ''), label: String(level.label || ''), description: String(level.description || '') };
+        }).filter(function(level) { return level.id && level.label; });
+        state.level = String(response.level || '');
+        if (!state.levels.some(function(level) { return level.id === state.level; })) state.level = DEFAULT_PERMISSION_LEVEL;
+        if (!state.levels.some(function(level) { return level.id === state.level; })) state.level = state.levels[Math.max(0, state.levels.length - 2)].id;
+        render();
+        return state.level;
+    }
+    async function commitLevel(levelId, options) {
+        options = options || {};
+        var api = bridge();
+        if (!api || typeof api.set !== 'function') throw new Error('Permission policy bridge is unavailable.');
+        if (state.busy && options.force !== true) return state.level || DEFAULT_PERMISSION_LEVEL;
+        state.busy = true; setError(''); render(levelId);
+        try {
+            var level = applySnapshot(await api.set(String(levelId || DEFAULT_PERMISSION_LEVEL)));
+            if (options.persistWorkflow !== false && typeof root.scheduleWorkflowSessionSave === 'function') root.scheduleWorkflowSessionSave(0);
+            return level;
+        } finally { state.busy = false; render(); }
+    }
+    async function setLevelFromUi(levelId) {
+        if (levelId === state.level) { render(); return state.level; }
+        try { return await commitLevel(levelId, { persistWorkflow: true }); }
+        catch (error) { setError(error && error.message ? error.message : 'Could not update permission policy.'); render(); return state.level; }
+    }
+    async function restorePermissionPolicyLevel(levelId) {
+        return commitLevel(levelId || DEFAULT_PERMISSION_LEVEL, { persistWorkflow: false, force: true });
+    }
+    function currentPermissionPolicyLevel() { return state.level || DEFAULT_PERMISSION_LEVEL; }
+    function openPanel(open) {
+        var refs = elements();
+        if (!refs.panel || !refs.button) return;
+        var next = open === undefined ? refs.panel.hidden : Boolean(open);
+        refs.panel.hidden = !next; refs.button.classList.toggle('is-open', next);
+        refs.button.setAttribute('aria-expanded', next ? 'true' : 'false');
+        if (next) {
+            var otherPanel = document.getElementById('filesystemAccessPanel'), otherButton = document.getElementById('nodeFilesystemAccessButton');
+            if (otherPanel) otherPanel.hidden = true;
+            if (otherButton) { otherButton.classList.remove('is-open'); otherButton.setAttribute('aria-expanded', 'false'); }
+            refs.slider && refs.slider.focus();
+        }
+    }
+    async function initializePermissionPolicyUi() {
+        if (state.initialized) return;
+        state.initialized = true;
+        var refs = elements(), api = bridge();
+        if (!refs.button || !refs.panel) return;
+        refs.button.addEventListener('click', function(event) { event.stopPropagation(); openPanel(); });
+        refs.close && refs.close.addEventListener('click', function() { openPanel(false); refs.button.focus(); });
+        refs.panel.addEventListener('click', function(event) { event.stopPropagation(); });
+        refs.slider && refs.slider.addEventListener('input', function() {
+            if (!state.levels.length) return;
+            var level = levelFromSliderValue(refs.slider.value);
+            if (level) render(level.id);
+        });
+        refs.slider && refs.slider.addEventListener('change', function() {
+            if (!state.levels.length) return;
+            var level = levelFromSliderValue(refs.slider.value);
+            if (level) setLevelFromUi(level.id);
+        });
+        refs.stages && refs.stages.addEventListener('click', function(event) {
+            var stage = event.target && event.target.closest ? event.target.closest('[data-permission-level]') : null;
+            if (stage) setLevelFromUi(stage.dataset.permissionLevel);
+        });
+        refs.stages && refs.stages.addEventListener('keydown', function(event) {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            var stage = event.target && event.target.closest ? event.target.closest('[data-permission-level]') : null;
+            if (stage) { event.preventDefault(); setLevelFromUi(stage.dataset.permissionLevel); }
+        });
+        document.addEventListener('click', function() { openPanel(false); });
+        document.addEventListener('keydown', function(event) { if (event.key === 'Escape' && !refs.panel.hidden) openPanel(false); });
+        if (!api || typeof api.get !== 'function') { setError('Permission policy bridge is unavailable.'); refs.slider && (refs.slider.disabled = true); return; }
+        try { applySnapshot(await api.get()); }
+        catch (error) { setError(error && error.message ? error.message : 'Could not load permission policy.'); refs.slider && (refs.slider.disabled = true); }
+    }
+    function workflowSecuritySnapshot() {
+        return {
+            modelActionPermissionLevel: currentPermissionPolicyLevel(),
+            filesystemAccessLevel: typeof root.getDarkstarFilesystemAccessLevel === 'function' ? root.getDarkstarFilesystemAccessLevel() : '2'
+        };
+    }
+    function restoreWorkflowSecurity(value) {
+        var security = value && value.security && typeof value.security === 'object' ? value.security : {};
+        var permissionTask = restorePermissionPolicyLevel(String(security.modelActionPermissionLevel || DEFAULT_PERMISSION_LEVEL));
+        var filesystemTask = typeof root.restoreDarkstarFilesystemAccessLevel === 'function'
+            ? root.restoreDarkstarFilesystemAccessLevel(String(security.filesystemAccessLevel || '3'))
+            : Promise.resolve('3');
+        return Promise.all([permissionTask, filesystemTask]).then(function(results) { return results[0]; });
+    }
+    root.getDarkstarPermissionPolicyLevel = currentPermissionPolicyLevel;
+    root.restoreDarkstarPermissionPolicyLevel = restorePermissionPolicyLevel;
+    root.getDarkstarWorkflowSecurity = workflowSecuritySnapshot;
+    root.restoreDarkstarWorkflowSecurity = restoreWorkflowSecurity;
+    root.initializePermissionPolicyUi = initializePermissionPolicyUi;
+})(globalThis);
+    // <DARKSTAR_SOURCE_END path="backend/renderer/permission-policy.js">
+    // RENDERER MODULE :: backend/renderer/filesystem-access-policy.js
+    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/filesystem-access-policy.js">
+(function initializeFilesystemAccessUiModule(root) {
+    'use strict';
+
+    var DEFAULT_FILESYSTEM_ACCESS_LEVEL = '2';
+    var state = { level: DEFAULT_FILESYSTEM_ACCESS_LEVEL, levels: [], homeRoot: '', initialized: false, busy: false };
+    function bridge() { return root.darkstar && root.darkstar.filesystemAccess ? root.darkstar.filesystemAccess : null; }
+    function elements() {
+        return {
+            button: document.getElementById('nodeFilesystemAccessButton'),
+            panel: document.getElementById('filesystemAccessPanel'),
+            close: document.getElementById('filesystemAccessClose'),
+            slider: document.getElementById('filesystemAccessSlider'),
+            stages: document.getElementById('filesystemAccessStages'),
+            label: document.getElementById('filesystemAccessCurrentLabel'),
+            description: document.getElementById('filesystemAccessCurrentDescription'),
+            boundary: document.getElementById('filesystemAccessBoundary'),
+            error: document.getElementById('filesystemAccessError')
+        };
+    }
+    function levelIndex(levelId) {
+        var index = state.levels.findIndex(function(level) { return level.id === String(levelId || ''); });
+        return index >= 0 ? index : Math.max(0, state.levels.length - 1);
+    }
+    function setError(message) {
+        var target = elements().error;
+        if (target) target.textContent = String(message || '');
+    }
+    function boundaryText(level) {
+        if (!level) return '';
+        if (level.id === '1') return 'Boundary: none (OS account permissions still apply)';
+        if (level.id === '2') return 'Boundary: ' + (state.homeRoot || 'current OS user profile');
+        return 'Boundary: active project working directory';
+    }
+    function render(previewLevel) {
+        var refs = elements();
+        if (!state.levels.length) return;
+        var currentIndex = levelIndex(state.level);
+        var previewIndex = previewLevel ? levelIndex(previewLevel) : currentIndex;
+        var preview = state.levels[previewIndex] || state.levels[currentIndex];
+        if (refs.slider) {
+            refs.slider.min = '0'; refs.slider.max = String(state.levels.length - 1);
+            refs.slider.value = String((state.levels.length - 1) - previewIndex);
+            refs.slider.disabled = state.busy;
+            refs.slider.setAttribute('aria-valuetext', preview.label);
+        }
+        if (refs.label) refs.label.textContent = preview.label;
+        if (refs.description) refs.description.textContent = preview.description;
+        if (refs.boundary) refs.boundary.textContent = boundaryText(preview);
+        if (refs.button) {
+            refs.button.dataset.level = state.level;
+            refs.button.title = 'Filesystem Access · ' + (state.levels[currentIndex] ? state.levels[currentIndex].label : 'Level 2 · User Profile');
+            refs.button.setAttribute('aria-label', refs.button.title);
+        }
+        if (refs.stages) {
+            refs.stages.innerHTML = '';
+            state.levels.forEach(function(level, index) {
+                var stage = document.createElement('div');
+                stage.className = 'permission-policy-stage' + (index === previewIndex ? ' is-current' : '');
+                stage.dataset.filesystemAccessLevel = level.id; stage.tabIndex = 0; stage.setAttribute('role', 'button');
+                stage.setAttribute('aria-label', level.label + '. ' + level.description);
+                var strong = document.createElement('strong'); strong.textContent = level.label;
+                var detail = document.createElement('span'); detail.textContent = level.description;
+                stage.appendChild(strong); stage.appendChild(detail); refs.stages.appendChild(stage);
+            });
+        }
+    }
+    function applySnapshot(response) {
+        if (!response || response.success !== true || !Array.isArray(response.levels) || !response.levels.length) {
+            throw new Error(response && response.error ? response.error : 'Filesystem Access policy is unavailable.');
+        }
+        state.levels = response.levels.map(function(level) {
+            return { id: String(level.id || ''), label: String(level.label || ''), description: String(level.description || '') };
+        }).filter(function(level) { return level.id && level.label; });
+        state.homeRoot = String(response.homeRoot || '');
+        state.level = String(response.level || DEFAULT_FILESYSTEM_ACCESS_LEVEL);
+        if (!state.levels.some(function(level) { return level.id === state.level; })) state.level = DEFAULT_FILESYSTEM_ACCESS_LEVEL;
+        if (!state.levels.some(function(level) { return level.id === state.level; })) state.level = state.levels[state.levels.length - 1].id;
+        render();
+        return state.level;
+    }
+    async function commitLevel(levelId, options) {
+        options = options || {};
+        var api = bridge();
+        if (!api || typeof api.set !== 'function') throw new Error('Filesystem Access bridge is unavailable.');
+        if (state.busy && options.force !== true) return state.level || DEFAULT_FILESYSTEM_ACCESS_LEVEL;
+        state.busy = true; setError(''); render(levelId);
+        try {
+            var level = applySnapshot(await api.set(String(levelId || DEFAULT_FILESYSTEM_ACCESS_LEVEL)));
+            if (options.persistWorkflow !== false && typeof root.scheduleWorkflowSessionSave === 'function') root.scheduleWorkflowSessionSave(0);
+            return level;
+        } finally { state.busy = false; render(); }
+    }
+    async function setLevelFromUi(levelId) {
+        if (String(levelId || '') === state.level) { render(); return state.level; }
+        try { return await commitLevel(levelId, { persistWorkflow: true }); }
+        catch (error) { setError(error && error.message ? error.message : 'Could not update Filesystem Access.'); render(); return state.level; }
+    }
+    async function restoreFilesystemAccessLevel(levelId) {
+        return commitLevel(levelId || DEFAULT_FILESYSTEM_ACCESS_LEVEL, { persistWorkflow: false, force: true });
+    }
+    function currentFilesystemAccessLevel() { return state.level || DEFAULT_FILESYSTEM_ACCESS_LEVEL; }
+    function openPanel(open) {
+        var refs = elements();
+        if (!refs.panel || !refs.button) return;
+        var next = open === undefined ? refs.panel.hidden : Boolean(open);
+        refs.panel.hidden = !next; refs.button.classList.toggle('is-open', next);
+        refs.button.setAttribute('aria-expanded', next ? 'true' : 'false');
+        if (next) {
+            var otherPanel = document.getElementById('permissionPolicyPanel'), otherButton = document.getElementById('nodePermissionPolicyButton');
+            if (otherPanel) otherPanel.hidden = true;
+            if (otherButton) { otherButton.classList.remove('is-open'); otherButton.setAttribute('aria-expanded', 'false'); }
+            refs.slider && refs.slider.focus();
+        }
+    }
+    async function initializeFilesystemAccessUi() {
+        if (state.initialized) return;
+        state.initialized = true;
+        var refs = elements(), api = bridge();
+        if (!refs.button || !refs.panel) return;
+        refs.button.addEventListener('click', function(event) { event.stopPropagation(); openPanel(); });
+        refs.close && refs.close.addEventListener('click', function() { openPanel(false); refs.button.focus(); });
+        refs.panel.addEventListener('click', function(event) { event.stopPropagation(); });
+        refs.slider && refs.slider.addEventListener('input', function() {
+            if (!state.levels.length) return;
+            var index = (state.levels.length - 1) - Number(refs.slider.value), level = state.levels[index];
+            if (level) render(level.id);
+        });
+        refs.slider && refs.slider.addEventListener('change', function() {
+            if (!state.levels.length) return;
+            var index = (state.levels.length - 1) - Number(refs.slider.value), level = state.levels[index];
+            if (level) setLevelFromUi(level.id);
+        });
+        refs.stages && refs.stages.addEventListener('click', function(event) {
+            var stage = event.target && event.target.closest ? event.target.closest('[data-filesystem-access-level]') : null;
+            if (stage) setLevelFromUi(stage.dataset.filesystemAccessLevel);
+        });
+        refs.stages && refs.stages.addEventListener('keydown', function(event) {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            var stage = event.target && event.target.closest ? event.target.closest('[data-filesystem-access-level]') : null;
+            if (stage) { event.preventDefault(); setLevelFromUi(stage.dataset.filesystemAccessLevel); }
+        });
+        document.addEventListener('click', function() { openPanel(false); });
+        document.addEventListener('keydown', function(event) { if (event.key === 'Escape' && !refs.panel.hidden) openPanel(false); });
+        if (!api || typeof api.get !== 'function') { setError('Filesystem Access bridge is unavailable.'); refs.slider && (refs.slider.disabled = true); return; }
+        try { applySnapshot(await api.get()); }
+        catch (error) { setError(error && error.message ? error.message : 'Could not load Filesystem Access.'); refs.slider && (refs.slider.disabled = true); }
+    }
+    root.getDarkstarFilesystemAccessLevel = currentFilesystemAccessLevel;
+    root.restoreDarkstarFilesystemAccessLevel = restoreFilesystemAccessLevel;
+    root.initializeFilesystemAccessUi = initializeFilesystemAccessUi;
+})(globalThis);
+    // <DARKSTAR_SOURCE_END path="backend/renderer/filesystem-access-policy.js">
     // --------------------------------------------------------------------------
     // [9200] NODE PLATFORM :: SDK, controls and backend-service bridge
     // --------------------------------------------------------------------------
@@ -1294,9 +1617,11 @@ function unregisterGenerationSession(session) {
     function button(label, nodeId, action, options) {
         options = options || {};
         var secondary = options.secondary === true ? ' secondary' : '';
+        var className = options.className ? ' ' + escapeHtml(options.className) : '';
         var disabled = options.disabled === true ? ' disabled' : '';
         var title = options.title ? ' title="' + escapeHtml(options.title) + '"' : '';
-        return '<button type="button" class="node-action-button' + secondary + '" data-node-control="true" data-node-id="' + escapeHtml(nodeId) + '" data-action="' + escapeHtml(action) + '"' + title + disabled + '>' + escapeHtml(label) + '</button>';
+        var ariaLabel = options.ariaLabel ? ' aria-label="' + escapeHtml(options.ariaLabel) + '"' : '';
+        return '<button type="button" class="node-action-button' + secondary + className + '" data-node-control="true" data-node-id="' + escapeHtml(nodeId) + '" data-action="' + escapeHtml(action) + '"' + title + ariaLabel + disabled + '>' + escapeHtml(label) + '</button>';
     }
 
     function slider(label, value, min, max, step, decimals, nodeId, param) {
@@ -1345,6 +1670,14 @@ function unregisterGenerationSession(session) {
         var hostWindow = root.window || root;
         if (!hostWindow.darkstar || !hostWindow.darkstar.agent) throw new Error('The agent tool bridge is unavailable.');
         return hostWindow.darkstar.agent;
+    }
+
+    async function configureModelIdleUnload(seconds) {
+        var bridge = getBridge();
+        if (typeof bridge.configureModelIdleUnload !== 'function') throw new Error('Model idle unload configuration is unavailable.');
+        var response = await bridge.configureModelIdleUnload(seconds);
+        if (!response || response.success !== true) throw new Error(response && response.error ? response.error : 'Could not configure model idle unload.');
+        return Number(response.modelIdleUnloadSeconds) || 0;
     }
 
     function copyWorking(working) {
@@ -1925,6 +2258,7 @@ function unregisterGenerationSession(session) {
         makeRequestId: makeRequestId,
         getBridge: getBridge,
         getAgentBridge: getAgentBridge,
+        configureModelIdleUnload: configureModelIdleUnload,
         streamChat: streamChat,
         upsertWorkingActivity: upsertWorkingActivity,
         copyAgentTimeline: copyAgentTimeline,
@@ -1944,7 +2278,7 @@ function unregisterGenerationSession(session) {
     // not dereference this mutable namespace at execution time.
     nodes.services = serviceApi;
 })(globalThis);
-    // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/services.js">
+// <DARKSTAR_SOURCE_END path="backend/renderer/nodes/services.js">
     // --------------------------------------------------------------------------
     // [9300] BUILT-IN NODES :: server, model, context, skills, tools, control and sampler
     // --------------------------------------------------------------------------
@@ -1957,25 +2291,50 @@ function unregisterGenerationSession(session) {
     if (root.window && root.window !== root) root.window.Darkstar = namespace;
     var nodes = namespace.nodes = namespace.nodes || {};
     var controls = nodes.controls;
+    function isAbsoluteModelPath(value) {
+        var text = String(value || '').trim();
+        return text.charAt(0) === '/' || /^[A-Za-z]:[\\/]/u.test(text) || /^\\\\/u.test(text);
+    }
 
-    function listModelOptions(selectedModel) {
+    function cacheModelRecord(record) {
+        if (!record || typeof record !== 'object') return null;
+        var id = String(record.id || '').trim();
+        if (!id) return null;
+        namespace.modelInventory = Array.isArray(namespace.modelInventory) ? namespace.modelInventory : [];
+        var normalized = Object.assign({}, record, { id: id, displayName: String(record.displayName || record.fileName || id), localFilesystem: isAbsoluteModelPath(id) });
+        var index = namespace.modelInventory.findIndex(function(candidate) { return String(candidate && candidate.id || '') === id; });
+        if (index >= 0) namespace.modelInventory[index] = normalized;
+        else namespace.modelInventory.push(normalized);
+        return normalized;
+    }
+
+    function modelInventoryRecord(modelId) {
+        var id = String(modelId || '').trim();
+        if (!id || !Array.isArray(namespace.modelInventory)) return null;
+        return namespace.modelInventory.find(function(candidate) { return String(candidate && candidate.id || '') === id; }) || null;
+    }
+
+    function listModelOptions(selectedModel, placeholderLabel) {
         var select = document.getElementById('modelSelect');
-        var options = [{ value: '', label: 'Select a model' }];
-        if (!select) return options;
-        for (var i = 0; i < select.options.length; i++) {
-            var option = select.options[i];
-            if (!option.value) continue;
-            options.push({ value: option.value, label: option.textContent });
+        var options = [{ value: '', label: String(placeholderLabel || 'C:/Your/Model/Path') }];
+        if (select) {
+            for (var i = 0; i < select.options.length; i++) {
+                var option = select.options[i];
+                if (!option.value) continue;
+                options.push({ value: option.value, label: option.textContent });
+            }
         }
         var selected = String(selectedModel || '').trim();
         if (selected && !options.some(function(option) { return option.value === selected; })) {
-            options.push({ value: selected, label: selected + ' (Unavailable)' });
+            var record = modelInventoryRecord(selected);
+            options.push({ value: selected, label: record ? record.displayName + '  ·  Local file' : selected + ' (Unavailable)' });
         }
         return options;
     }
 
     function modelDropdown(node) {
-        return controls.dropdown('Model', node.selectedModel, node.id, '', listModelOptions(node.selectedModel), 'model');
+        var params = node && node.params && typeof node.params === 'object' ? node.params : {};
+        return controls.dropdown('Model', node.selectedModel, node.id, '', listModelOptions(node.selectedModel, params.modelPathPlaceholder), 'model');
     }
 
     function getLlamaBridge() {
@@ -2026,6 +2385,9 @@ function unregisterGenerationSession(session) {
     }
 
     nodes.builtinCommon = Object.freeze({
+        isAbsoluteModelPath: isAbsoluteModelPath,
+        cacheModelRecord: cacheModelRecord,
+        modelInventoryRecord: modelInventoryRecord,
         listModelOptions: listModelOptions,
         modelDropdown: modelDropdown,
         getLlamaBridge: getLlamaBridge,
@@ -2036,7 +2398,7 @@ function unregisterGenerationSession(session) {
         baseNode: baseNode
     });
 })(globalThis);
-    // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/common.js">
+// <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/common.js">
     // RENDERER MODULE :: backend/renderer/nodes/builtin/load-server.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/nodes/builtin/load-server.js">
 (function registerLoadServerNode(root) {
@@ -2546,7 +2908,7 @@ function unregisterGenerationSession(session) {
                 node.params.multiGpuMode = 'sequential';
             } else if (node.params.backend === 'vulkan') {
                 node.params.multiGpuMode = 'sequential';
-                // Pinned llama.cpp b10520 has unresolved Vulkan Flash Attention
+                // Pinned llama.cpp b10645 has unresolved Vulkan Flash Attention
                 // correctness bugs around KV rollback. Keep the node state honest:
                 // Vulkan runs with FA explicitly Off, not llama.cpp's Auto default.
                 node.params.flashAttention = false;
@@ -2763,6 +3125,8 @@ function unregisterGenerationSession(session) {
     var common = nodes.builtinCommon;
     var controls = nodes.controls;
     var types = nodes.PORT_TYPES;
+    var DEFAULT_MODEL_PATH_PLACEHOLDER = 'C:/Your/Model/Path';
+    var DEFAULT_PROJECTOR_PATH_PLACEHOLDER = 'C:/Your/MMProj/Path';
 
     function runGenerationOperation(context, action) {
         var signal = context && context.abortSignal;
@@ -2780,6 +3144,8 @@ function unregisterGenerationSession(session) {
 
     function ensureProjectorState(node) {
         node.params = node.params || {};
+        if (typeof node.params.modelPathPlaceholder !== 'string' || !node.params.modelPathPlaceholder.trim()) node.params.modelPathPlaceholder = DEFAULT_MODEL_PATH_PLACEHOLDER;
+        if (typeof node.params.projectorPathPlaceholder !== 'string' || !node.params.projectorPathPlaceholder.trim()) node.params.projectorPathPlaceholder = DEFAULT_PROJECTOR_PATH_PLACEHOLDER;
         if (typeof node.params.projectorPath !== 'string') node.params.projectorPath = '';
         if (typeof node.params.projectorSource !== 'string') node.params.projectorSource = '';
         if (typeof node.params.projectorModel !== 'string') node.params.projectorModel = '';
@@ -2787,51 +3153,97 @@ function unregisterGenerationSession(session) {
         return node.params;
     }
 
+    function normalizeProjectorCandidate(candidate, index, source) {
+        var projectorPath = String(candidate && candidate.path ? candidate.path : '').trim();
+        if (!projectorPath) return null;
+        var fileName = String(candidate && candidate.fileName ? candidate.fileName : '').trim();
+        if (!fileName) fileName = projectorPath.split(/[\\/]/).pop() || projectorPath;
+        return {
+            path: projectorPath,
+            fileName: fileName,
+            score: Number(candidate && candidate.score) || 0,
+            recommended: candidate && candidate.recommended === true ? true : index === 0,
+            source: source || String(candidate && candidate.source || 'detected')
+        };
+    }
+
     function normalizeProjectorCandidates(response) {
         var source = response && Array.isArray(response.projectors) ? response.projectors : [];
-        if (!source.length && response && response.projectorPath) {
-            source = [{ path: response.projectorPath, fileName: '' }];
-        }
+        if (!source.length && response && response.projectorPath) source = [{ path: response.projectorPath, fileName: '' }];
         var seen = Object.create(null);
         return source.map(function(candidate, index) {
-            var projectorPath = String(candidate && candidate.path ? candidate.path : '').trim();
-            if (!projectorPath || seen[projectorPath]) return null;
-            seen[projectorPath] = true;
-            var fileName = String(candidate && candidate.fileName ? candidate.fileName : '').trim();
-            if (!fileName) fileName = projectorPath.split(/[\\/]/).pop() || projectorPath;
-            return {
-                path: projectorPath,
-                fileName: fileName,
-                score: Number(candidate && candidate.score) || 0,
-                recommended: candidate && candidate.recommended === true ? true : index === 0
-            };
+            var normalized = normalizeProjectorCandidate(candidate, index, 'detected');
+            if (!normalized || seen[normalized.path]) return null;
+            seen[normalized.path] = true;
+            return normalized;
         }).filter(Boolean);
+    }
+
+    function upsertProjectorCandidate(params, candidate, source) {
+        var normalized = normalizeProjectorCandidate(candidate, params.projectorCandidates.length, source);
+        if (!normalized) return null;
+        var index = params.projectorCandidates.findIndex(function(item) { return item.path === normalized.path; });
+        if (index >= 0) params.projectorCandidates[index] = Object.assign({}, params.projectorCandidates[index], normalized);
+        else params.projectorCandidates.push(normalized);
+        return normalized;
     }
 
     function projectorOptions(node) {
         var params = ensureProjectorState(node);
-        if (!params.projectorCandidates.length) {
-            return [{ value: '', label: 'No projector detected', disabled: true }];
-        }
-        return params.projectorCandidates.map(function(candidate, index) {
-            return {
-                value: candidate.path,
-                label: candidate.fileName + (index === 0 ? '  ·  Best match' : '')
-            };
+        var options = [{ value: '', label: String(params.projectorPathPlaceholder || DEFAULT_PROJECTOR_PATH_PLACEHOLDER) }];
+        var seen = Object.create(null);
+        params.projectorCandidates.forEach(function(candidate, index) {
+            if (!candidate || !candidate.path || seen[candidate.path]) return;
+            seen[candidate.path] = true;
+            var suffix = candidate.source === 'manual' ? '  ·  Local file' : index === 0 || candidate.recommended ? '  ·  Best match' : '';
+            options.push({ value: candidate.path, label: candidate.fileName + suffix });
         });
+        var remembered = root.Darkstar && Array.isArray(root.Darkstar.projectorInventory) ? root.Darkstar.projectorInventory : [];
+        remembered.forEach(function(candidate) {
+            var projectorPath = String(candidate && candidate.path || '').trim();
+            if (!projectorPath || seen[projectorPath]) return;
+            seen[projectorPath] = true;
+            options.push({ value: projectorPath, label: String(candidate.fileName || common.fileName(projectorPath, projectorPath)) + '  ·  Local file' });
+        });
+        if (params.projectorPath && !seen[params.projectorPath]) {
+            options.push({ value: params.projectorPath, label: common.fileName(params.projectorPath, params.projectorPath) + ' (Unavailable)' });
+        }
+        return options;
+    }
+
+    function localBrowseField(dropdownHtml, nodeId, action, label) {
+        return '<div class="node-local-browser-field">' + dropdownHtml + controls.button('⋯', nodeId, action, {
+            className: 'node-local-browser-button',
+            title: 'Browse Local Filesystem …',
+            ariaLabel: 'Browse Local Filesystem for ' + label
+        }) + '</div>';
+    }
+
+    function rememberProjectorSelection(projectorPath) {
+        var bridge = common.getLlamaBridge();
+        var asyncRuntime = root.Darkstar && root.Darkstar.async;
+        if (!projectorPath || typeof bridge.browseModelFiles !== 'function' || !asyncRuntime || typeof asyncRuntime.runBestEffort !== 'function') return;
+        asyncRuntime.runBestEffort(async function() {
+            var response = await bridge.browseModelFiles({ kind: 'projector', path: projectorPath });
+            if (!response || response.success !== true || !response.selectedPath) throw new Error(response && response.error ? response.error : 'Projector history validation failed.');
+        }, 'MODEL_FILES');
     }
 
     function projectorLabel(node) {
         var params = ensureProjectorState(node);
-        var count = params.projectorCandidates.length;
-        if (!count) return 'No projector detected';
-        return count === 1 ? '1 projector detected' : count + ' projectors detected';
+        if (params.projectorSource === 'none') return 'No projector selected';
+        if (params.projectorPath) return common.fileName(params.projectorPath, 'Projector') + (params.projectorSource === 'manual' ? ' selected' : ' auto-selected');
+        return params.projectorCandidates.length ? 'Projector available' : 'No projector detected';
     }
 
     async function detectProjectors(node, modelId, preserveSelection) {
         var params = ensureProjectorState(node);
         var selected = String(modelId || node.selectedModel || '').trim();
+        var previousModel = String(params.projectorModel || '').trim();
         var previousPath = String(params.projectorPath || '').trim();
+        var previousSource = String(params.projectorSource || '').trim();
+        var previousCandidate = params.projectorCandidates.find(function(candidate) { return candidate && candidate.path === previousPath; }) || null;
+        var preserveForSameModel = preserveSelection && previousModel === selected;
         params.projectorModel = selected;
         params.projectorCandidates = [];
         params.projectorPath = '';
@@ -2843,20 +3255,27 @@ function unregisterGenerationSession(session) {
         node.status = 'loading';
         node.statusMessage = 'Detecting projectors…';
         var response = await bridge.detectProjector(selected);
-        if (!response || !response.success) {
-            throw new Error(response && response.error ? response.error : 'Projector detection failed.');
-        }
+        if (!response || !response.success) throw new Error(response && response.error ? response.error : 'Projector detection failed.');
+        if (String(node.selectedModel || '').trim() !== selected || String(params.projectorModel || '').trim() !== selected) return null;
 
         params.projectorCandidates = normalizeProjectorCandidates(response);
-        var previousStillAvailable = preserveSelection && params.projectorCandidates.some(function(candidate) {
-            return candidate.path === previousPath;
-        });
-        var recommendedPath = String(response.projectorPath || '').trim();
-        if (!params.projectorCandidates.some(function(candidate) { return candidate.path === recommendedPath; })) {
-            recommendedPath = params.projectorCandidates.length ? params.projectorCandidates[0].path : '';
+        if (preserveForSameModel && previousSource === 'none') {
+            params.projectorSource = 'none';
+        } else if (preserveForSameModel && previousSource === 'manual' && previousPath) {
+            upsertProjectorCandidate(params, previousCandidate || { path: previousPath }, 'manual');
+            params.projectorPath = previousPath;
+            params.projectorSource = 'manual';
+        } else {
+            var previousStillAvailable = preserveForSameModel && previousPath && params.projectorCandidates.some(function(candidate) {
+                return candidate.path === previousPath;
+            });
+            var recommendedPath = String(response.projectorPath || '').trim();
+            if (!params.projectorCandidates.some(function(candidate) { return candidate.path === recommendedPath; })) {
+                recommendedPath = params.projectorCandidates.length ? params.projectorCandidates[0].path : '';
+            }
+            params.projectorPath = previousStillAvailable ? previousPath : recommendedPath;
+            params.projectorSource = params.projectorPath ? 'detected' : '';
         }
-        params.projectorPath = previousStillAvailable ? previousPath : recommendedPath;
-        params.projectorSource = params.projectorPath ? 'detected' : '';
         node.status = 'idle';
         node.statusMessage = '';
         return params.projectorPath || null;
@@ -2874,6 +3293,8 @@ function unregisterGenerationSession(session) {
             return common.baseNode(definition, nodeId, x, y, {
                 selectedModel: '',
                 params: {
+                    modelPathPlaceholder: DEFAULT_MODEL_PATH_PLACEHOLDER,
+                    projectorPathPlaceholder: DEFAULT_PROJECTOR_PATH_PLACEHOLDER,
                     projectorPath: '',
                     projectorSource: '',
                     projectorModel: '',
@@ -2884,12 +3305,32 @@ function unregisterGenerationSession(session) {
         normalizeNode: function(node, saved) {
             var savedTitle = String(saved && saved.title ? saved.title : '').trim();
             if (!savedTitle || savedTitle === 'Load Model') node.title = definition.title;
-            ensureProjectorState(node);
+            var params = ensureProjectorState(node);
+            if (saved && params.projectorPath && params.projectorSource !== 'none') {
+                params.projectorSource = 'manual';
+                params.projectorModel = String(node.selectedModel || params.projectorModel || '').trim();
+            }
+        },
+        onMount: async function(node) {
+            var selected = String(node.selectedModel || '').trim();
+            if (!selected || !common.isAbsoluteModelPath(selected)) return false;
+            var inventory = root.Darkstar && Array.isArray(root.Darkstar.modelInventory) ? root.Darkstar.modelInventory : [];
+            if (inventory.some(function(record) { return String(record && record.id || '') === selected; })) return false;
+            var bridge = common.getLlamaBridge();
+            if (typeof bridge.inspectModel !== 'function') return false;
+            try {
+                var response = await bridge.inspectModel(selected);
+                if (!response || response.success !== true || !response.model) return false;
+                common.cacheModelRecord(response.model);
+                return true;
+            } catch (_error) {
+                return false;
+            }
         },
         buildContentHTML: function(node) {
             var params = ensureProjectorState(node);
-            return common.modelDropdown(node) +
-                controls.dropdown('Projector', params.projectorPath, node.id, 'projectorPath', projectorOptions(node), 'string') +
+            return localBrowseField(common.modelDropdown(node), node.id, 'browse-local-model', 'Model') +
+                localBrowseField(controls.dropdown('Projector', params.projectorPath, node.id, 'projectorPath', projectorOptions(node), 'string'), node.id, 'browse-local-projector', 'Projector') +
                 controls.button('Unload model', node.id, 'unload-model', { secondary: true, disabled: !node.selectedModel }) +
                 controls.status(node, node.selectedModel ? projectorLabel(node) : 'No model selected');
         },
@@ -2900,10 +3341,18 @@ function unregisterGenerationSession(session) {
             if (param !== 'projectorPath') return;
             var params = ensureProjectorState(node);
             params.projectorPath = String(params.projectorPath || '').trim();
-            params.projectorSource = params.projectorPath ? 'detected' : '';
+            params.projectorSource = params.projectorPath ? 'manual' : 'none';
             params.projectorModel = node.selectedModel || '';
+            if (params.projectorPath) rememberProjectorSelection(params.projectorPath);
             node.status = 'idle';
             node.statusMessage = '';
+        },
+        onProjectorBrowse: function(node, result) {
+            var params = ensureProjectorState(node);
+            var projectorPath = String(result && result.path || '').trim();
+            if (!projectorPath) return '';
+            var candidate = upsertProjectorCandidate(params, { path: projectorPath, fileName: result.fileName || '' }, 'manual');
+            return candidate ? candidate.path : '';
         },
         onAction: async function(node, action) {
             if (action !== 'unload-model') return;
@@ -2912,9 +3361,7 @@ function unregisterGenerationSession(session) {
             node.status = 'loading';
             node.statusMessage = 'Unloading model…';
             var response = await bridge.unloadModel(String(node.selectedModel || '').trim());
-            if (!response || response.success !== true) {
-                throw new Error(response && response.error ? response.error : 'Model unload failed.');
-            }
+            if (!response || response.success !== true) throw new Error(response && response.error ? response.error : 'Model unload failed.');
             if (typeof root.invalidateContextContractForModelUnload === 'function') root.invalidateContextContractForModelUnload();
             else if (typeof root.setContextContractRuntimeContextReady === 'function') root.setContextContractRuntimeContextReady(false);
             else root.window.CONTEXT_LIMIT_READY = false;
@@ -2933,15 +3380,19 @@ function unregisterGenerationSession(session) {
             node.status = 'loading';
             node.statusMessage = 'Loading ' + node.selectedModel + '...';
             var projectorPath = String(params.projectorPath || '').trim();
+            var autoDetectProjector = params.projectorSource !== 'none';
             var result = await runGenerationOperation(context, function() {
-                return common.getLlamaBridge().loadModel(node.selectedModel, projectorPath);
+                return common.getLlamaBridge().loadModel(node.selectedModel, projectorPath, { autoDetectProjector: autoDetectProjector });
             });
             if (!result || !result.success || !result.modelId) {
                 throw new Error('Load Model (GGUF): ' + (result && result.error ? result.error : 'model loading failed.'));
             }
+            if (result.metadata) common.cacheModelRecord(result.metadata);
             if (result.projectorPath) {
                 params.projectorPath = result.projectorPath;
-                params.projectorSource = 'detected';
+                if (params.projectorSource !== 'manual') params.projectorSource = 'detected';
+            } else if (params.projectorSource === 'none') {
+                params.projectorPath = '';
             }
             params.projectorModel = node.selectedModel;
             var measuredPerSlot = Number(result.contextSizePerSlot || result.effectiveContextSize);
@@ -2949,12 +3400,8 @@ function unregisterGenerationSession(session) {
             var measuredParallel = Math.max(1, Number(result.parallelSlots || result.effectiveParallelSlots || (inputs.server && inputs.server.parallelSlots)) || 1);
             var serverPerSlotCeiling = Number(inputs.server && inputs.server.contextSizePerSlot);
             var serverTotalCeiling = Number(inputs.server && inputs.server.totalContextSize);
-            var effectivePerSlot = Number.isFinite(measuredPerSlot) && measuredPerSlot > 0
-                ? Math.floor(measuredPerSlot)
-                : 0;
-            if (Number.isFinite(serverPerSlotCeiling) && serverPerSlotCeiling > 0 && effectivePerSlot > 0) {
-                effectivePerSlot = Math.min(effectivePerSlot, Math.floor(serverPerSlotCeiling));
-            }
+            var effectivePerSlot = Number.isFinite(measuredPerSlot) && measuredPerSlot > 0 ? Math.floor(measuredPerSlot) : 0;
+            if (Number.isFinite(serverPerSlotCeiling) && serverPerSlotCeiling > 0 && effectivePerSlot > 0) effectivePerSlot = Math.min(effectivePerSlot, Math.floor(serverPerSlotCeiling));
             if (effectivePerSlot > 0) {
                 root.window.TOKEN_LIMIT = effectivePerSlot;
                 if (typeof root.setContextContractRuntimeContextReady === 'function') root.setContextContractRuntimeContextReady(true, effectivePerSlot);
@@ -2962,12 +3409,8 @@ function unregisterGenerationSession(session) {
                 if (inputs.server && typeof inputs.server === 'object') {
                     inputs.server.contextSizePerSlot = effectivePerSlot;
                     inputs.server.parallelSlots = measuredParallel;
-                    var effectiveTotal = Number.isFinite(measuredTotal) && measuredTotal > 0
-                        ? Math.floor(measuredTotal)
-                        : effectivePerSlot * measuredParallel;
-                    if (Number.isFinite(serverTotalCeiling) && serverTotalCeiling > 0) {
-                        effectiveTotal = Math.min(effectiveTotal, Math.floor(serverTotalCeiling));
-                    }
+                    var effectiveTotal = Number.isFinite(measuredTotal) && measuredTotal > 0 ? Math.floor(measuredTotal) : effectivePerSlot * measuredParallel;
+                    if (Number.isFinite(serverTotalCeiling) && serverTotalCeiling > 0) effectiveTotal = Math.min(effectiveTotal, Math.floor(serverTotalCeiling));
                     inputs.server.totalContextSize = effectiveTotal;
                     inputs.server.contextMeasurementSource = result.contextMeasurementSource || 'model-load';
                 }
@@ -2977,9 +3420,7 @@ function unregisterGenerationSession(session) {
             if (inputs.server && typeof inputs.server === 'object' && result.mtp && typeof result.mtp === 'object') inputs.server.mtp = result.mtp;
             node.status = 'active';
             var fallbackLabel = (result.mtpFallback ? ' · MTP Auto→Off' : '') + (result.memoryFallback ? ' · adaptive VRAM settings' : '');
-            var contextLabel = effectivePerSlot > 0
-                ? ' · ' + effectivePerSlot.toLocaleString() + ' ctx/slot'
-                : '';
+            var contextLabel = effectivePerSlot > 0 ? ' · ' + effectivePerSlot.toLocaleString() + ' ctx/slot' : '';
             node.statusMessage = result.modelId + (result.projectorPath ? ' + projector' : '') + contextLabel + fallbackLabel;
             return {
                 model: {
@@ -2999,7 +3440,7 @@ function unregisterGenerationSession(session) {
 
     nodes.registerNode(definition);
 })(globalThis);
-    // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/load-model.js">
+// <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/load-model.js">
     // RENDERER MODULE :: backend/renderer/nodes/builtin/context.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/nodes/builtin/context.js">
 (function registerContextNode(root) {
@@ -3424,20 +3865,20 @@ function unregisterGenerationSession(session) {
             }
             if (action !== 'add-skill-file') return;
 
-            node.status = 'loading';
-            node.statusMessage = 'Inspecting selected skills…';
-            if (typeof rerenderNode === 'function') rerenderNode(node.id);
-            var response = await common.getAgentBridge().chooseSkill({ multiple: true });
-            if (!response || !response.success) throw new Error(response && response.error ? response.error : 'Could not load the skills.');
-            if (response.canceled) {
+            var browser = root.Darkstar && root.Darkstar.skillFiles;
+            if (!browser || typeof browser.open !== 'function') throw new Error('Darkstar’s skill browser is unavailable in this build.');
+            var result = await browser.open({ multiple: true });
+            var selectedPaths = result && Array.isArray(result.paths) ? result.paths : (result && result.path ? [result.path] : []);
+            if (!selectedPaths.length) {
                 node.status = skills.length ? 'active' : 'idle';
                 node.statusMessage = statusText(skills);
                 return;
             }
-            var selected = Array.isArray(response.skills)
-                ? response.skills
-                : (response.skill ? [response.skill] : []);
-            addInspectedSkills(node, selected, response.errors);
+            node.status = 'loading';
+            node.statusMessage = 'Inspecting selected skills…';
+            if (typeof rerenderNode === 'function') rerenderNode(node.id);
+            var inspected = await inspectDroppedSkills(selectedPaths);
+            addInspectedSkills(node, inspected.skills, inspected.errors);
         },
         onFilesDropped: async function(node, filePaths) {
             var skills = ensureSkills(node);
@@ -3514,18 +3955,18 @@ function unregisterGenerationSession(session) {
         },
         onAction: async function(node, action) {
             if (action !== 'choose-python-tool') return;
+            var browser = root.Darkstar && root.Darkstar.toolFiles;
+            if (!browser || typeof browser.open !== 'function') throw new Error('Darkstar’s Python tool browser is unavailable in this build.');
+            var currentPath = String(node.params.path || '');
+            var result = await browser.open({ multiple: false, initialPath: /^(?:[A-Za-z]:[\\/]|\/)/u.test(currentPath) ? currentPath : '' });
+            if (!result || !result.path) return;
             var bridge = common.getAgentBridge();
             node.status = 'loading';
             node.statusMessage = 'Loading Python tool…';
             if (typeof rerenderNode === 'function') rerenderNode(node.id);
-            var response = await bridge.chooseToolFile();
-            if (!response || !response.success) throw new Error(response && response.error ? response.error : 'Could not load the Python tool file.');
-            if (response.canceled) {
-                node.status = 'idle';
-                node.statusMessage = '';
-                return;
-            }
-            node.params.path = response.provider.path || '';
+            var response = await bridge.inspectToolProvider({ kind: 'python', path: result.path });
+            if (!response || !response.success || !response.provider) throw new Error(response && response.error ? response.error : 'Could not load the Python tool file.');
+            node.params.path = response.provider.path || result.path;
             node.params.providerName = response.provider.name || response.provider.id || 'Python tool file';
             node.status = 'active';
             node.statusMessage = (response.provider.tools || []).length + ' tools';
@@ -3561,6 +4002,8 @@ function unregisterGenerationSession(session) {
     var BROWSER_CONTROL_TOOL_MIGRATION_VERSION = 1;
     var TIMEOUT_TOOL_PATH = 'agent_assets/tools/timeout.py';
     var TIMEOUT_TOOL_MIGRATION_VERSION = 1;
+    var ASK_USER_YES_NO_TOOL_PATH = 'agent_assets/tools/ask_user_yes_no.py';
+    var ASK_USER_YES_NO_TOOL_MIGRATION_VERSION = 1;
     var MAX_ROUNDS_MIGRATION_VERSION = 2;
     var PACKAGED_PROVIDER_MIGRATIONS = Object.freeze([
         Object.freeze({ from: 'agent_assets/tools/edit_file_tool.py', to: 'agent_assets/tools/safe_edit_tool.py', name: 'Safe Edit Tool', toolCount: 1 }),
@@ -3653,6 +4096,15 @@ function unregisterGenerationSession(session) {
         });
     }
 
+    function askUserYesNoProvider() {
+        return normalizeProvider({
+            kind: 'python',
+            path: ASK_USER_YES_NO_TOOL_PATH,
+            name: 'Ask User Yes/No',
+            toolCount: 1
+        });
+    }
+
     function providerFromInspection(value, reference) {
         if (!value || typeof value !== 'object') return null;
         return normalizeProvider({
@@ -3722,6 +4174,16 @@ function unregisterGenerationSession(session) {
                 seen[timeoutKey] = true;
             }
             node.params.timeoutToolMigrationVersion = TIMEOUT_TOOL_MIGRATION_VERSION;
+        }
+        var askUserMigrationVersion = Math.max(0, Number.parseInt(node.params.askUserYesNoToolMigrationVersion, 10) || 0);
+        if (askUserMigrationVersion < ASK_USER_YES_NO_TOOL_MIGRATION_VERSION) {
+            var bundledAskUser = askUserYesNoProvider();
+            var askUserKey = providerKey(bundledAskUser);
+            if (!seen[askUserKey]) {
+                node.params.providers.push(bundledAskUser);
+                seen[askUserKey] = true;
+            }
+            node.params.askUserYesNoToolMigrationVersion = ASK_USER_YES_NO_TOOL_MIGRATION_VERSION;
         }
         delete node.params.uipToolMigrationVersion;
         delete node.params.toolFiles;
@@ -3860,9 +4322,10 @@ function unregisterGenerationSession(session) {
         factory: function(nodeId, x, y) {
             return common.baseNode(definition, nodeId, x, y, {
                 params: {
-                    providers: [screenshotProvider(), browserControlProvider(), timeoutProvider()],
+                    providers: [screenshotProvider(), browserControlProvider(), timeoutProvider(), askUserYesNoProvider()],
                     browserControlToolMigrationVersion: BROWSER_CONTROL_TOOL_MIGRATION_VERSION,
                     timeoutToolMigrationVersion: TIMEOUT_TOOL_MIGRATION_VERSION,
+                    askUserYesNoToolMigrationVersion: ASK_USER_YES_NO_TOOL_MIGRATION_VERSION,
                     maxRoundsMigrationVersion: MAX_ROUNDS_MIGRATION_VERSION,
                     maxRounds: 'auto',
                     toolChoice: 'auto'
@@ -3899,20 +4362,20 @@ function unregisterGenerationSession(session) {
             }
             if (action !== 'add-tool-file') return;
 
-            node.status = 'loading';
-            node.statusMessage = 'Inspecting selected Python tools…';
-            if (typeof rerenderNode === 'function') rerenderNode(node.id);
-            var response = await common.getAgentBridge().chooseToolFile({ multiple: true });
-            if (!response || !response.success) throw new Error(response && response.error ? response.error : 'Could not load the Python tool files.');
-            if (response.canceled) {
+            var browser = root.Darkstar && root.Darkstar.toolFiles;
+            if (!browser || typeof browser.open !== 'function') throw new Error('Darkstar’s Python tool browser is unavailable in this build.');
+            var result = await browser.open({ multiple: true });
+            var selectedPaths = result && Array.isArray(result.paths) ? result.paths : (result && result.path ? [result.path] : []);
+            if (!selectedPaths.length) {
                 node.status = providers.length ? 'active' : 'idle';
                 node.statusMessage = statusText(providers);
                 return;
             }
-            var selected = Array.isArray(response.providers)
-                ? response.providers
-                : (response.provider ? [response.provider] : []);
-            addInspectedProviders(node, selected, response.errors);
+            node.status = 'loading';
+            node.statusMessage = 'Inspecting selected Python tools…';
+            if (typeof rerenderNode === 'function') rerenderNode(node.id);
+            var inspected = await inspectDroppedProviders(selectedPaths);
+            addInspectedProviders(node, inspected.providers, inspected.errors);
         },
         onFilesDropped: async function(node, filePaths) {
             var providers = ensureProviders(node);
@@ -3981,17 +4444,45 @@ function unregisterGenerationSession(session) {
     var controls = nodes.controls;
     var types = nodes.PORT_TYPES;
 
+    var FIXED_MODEL_IDLE_UNLOAD_SECONDS = 600;
+
+    function normalizeIdleUnloadSeconds(value) {
+        var parsed = Number(value);
+        if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+        return FIXED_MODEL_IDLE_UNLOAD_SECONDS;
+    }
+
+    function applyIdleUnloadPolicy(value) {
+        var runtime = root.Darkstar && (root.Darkstar.chatRuntime || (root.Darkstar.nodes && root.Darkstar.nodes.services));
+        if (!runtime || typeof runtime.configureModelIdleUnload !== 'function') return;
+        root.Darkstar.async.runBestEffort(function() { return runtime.configureModelIdleUnload(normalizeIdleUnloadSeconds(value)); }, 'CONTROL');
+    }
+
+    function syncIdleUnloadPolicyFromGraph() {
+        var editor = typeof nodeEditorState !== 'undefined' && nodeEditorState && Array.isArray(nodeEditorState.nodes) ? nodeEditorState : null;
+        var control = editor ? editor.nodes.find(function(node) { return node && node.type === 'control'; }) : null;
+        var params = control && control.params && typeof control.params === 'object' ? control.params : null;
+        var enabled = Boolean(params && (params.modelIdleUnloadEnabled === true
+            || (typeof params.modelIdleUnloadEnabled !== 'boolean' && normalizeIdleUnloadSeconds(params.modelIdleUnloadSeconds) > 0)));
+        applyIdleUnloadPolicy(enabled ? FIXED_MODEL_IDLE_UNLOAD_SECONDS : 0);
+    }
+
     function statusText(node) {
         var naming = node.params.nameConversations === true ? 'Conversation naming on' : 'Conversation naming off';
         var autoCompact = node.params.autoCompact === true ? 'Auto-compact on' : 'Auto-compact off';
-        return naming + ' · ' + autoCompact;
+        var idleUnload = node.params.modelIdleUnloadEnabled === true ? 'Model idle unload on · 10 min' : 'Model idle unload off';
+        return naming + ' · ' + autoCompact + ' · ' + idleUnload;
     }
 
     function normalizeNode(node) {
         var params = node && node.params && typeof node.params === 'object' ? node.params : {};
+        var enabled = typeof params.modelIdleUnloadEnabled === 'boolean'
+            ? params.modelIdleUnloadEnabled
+            : normalizeIdleUnloadSeconds(params.modelIdleUnloadSeconds) > 0;
         node.params = {
             nameConversations: typeof params.nameConversations === 'boolean' ? params.nameConversations : true,
-            autoCompact: typeof params.autoCompact === 'boolean' ? params.autoCompact : false
+            autoCompact: typeof params.autoCompact === 'boolean' ? params.autoCompact : false,
+            modelIdleUnloadEnabled: enabled
         };
     }
 
@@ -4005,14 +4496,17 @@ function unregisterGenerationSession(session) {
         outputs: [{ name: 'while', label: 'While', type: types.CONTROL }],
         factory: function(nodeId, x, y) {
             return common.baseNode(definition, nodeId, x, y, {
-                params: { nameConversations: true, autoCompact: false },
+                params: { nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: false },
                 status: 'active',
-                statusMessage: 'Conversation naming on · Auto-compact off'
+                statusMessage: 'Conversation naming on · Auto-compact off · Model idle unload off'
             });
         },
         normalizeNode: normalizeNode,
-        onParameterChange: function(node) {
+        onParameterChange: function(node, param) {
             normalizeNode(node);
+            if (param === 'modelIdleUnloadEnabled') {
+                applyIdleUnloadPolicy(node.params.modelIdleUnloadEnabled ? FIXED_MODEL_IDLE_UNLOAD_SECONDS : 0);
+            }
             node.status = 'active';
             node.statusMessage = statusText(node);
         },
@@ -4026,7 +4520,12 @@ function unregisterGenerationSession(session) {
                 onLabel: 'ON',
                 offLabel: 'OFF',
                 description: 'When 90% of the context window is occupied, compact the earliest 50% into a system handoff summary before the next generation.'
-            }) + controls.status(node, statusText(node));
+            }) + controls.toggle('Model idle unload', node.params.modelIdleUnloadEnabled, node.id, 'modelIdleUnloadEnabled', {
+                onLabel: 'ON',
+                offLabel: 'OFF',
+                description: 'When enabled, unload the loaded model after 10 minutes with no active or queued inference.'
+            }) + '<div class="node-control-help">The 10-minute timeout is fixed. Any new inference resets the idle window. Pending Authorization decisions pause automatic unloading.</div>' +
+                controls.status(node, statusText(node));
         },
         execute: async function(_inputs, node) {
             normalizeNode(node);
@@ -4035,12 +4534,14 @@ function unregisterGenerationSession(session) {
             return {
                 while: {
                     nameConversations: node.params.nameConversations === true,
-                    autoCompact: node.params.autoCompact === true
+                    autoCompact: node.params.autoCompact === true,
+                    modelIdleUnloadSeconds: node.params.modelIdleUnloadEnabled === true ? FIXED_MODEL_IDLE_UNLOAD_SECONDS : 0
                 }
             };
         }
     };
 
+    root.syncDarkstarModelIdleUnloadPolicy = syncIdleUnloadPolicyFromGraph;
     nodes.registerNode(definition);
 })(globalThis);
     // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/control.js">
@@ -4388,15 +4889,17 @@ function unregisterGenerationSession(session) {
                 });
                 node.statusMessage = 'Generating...';
             }
-            var secureContinuationBoundary = continuingFinalMessage && context.continuationBrowserCompartmentActivated === true;
+            var browserContinuationBoundary = continuingFinalMessage && context.continuationBrowserCompartmentActivated === true;
             // Keep the model-visible tool/skill envelope token-stable on Continue.
-            // Security is enforced at the execution gate, not by rewriting the
+            // Authorization is enforced at the execution gate, not by rewriting the
             // prompt prefix and accidentally invalidating otherwise valid KV.
             var toolConfiguration = Object.assign({}, inputs.tools || { providers: [], maxRounds: 'auto', toolChoice: 'auto' }, {
                 workspaceId: context.workspaceId || 'default',
+                projectId: Number(context.projectId) || 0,
+                tabId: Number(context.tabId) || 0,
                 uipScopeId: context.uipScopeId || ('project-' + String(Number(context.projectId) || 0)),
                 browserId: String(context.tabId === undefined || context.tabId === null ? '0' : context.tabId),
-                executionDisabled: secureContinuationBoundary
+                executionDisabled: browserContinuationBoundary
             });
             if (!chatRuntime || typeof chatRuntime.streamChat !== 'function') throw new Error('Darkstar chat runtime is unavailable.');
             var chatRequest = {
@@ -4466,7 +4969,7 @@ function unregisterGenerationSession(session) {
                 usage: result.usage,
                 contextUsage: result.contextUsage || null,
                 finishReason: result.finishReason,
-                stopDetails: result.stopDetails && typeof result.stopDetails === 'object' ? structuredClone(result.stopDetails) : null,
+                stopDetails: result.stopDetails && typeof result.stopDetails === 'object' ? structuredClone(result.stopDetails) : null, browserCompartmentActivated: result.browserCompartmentActivated === true,
                 working: Array.isArray(result.working) ? result.working : [],
                 toolMessages: Array.isArray(result.toolMessages) ? result.toolMessages : [],
                 agentTimeline: Array.isArray(result.agentTimeline) ? result.agentTimeline : [],
@@ -4478,7 +4981,7 @@ function unregisterGenerationSession(session) {
 
     nodes.registerNode(definition);
 })(globalThis);
-    // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/sampler.js">
+// <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/sampler.js">
     // RENDERER MODULE :: backend/renderer/nodes/plugin-loader.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/nodes/plugin-loader.js">
 (function initializeCustomNodeLoader(root) {
@@ -4702,7 +5205,7 @@ function initNodeEditor() {
         }
     });
     if (!nodeEditorState.nodes.length) {
-        resetNodeGraph();
+        Darkstar.async.runBestEffort(function() { return resetNodeGraph(); }, 'WORKFLOW');
     } else {
         syncHiddenModelSelectFromNode({ rerender: false });
         renderAllNodes();
@@ -4740,7 +5243,19 @@ function createDefaultNodePipeline(startX, startY) {
     nodeEditorState.defaultLayoutPending = true;
 }
 
-function resetNodeGraph() {
+async function resetNodeGraph() {
+    if (typeof restoreCanonicalDefaultWorkflow === 'function') {
+        try {
+            if (await restoreCanonicalDefaultWorkflow()) {
+                if (typeof scheduleWorkflowSessionSave === 'function') scheduleWorkflowSessionSave();
+                return true;
+            }
+        } catch (error) {
+            console.warn('[WORKFLOW] Could not reset to bundled default workflow:', error && error.message ? error.message : error);
+        }
+    }
+
+    // Emergency fallback if the bundled workflow is unavailable or corrupt.
     nodeEditorState.nodes = [];
     nodeEditorState.connections = [];
     nodeEditorState.nextNodeId = 1;
@@ -4756,6 +5271,7 @@ function resetNodeGraph() {
     renderConnections();
     updateGridTransform();
     if (typeof scheduleWorkflowSessionSave === 'function') scheduleWorkflowSessionSave();
+    return false;
 }
 
 // --- CREATE NODE FROM REGISTRY ---
@@ -5856,7 +6372,7 @@ function onGridContextMenu(e) {
     getAllUserNodeTypes().forEach(function(def) {
         items.push(['+ ' + def.title, function() { addNodeEditorNode(def.id); menu.remove(); }]);
     });
-    items.push(['Reset Graph', function() { resetNodeGraph(); menu.remove(); }]);
+    items.push(['Reset Graph', function() { Darkstar.async.runBestEffort(function() { return resetNodeGraph(); }, 'WORKFLOW'); menu.remove(); }]);
     items.forEach(function(item) {
         var div = document.createElement('div');
         div.className = 'context-menu-item'; div.textContent = item[0];
@@ -5930,7 +6446,7 @@ async function runNodeFileDrop(event, dropZone) {
     var node = nodeEditorState.nodes.find(function(candidate) { return candidate.id === nodeId; });
     var definition = node && typeof getNodeDef === 'function' ? getNodeDef(node.type) : null;
     if (!node || !definition || typeof definition.onFilesDropped !== 'function') return;
-
+    var runtimeSignatureBefore = typeof nodeRuntimeUnloadRelevantSignature === 'function' ? nodeRuntimeUnloadRelevantSignature(node) : null;
     var filePaths = getDroppedFilePaths(event && event.dataTransfer ? event.dataTransfer.files : []);
     dropZone.setAttribute('aria-busy', 'true');
     try {
@@ -5940,6 +6456,7 @@ async function runNodeFileDrop(event, dropZone) {
         node.status = 'error';
         node.statusMessage = error && error.message ? error.message : String(error);
     } finally {
+        if (typeof noteNodeRuntimeConfigMutation === 'function') noteNodeRuntimeConfigMutation(node, runtimeSignatureBefore);
         if (typeof rerenderNode === 'function') rerenderNode(nodeId);
         if (typeof renderConnections === 'function') renderConnections();
         if (typeof scheduleWorkflowSessionSave === 'function') scheduleWorkflowSessionSave();
@@ -5971,6 +6488,10 @@ function bindNodeControlEvents() {
             return;
         }
         var actionButton = event.target && event.target.closest ? event.target.closest('.node-action-button') : null;
+        if (actionButton && actionButton.classList.contains('node-local-browser-button')) {
+            browseNodeLocalFilesystem(event, actionButton);
+            return;
+        }
         if (actionButton) runNodeAction(event, actionButton);
     });
 
@@ -6182,6 +6703,47 @@ function setNodeModelValue(nodeId, value) {
     return true;
 }
 
+async function browseNodeLocalFilesystem(event, button) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    if (!button || button.disabled) return;
+    var nodeId = parseInt(button.dataset.nodeId, 10);
+    var browserKind = String(button.dataset.action || '').replace(/^browse-local-/u, '');
+    var node = nodeEditorState.nodes.find(function(candidate) { return candidate.id === nodeId; });
+    var common = window.Darkstar && window.Darkstar.nodes ? window.Darkstar.nodes.builtinCommon : null;
+    if (!node || !common) return;
+    button.disabled = true;
+    try {
+        if (browserKind === 'model') {
+            var modelBrowser = window.Darkstar && window.Darkstar.modelFiles;
+            if (!modelBrowser || typeof modelBrowser.open !== 'function') throw new Error('Local model browsing is unavailable in this build.');
+            var selected = String(node.selectedModel || '');
+            var result = await modelBrowser.open({ initialPath: common.isAbsoluteModelPath(selected) ? selected : '' });
+            if (!result || !result.path) return;
+            if (result.model) common.cacheModelRecord(result.model);
+            if (setNodeModelValue(nodeId, result.path) && typeof rerenderNode === 'function') rerenderNode(nodeId);
+            return;
+        }
+        if (browserKind !== 'projector') return;
+        var projectorBrowser = window.Darkstar && window.Darkstar.projectorFiles;
+        var definition = typeof getNodeDef === 'function' ? getNodeDef(node.type) : null;
+        if (!projectorBrowser || typeof projectorBrowser.open !== 'function' || !definition || typeof definition.onProjectorBrowse !== 'function') {
+            throw new Error('Local projector browsing is unavailable in this build.');
+        }
+        var projectorPath = String(node.params && node.params.projectorPath || '').trim();
+        var projectorResult = await projectorBrowser.open({ initialPath: common.isAbsoluteModelPath(projectorPath) ? projectorPath : '' });
+        if (!projectorResult || !projectorResult.path) return;
+        var selectedProjectorPath = definition.onProjectorBrowse(node, projectorResult);
+        if (selectedProjectorPath && setNodeParamValue(nodeId, 'projectorPath', 'string', selectedProjectorPath) && typeof rerenderNode === 'function') rerenderNode(nodeId);
+    } catch (error) {
+        if (typeof showNodeEditorToast === 'function') showNodeEditorToast(error && error.message ? error.message : String(error), 'error', 6200);
+    } finally {
+        if (button.isConnected) button.disabled = false;
+    }
+}
+
 function selectNodeDropdownOption(event, option) {
     if (event) {
         event.preventDefault();
@@ -6243,7 +6805,9 @@ function ensureHiddenModelOption(select, selectedModel) {
     }
     var option = document.createElement('option');
     option.value = selectedModel;
-    option.textContent = selectedModel + ' (Unavailable)';
+    var inventory = window.Darkstar && Array.isArray(window.Darkstar.modelInventory) ? window.Darkstar.modelInventory : [];
+    var record = inventory.find(function(candidate) { return String(candidate && candidate.id || '') === selectedModel; });
+    option.textContent = record && record.localFilesystem === true ? record.displayName + '  ·  Local file' : selectedModel + ' (Unavailable)';
     option.dataset.darkstarUnavailableModel = 'true';
     select.appendChild(option);
     return option;
@@ -6314,9 +6878,10 @@ function onNodeParamChange(el) {
     'use strict';
 
     var LEGACY_WORKFLOW_FORMAT = 'darkstar-workflow';
-    var LEGACY_WORKFLOW_VERSION = 2;
+    var LEGACY_WORKFLOW_VERSION = 3;
     var SNAPSHOT_FORMAT = 'darkstar-workflow-snapshot';
-    var SNAPSHOT_VERSION = 1;
+    var SNAPSHOT_VERSION = 2;
+    var DEFAULT_WORKFLOW_PERMISSION_LEVEL = 'boundary-guard';
     var VOLATILE_NODE_KEYS = {
         status: true,
         statusMessage: true,
@@ -6346,6 +6911,8 @@ function onNodeParamChange(el) {
     var LEGACY_OMITTED_NODE_KEYS = Object.assign({ inputs: true, outputs: true, ports: true }, VOLATILE_NODE_KEYS);
     var SKIP_VALUE = {};
     var toastTimer = null;
+    var DEFAULT_WORKFLOW_FILE = 'darkstar-workflow.dswf';
+    var canonicalDefaultWorkflow = null;
     var workflowSessionReady = false;
     var workflowSessionSaveTimer = null;
     var workflowRevision = 0;
@@ -6434,6 +7001,15 @@ function onNodeParamChange(el) {
         return JSON.stringify(left) === JSON.stringify(right);
     }
 
+    function workflowSecurity() {
+        if (typeof root.getDarkstarWorkflowSecurity !== 'function') throw new Error('Workflow security serialization is unavailable in this build.');
+        return root.getDarkstarWorkflowSecurity();
+    }
+    function restoreWorkflowSecurity(value) {
+        if (typeof root.restoreDarkstarWorkflowSecurity !== 'function') throw new Error('Workflow security restoration is unavailable in this build.');
+        return root.restoreDarkstarWorkflowSecurity(value);
+    }
+
     function snapshotNode(node) {
         var snapshot = {};
         Object.keys(node || {}).forEach(function(key) {
@@ -6462,7 +7038,7 @@ function onNodeParamChange(el) {
         editor.panX = normalizeNumber(nodeEditorState.panX, 0);
         editor.panY = normalizeNumber(nodeEditorState.panY, 0);
         editor.zoom = normalizeNumber(nodeEditorState.zoom, 1);
-        return { format: SNAPSHOT_FORMAT, version: SNAPSHOT_VERSION, editor: editor };
+        return { format: SNAPSHOT_FORMAT, version: SNAPSHOT_VERSION, security: workflowSecurity(), editor: editor };
     }
 
     // Kept only for importing workflows created by older Darkstar builds.
@@ -6499,6 +7075,7 @@ function onNodeParamChange(el) {
                 panY: normalizeNumber(nodeEditorState.panY, 0),
                 zoom: normalizeNumber(nodeEditorState.zoom, 1)
             },
+            security: workflowSecurity(),
             nodes: nodeEditorState.nodes.map(serializeLegacyNode),
             connections: nodeEditorState.connections.map(function(connection) {
                 return {
@@ -6787,23 +7364,26 @@ function onNodeParamChange(el) {
         if (typeof updateGridTransform === 'function') updateGridTransform();
         if (typeof renderConnections === 'function') renderConnections();
         if (typeof updateModelReadyState === 'function') updateModelReadyState();
+        if (typeof root.syncDarkstarModelIdleUnloadPolicy === 'function') root.syncDarkstarModelIdleUnloadPolicy();
         return { unrecognizedNames: unrecognizedNames };
     }
 
-    function restoreWorkflowSnapshot(snapshot) {
+    async function restoreWorkflowSnapshot(snapshot) {
         if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) throw new Error('Workflow snapshot must contain an object.');
         var editor = snapshot.editor && typeof snapshot.editor === 'object' ? snapshot.editor : null;
         if (!editor || !Array.isArray(editor.nodes) || !Array.isArray(editor.connections)) {
             if (Array.isArray(snapshot.nodes) && Array.isArray(snapshot.connections)) return restoreWorkflowDocument(snapshot);
             throw new Error('Workflow snapshot does not contain editor nodes and connections arrays.');
         }
+        await restoreWorkflowSecurity(snapshot);
         return restoreGraph(editor.nodes, editor.connections, editor, false);
     }
 
-    function restoreWorkflowDocument(documentValue) {
+    async function restoreWorkflowDocument(documentValue) {
         if (!documentValue || typeof documentValue !== 'object' || Array.isArray(documentValue)) throw new Error('Workflow JSON must contain an object.');
         if (!Array.isArray(documentValue.nodes)) throw new Error('Workflow JSON does not contain a nodes array.');
         if (!Array.isArray(documentValue.connections)) throw new Error('Workflow JSON does not contain a connections array.');
+        await restoreWorkflowSecurity(documentValue);
         var viewport = documentValue.viewport && typeof documentValue.viewport === 'object' ? documentValue.viewport : documentValue;
         return restoreGraph(documentValue.nodes, documentValue.connections, viewport, true);
     }
@@ -6823,6 +7403,32 @@ function onNodeParamChange(el) {
 
     function workflowBridge() {
         return root.darkstar && root.darkstar.workflow ? root.darkstar.workflow : null;
+    }
+
+    async function loadCanonicalDefaultWorkflow() {
+        if (canonicalDefaultWorkflow) return persistentClone(canonicalDefaultWorkflow);
+        var bridge = workflowBridge();
+        if (!bridge || typeof bridge.load !== 'function') return null;
+        var response = await bridge.load({ fileName: DEFAULT_WORKFLOW_FILE });
+        if (!response || response.success !== true) {
+            throw new Error(response && response.error ? response.error : 'The bundled default workflow could not be loaded.');
+        }
+        if (response.kind === 'legacy-json' && response.document) {
+            canonicalDefaultWorkflow = { kind: 'legacy-json', document: persistentClone(response.document) };
+        } else if (response.snapshot) {
+            canonicalDefaultWorkflow = { kind: 'snapshot', snapshot: persistentClone(response.snapshot) };
+        } else {
+            throw new Error('The bundled default workflow has no restorable state.');
+        }
+        return persistentClone(canonicalDefaultWorkflow);
+    }
+
+    async function restoreCanonicalDefaultWorkflow() {
+        var bundled = await loadCanonicalDefaultWorkflow();
+        if (!bundled) return false;
+        if (bundled.kind === 'legacy-json') await restoreWorkflowDocument(bundled.document);
+        else await restoreWorkflowSnapshot(bundled.snapshot);
+        return true;
     }
 
     async function saveWorkflowSessionNow(options) {
@@ -6887,24 +7493,41 @@ function onNodeParamChange(el) {
 
     async function restoreWorkflowSession() {
         var bridge = workflowBridge();
-        if (!bridge || typeof bridge.loadSession !== 'function') {
-            workflowSessionReady = true;
-            savedWorkflowRevision = workflowRevision;
-            return false;
-        }
         try {
-            var response = await bridge.loadSession();
-            if (response && response.success && response.found) {
-                if (response.kind === 'legacy-json' && response.document) restoreWorkflowDocument(response.document);
-                else if (response.snapshot) restoreWorkflowSnapshot(response.snapshot);
-                else throw new Error('The saved workflow session has no restorable state.');
+            // Cache the shipped workflow even when an autosave exists so Reset Graph
+            // always restores the exact same canonical default.
+            await loadCanonicalDefaultWorkflow();
+        } catch (defaultError) {
+            console.warn('[WORKFLOW] Could not load bundled default workflow:', defaultError && defaultError.message ? defaultError.message : defaultError);
+        }
+
+        if (bridge && typeof bridge.loadSession === 'function') {
+            try {
+                var response = await bridge.loadSession();
+                if (response && response.success && response.found) {
+                    if (response.kind === 'legacy-json' && response.document) await restoreWorkflowDocument(response.document);
+                    else if (response.snapshot) await restoreWorkflowSnapshot(response.snapshot);
+                    else throw new Error('The saved workflow session has no restorable state.');
+                    workflowSessionReady = true;
+                    savedWorkflowRevision = workflowRevision;
+                    return true;
+                }
+            } catch (error) {
+                console.warn('[WORKFLOW] Could not restore previous session:', error && error.message ? error.message : error);
+            }
+        }
+
+        try {
+            if (await restoreCanonicalDefaultWorkflow()) {
                 workflowSessionReady = true;
                 savedWorkflowRevision = workflowRevision;
                 return true;
             }
-        } catch (error) {
-            console.warn('[WORKFLOW] Could not restore previous session:', error && error.message ? error.message : error);
+        } catch (defaultError) {
+            console.warn('[WORKFLOW] Could not restore bundled default workflow:', defaultError && defaultError.message ? defaultError.message : defaultError);
         }
+
+        // Last-resort fallback only if the shipped default is missing or corrupt.
         workflowSessionReady = true;
         savedWorkflowRevision = workflowRevision;
         return false;
@@ -6969,23 +7592,46 @@ function onNodeParamChange(el) {
 
     var mode = null;
     var selectedName = '';
+    var selectedLocalPath = '';
+    var selectedLocalPaths = [];
+    var selectionAnchorPath = '';
+    var filesystemMultiple = false;
+    var dragSelection = null;
     var previousFocus = null;
     var completionResolver = null;
     var busy = false;
+    var navigationSerial = 0;
+    var navigationPending = false;
+    var navigationHistory = [];
+    var navigationHistoryIndex = -1;
     var modalApi = root.Darkstar && root.Darkstar.modal;
     var coordinator = modalApi.createModalCoordinator({
         bodyClass: 'workflow-file-modal-open',
         overlayReason: 'workflow-file-modal'
     });
 
-    function bridge() {
+    function workflowBridge() {
         return root.darkstar && root.darkstar.workflow ? root.darkstar.workflow : null;
+    }
+
+    function modelBridge() {
+        return root.darkstar && root.darkstar.nodes ? root.darkstar.nodes : null;
+    }
+
+    function isFilesystemMode() {
+        return mode === 'model' || mode === 'projector' || mode === 'tool' || mode === 'skill' || mode === 'image';
+    }
+
+    function isFilesystemMultiMode() {
+        return (mode === 'tool' || mode === 'skill') && filesystemMultiple;
     }
 
     function elements() {
         return modalApi.resolveElements({
             modal: 'workflowFileModal', title: 'workflowFileModalTitle', subtitle: 'workflowFileModalSubtitle',
             nameSection: 'workflowFileNameSection', nameInput: 'workflowFileNameInput', pickerLabel: 'workflowFilePickerLabel',
+            pickerSection: 'workflowFilePickerSection', sidebar: 'workflowFileSidebar', historyControls: 'workflowFileHistoryControls',
+            backButton: 'workflowFileBackButton', forwardButton: 'workflowFileForwardButton',
             list: 'workflowFileList', empty: 'workflowFileEmpty', error: 'workflowFileModalError',
             abortButton: 'workflowFileAbortButton', commitButton: 'workflowFileCommitButton'
         });
@@ -7001,12 +7647,21 @@ function onNodeParamChange(el) {
         if (target) target.textContent = String(message || '');
     }
 
+    function setFieldCopy(label, hint, placeholder) {
+        var fieldLabel = document.querySelector('label[for="workflowFileNameInput"]');
+        var fieldHint = document.getElementById('workflowFileNameHint');
+        var input = document.getElementById('workflowFileNameInput');
+        if (fieldLabel) fieldLabel.textContent = label;
+        if (fieldHint) fieldHint.textContent = hint;
+        if (input) input.placeholder = placeholder;
+    }
+
     function updateCommitState() {
         var ui = elements();
         if (!ui.commitButton) return false;
-        var ready = mode === 'save'
-            ? Boolean(ui.nameInput && String(ui.nameInput.value || '').trim())
-            : Boolean(selectedName);
+        var ready = mode === 'save' ? Boolean(ui.nameInput && String(ui.nameInput.value || '').trim())
+            : isFilesystemMultiMode() ? selectedLocalPaths.length > 0
+            : isFilesystemMode() ? Boolean(selectedLocalPath) : Boolean(selectedName);
         ui.commitButton.disabled = busy || !ready;
         return ready;
     }
@@ -7015,7 +7670,12 @@ function onNodeParamChange(el) {
         var list = document.getElementById('workflowFileList');
         if (!list || typeof list.querySelectorAll !== 'function') return;
         list.querySelectorAll('.workflow-file-list-item').forEach(function(button) {
-            var active = String(button.dataset.workflowName || '') === selectedName;
+            var localPath = String(button.dataset.localPath || '');
+            var active = isFilesystemMultiMode()
+                ? Boolean(localPath) && selectedLocalPaths.indexOf(localPath) >= 0
+                : isFilesystemMode()
+                    ? Boolean(selectedLocalPath) && localPath === selectedLocalPath
+                    : String(button.dataset.workflowName || '') === selectedName;
             button.classList.toggle('selected', active);
             button.setAttribute('aria-selected', active ? 'true' : 'false');
         });
@@ -7030,13 +7690,65 @@ function onNodeParamChange(el) {
         updateCommitState();
     }
 
+    function selectLocalPath(pathValue) {
+        selectedLocalPath = String(pathValue || '');
+        setError('');
+        markSelection();
+        updateCommitState();
+    }
+
+    function setSelectedLocalPaths(paths, anchorPath) {
+        var unique = [];
+        (Array.isArray(paths) ? paths : []).forEach(function(value) {
+            var candidate = String(value || '');
+            if (candidate && unique.indexOf(candidate) < 0) unique.push(candidate);
+        });
+        selectedLocalPaths = unique;
+        selectedLocalPath = unique.length === 1 ? unique[0] : '';
+        if (anchorPath !== undefined) selectionAnchorPath = String(anchorPath || '');
+        setError('');
+        markSelection();
+        updateCommitState();
+    }
+
+    function selectableLocalPaths() {
+        var list = document.getElementById('workflowFileList');
+        if (!list || typeof list.querySelectorAll !== 'function') return [];
+        return Array.from(list.querySelectorAll('.workflow-file-list-item')).map(function(button) {
+            return String(button.dataset && button.dataset.localPath || '');
+        }).filter(Boolean);
+    }
+
+    function selectFilesystemPath(pathValue, event) {
+        var selected = String(pathValue || '');
+        if (!selected) return;
+        var ordered = selectableLocalPaths();
+        var selectedIndex = ordered.indexOf(selected);
+        var anchorIndex = ordered.indexOf(selectionAnchorPath);
+        var toggle = Boolean(event && (event.ctrlKey || event.metaKey));
+        if (event && event.shiftKey && selectedIndex >= 0 && anchorIndex >= 0) {
+            var start = Math.min(anchorIndex, selectedIndex);
+            var end = Math.max(anchorIndex, selectedIndex);
+            var range = ordered.slice(start, end + 1);
+            setSelectedLocalPaths(toggle ? selectedLocalPaths.concat(range) : range, selectionAnchorPath);
+            return;
+        }
+        if (toggle) {
+            var next = selectedLocalPaths.slice();
+            var existing = next.indexOf(selected);
+            if (existing >= 0) next.splice(existing, 1);
+            else next.push(selected);
+            setSelectedLocalPaths(next, selected);
+            return;
+        }
+        setSelectedLocalPaths([selected], selected);
+    }
+
     function renderList(files) {
         var ui = elements();
         if (!ui.list || !ui.empty) return;
         ui.list.textContent = '';
-        var names = Array.isArray(files)
-            ? files.filter(function(name) { return typeof name === 'string' && /\.dswf$/iu.test(name); })
-            : [];
+        var names = Array.isArray(files) ? files.filter(function(name) { return typeof name === 'string' && /\.dswf$/iu.test(name); }) : [];
         ui.empty.hidden = names.length > 0;
         ui.empty.textContent = names.length ? '' : 'No .dswf workflows are currently saved in ./workflows.';
         names.forEach(function(name) {
@@ -7056,37 +7768,288 @@ function onNodeParamChange(el) {
     async function refreshList() {
         var ui = elements();
         if (ui.list) ui.list.textContent = '';
-        if (ui.empty) {
-            ui.empty.hidden = false;
-            ui.empty.textContent = 'Loading workflows…';
-        }
-        var api = bridge();
+        if (ui.empty) { ui.empty.hidden = false; ui.empty.textContent = 'Loading workflows…'; }
+        var api = workflowBridge();
         if (!api || typeof api.list !== 'function') throw new Error('Workflow listing is unavailable in this build.');
         var response = await api.list();
-        if (!response || response.success !== true) {
-            throw new Error(response && response.error ? response.error : 'The workflows directory could not be read.');
-        }
+        if (!response || response.success !== true) throw new Error(response && response.error ? response.error : 'The workflows directory could not be read.');
         renderList(response.files);
         return Array.isArray(response.files) ? response.files : [];
+    }
+
+    var LOCAL_ENTRY_ICONS = Object.freeze({
+        folder: ['M3.5 7.5h6l1.8 2H20v9.5H3.5z', 'M3.5 7.5V5h6l1.8 2H20v2.5'],
+        drive: ['M4 7h16v10H4z', 'M7 13.5h.01M10 13.5h7'],
+        computer: ['M3.5 5h17v11h-17z', 'M8 20h8M12 16v4'],
+        parent: ['M12 18V7', 'm7 12 5-5 5 5'],
+        model: ['M6 3.5h8l4 4v13H6z', 'M14 3.5v4h4', 'M9 12h6M9 16h6'],
+        projector: ['M6 3.5h8l4 4v13H6z', 'M14 3.5v4h4', 'M9 12.5h6v4H9z'],
+        tool: ['M6 3.5h8l4 4v13H6z', 'M14 3.5v4h4', 'm10 12-2 2 2 2M14 12l2 2-2 2M13 11l-2 6'],
+        skill: ['M6 3.5h8l4 4v13H6z', 'M14 3.5v4h4', 'M9 12h6M9 16h4'],
+        image: ['M5 4h14v16H5z', 'm7 9 3 3 2-2 3 4M9 9h.01'],
+    });
+
+    function appendLocalEntryIcon(button, iconType) {
+        var namespace = 'http://www.w3.org/2000/svg';
+        var icon = document.createElementNS(namespace, 'svg');
+        var kind = Object.prototype.hasOwnProperty.call(LOCAL_ENTRY_ICONS, iconType) ? iconType : 'model';
+        icon.setAttribute('class', 'workflow-file-entry-icon ' + kind);
+        icon.setAttribute('viewBox', '0 0 24 24');
+        icon.setAttribute('aria-hidden', 'true');
+        LOCAL_ENTRY_ICONS[kind].forEach(function(pathData) {
+            var path = document.createElementNS(namespace, 'path');
+            path.setAttribute('d', pathData);
+            icon.appendChild(path);
+        });
+        button.appendChild(icon);
+    }
+
+    function localEntryButton(entry, onClick) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'workflow-file-list-item';
+        button.setAttribute('role', 'option');
+        button.setAttribute('aria-selected', 'false');
+        appendLocalEntryIcon(button, String(entry.iconType || entry.type || 'model'));
+        var label = document.createElement('span');
+        label.className = 'workflow-file-entry-label';
+        label.textContent = String(entry.name || '');
+        button.appendChild(label);
+        if (entry.type === 'model' || entry.type === 'projector' || entry.type === 'tool' || entry.type === 'skill' || entry.type === 'image') button.dataset.localPath = String(entry.path || '');
+        button.addEventListener('click', onClick);
+        return button;
+    }
+
+    function removeDragSelectionBox() {
+        if (dragSelection && dragSelection.box && dragSelection.box.parentNode) dragSelection.box.parentNode.removeChild(dragSelection.box);
+        if (dragSelection) dragSelection.box = null;
+    }
+
+    function resetDragSelection() {
+        removeDragSelectionBox();
+        dragSelection = null;
+    }
+
+    function beginFilesystemDragSelection(event) {
+        var ui = elements();
+        if (!isFilesystemMultiMode() || busy || navigationPending || !ui.list || event.button !== 0 || event.target !== ui.list) return;
+        var bounds = ui.list.getBoundingClientRect ? ui.list.getBoundingClientRect() : null;
+        if (!bounds || event.clientX >= bounds.right - 14) return;
+        event.preventDefault();
+        dragSelection = {
+            startX: event.clientX, startY: event.clientY, moved: false, box: null,
+            basePaths: (event.ctrlKey || event.metaKey) ? selectedLocalPaths.slice() : [],
+        };
+    }
+
+    function updateFilesystemDragSelection(event) {
+        if (!dragSelection || !isFilesystemMultiMode()) return;
+        var ui = elements();
+        if (!ui.list) return;
+        var dx = event.clientX - dragSelection.startX;
+        var dy = event.clientY - dragSelection.startY;
+        if (!dragSelection.moved && Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
+        dragSelection.moved = true;
+        event.preventDefault();
+        var bounds = ui.list.getBoundingClientRect();
+        var endX = Math.max(bounds.left, Math.min(bounds.right, event.clientX));
+        var endY = Math.max(bounds.top, Math.min(bounds.bottom, event.clientY));
+        var left = Math.min(dragSelection.startX, endX);
+        var top = Math.min(dragSelection.startY, endY);
+        var right = Math.max(dragSelection.startX, endX);
+        var bottom = Math.max(dragSelection.startY, endY);
+        if (!dragSelection.box) {
+            dragSelection.box = document.createElement('div');
+            dragSelection.box.className = 'workflow-file-selection-marquee';
+            document.body.appendChild(dragSelection.box);
+        }
+        dragSelection.box.style.left = left + 'px';
+        dragSelection.box.style.top = top + 'px';
+        dragSelection.box.style.width = Math.max(1, right - left) + 'px';
+        dragSelection.box.style.height = Math.max(1, bottom - top) + 'px';
+        var hitPaths = [];
+        Array.from(ui.list.querySelectorAll('.workflow-file-list-item')).forEach(function(button) {
+            var localPath = String(button.dataset && button.dataset.localPath || '');
+            if (!localPath || !button.getBoundingClientRect) return;
+            var rect = button.getBoundingClientRect();
+            if (rect.right >= left && rect.left <= right && rect.bottom >= top && rect.top <= bottom) hitPaths.push(localPath);
+        });
+        setSelectedLocalPaths(dragSelection.basePaths.concat(hitPaths), selectionAnchorPath);
+    }
+
+    function finishFilesystemDragSelection() {
+        if (!dragSelection) return;
+        var moved = dragSelection.moved;
+        resetDragSelection();
+        if (!moved) setSelectedLocalPaths([], '');
+        else if (selectedLocalPaths.length) selectionAnchorPath = selectedLocalPaths[selectedLocalPaths.length - 1];
+    }
+
+    function updateFilesystemHistoryControls() {
+        var ui = elements();
+        var enabled = isFilesystemMode() && !navigationPending;
+        if (ui.backButton) ui.backButton.disabled = !enabled || navigationHistoryIndex <= 0;
+        if (ui.forwardButton) ui.forwardButton.disabled = !enabled || navigationHistoryIndex < 0 || navigationHistoryIndex >= navigationHistory.length - 1;
+    }
+
+    function commitFilesystemHistory(response, targetIndex) {
+        var location = { path: String(response && response.currentPath || ''), root: !String(response && response.currentPath || '') };
+        if (Number.isInteger(targetIndex)) {
+            navigationHistoryIndex = targetIndex;
+            navigationHistory[targetIndex] = location;
+        } else {
+            var current = navigationHistory[navigationHistoryIndex];
+            if (!current || current.path !== location.path || current.root !== location.root) {
+                navigationHistory = navigationHistory.slice(0, navigationHistoryIndex + 1);
+                navigationHistory.push(location);
+                navigationHistoryIndex = navigationHistory.length - 1;
+            }
+        }
+        updateFilesystemHistoryControls();
+    }
+
+    function navigateFilesystemHistory(offset) {
+        if (!isActive() || !isFilesystemMode() || navigationPending) return false;
+        var targetIndex = navigationHistoryIndex + Number(offset || 0);
+        if (targetIndex < 0 || targetIndex >= navigationHistory.length) return false;
+        var target = navigationHistory[targetIndex];
+        return navigateFilesystemDirectory(target.path, target.root === true, false, targetIndex);
+    }
+
+    function renderFilesystemSidebar(locations) {
+        var ui = elements();
+        if (!ui.sidebar || typeof ui.sidebar.querySelectorAll !== 'function') return;
+        var byId = Object.create(null);
+        (Array.isArray(locations) ? locations : []).forEach(function(location) {
+            if (location && location.id) byId[String(location.id)] = location;
+        });
+        ui.sidebar.querySelectorAll('.workflow-file-sidebar-item').forEach(function(button) {
+            var location = byId[String(button.dataset.filesystemLocation || '')] || null;
+            var available = Boolean(location && location.available === true);
+            button.disabled = !available;
+            button.dataset.localPath = available ? String(location.path || '') : '';
+            button.dataset.rootView = available && location.root === true ? 'true' : 'false';
+            button.classList.toggle('active', available && location.active === true);
+            if (available && location.active === true) button.setAttribute('aria-current', 'location');
+            else button.removeAttribute('aria-current');
+            button.title = available ? String(location.path || location.label || 'Computer') : String(button.textContent || '').trim() + ' is unavailable.';
+        });
+    }
+
+    function renderFilesystemDirectory(response) {
+        var ui = elements();
+        if (!ui.list || !ui.empty) return;
+        resetDragSelection();
+        ui.list.textContent = '';
+        renderFilesystemSidebar(response && response.sidebar);
+        selectedLocalPath = String(response && response.selectedPath || '');
+        selectedLocalPaths = isFilesystemMultiMode() && selectedLocalPath ? [selectedLocalPath] : [];
+        selectionAnchorPath = selectedLocalPaths[0] || '';
+        ui.list.classList.toggle('tool-multi-select', isFilesystemMultiMode());
+        if (isFilesystemMultiMode()) ui.list.setAttribute('aria-multiselectable', 'true');
+        else ui.list.removeAttribute('aria-multiselectable');
+        if (ui.nameInput) {
+            ui.nameInput.value = String(response && response.currentPath || '');
+            ui.nameInput.placeholder = response && response.currentPath ? 'Absolute path' : 'Computer';
+        }
+        var parentPath = response ? response.parentPath : null;
+        if (parentPath !== null && parentPath !== undefined) {
+            ui.list.appendChild(localEntryButton({ name: parentPath === '' ? 'Computer' : '..', path: parentPath, type: 'directory', iconType: parentPath === '' ? 'computer' : 'parent' }, function() {
+                navigateFilesystemDirectory(parentPath, parentPath === '', false);
+            }));
+        }
+        var fileType = mode;
+        var entries = response && Array.isArray(response.entries) ? response.entries : [];
+        var rootListing = !String(response && response.currentPath || '');
+        entries.forEach(function(entry) {
+            if (!entry || (entry.type !== 'directory' && entry.type !== fileType) || !entry.path) return;
+            entry.iconType = entry.type === 'directory' ? (rootListing ? 'drive' : 'folder') : entry.type;
+            var button = localEntryButton(entry, function(event) {
+                if (entry.type === 'directory') navigateFilesystemDirectory(entry.path, false, false);
+                else if (isFilesystemMultiMode()) selectFilesystemPath(entry.path, event);
+                else selectLocalPath(entry.path);
+            });
+            if (entry.type === fileType) {
+                button.addEventListener('dblclick', function() {
+                    if (isFilesystemMultiMode()) setSelectedLocalPaths([entry.path], entry.path);
+                    else selectLocalPath(entry.path);
+                    commit();
+                });
+            }
+            ui.list.appendChild(button);
+        });
+        ui.empty.hidden = Boolean(ui.list.children.length);
+        ui.empty.textContent = ui.list.children.length ? '' : (mode === 'projector'
+            ? 'No folders or selectable projector files are available here.'
+            : mode === 'tool' ? 'No folders or selectable Python tool files are available here.'
+                : mode === 'skill' ? 'No folders or SKILL.md files are available here.'
+                    : mode === 'image' ? 'No folders or supported image files are available here.'
+                        : 'No folders or selectable .gguf model files are available here.');
+        markSelection();
+        updateCommitState();
+    }
+
+    async function navigateFilesystemDirectory(pathValue, rootView, parentOfFile, historyTargetIndex) {
+        if (!isActive() || !isFilesystemMode()) return false;
+        var activeMode = mode;
+        var api = modelBridge();
+        if (!api || typeof api.browseModelFiles !== 'function') throw new Error('Local filesystem browsing is unavailable in this build.');
+        var serial = ++navigationSerial;
+        var ui = elements();
+        navigationPending = true;
+        updateFilesystemHistoryControls();
+        selectedLocalPath = '';
+        selectedLocalPaths = [];
+        selectionAnchorPath = '';
+        updateCommitState();
+        setError('');
+        if (ui.list) ui.list.textContent = '';
+        if (ui.empty) { ui.empty.hidden = false; ui.empty.textContent = 'Reading local filesystem…'; }
+        try {
+            var request = rootView ? { root: true, kind: activeMode } : (pathValue ? { path: String(pathValue), kind: activeMode, parentOfFile: parentOfFile === true } : { kind: activeMode });
+            var response = await api.browseModelFiles(request);
+            if (serial !== navigationSerial || !isActive() || mode !== activeMode) return false;
+            if (!response || response.success !== true) throw new Error(response && response.error ? response.error : 'The local directory could not be read.');
+            renderFilesystemDirectory(response);
+            navigationPending = false;
+            commitFilesystemHistory(response, historyTargetIndex);
+            return true;
+        } catch (error) {
+            if (serial !== navigationSerial || !isActive() || mode !== activeMode) return false;
+            navigationPending = false;
+            updateFilesystemHistoryControls();
+            if (ui.empty) { ui.empty.hidden = false; ui.empty.textContent = 'The directory could not be displayed.'; }
+            setError(error && error.message ? error.message : String(error));
+            updateCommitState();
+            return false;
+        }
     }
 
     function close(result) {
         var ui = elements();
         var focusTarget = previousFocus;
         var resolver = completionResolver;
+        var closingMode = mode;
         previousFocus = null;
         completionResolver = null;
         mode = null;
         selectedName = '';
+        selectedLocalPath = '';
+        selectedLocalPaths = [];
+        selectionAnchorPath = '';
+        filesystemMultiple = false;
+        resetDragSelection();
         busy = false;
-        if (ui.modal) {
-            ui.modal.classList.remove('active');
-            ui.modal.setAttribute('aria-hidden', 'true');
-        }
+        navigationPending = false;
+        navigationHistory = [];
+        navigationHistoryIndex = -1;
+        navigationSerial += 1;
+        updateFilesystemHistoryControls();
+        if (ui.modal) { ui.modal.classList.remove('active'); ui.modal.setAttribute('aria-hidden', 'true'); }
         coordinator.blockBackground(false);
         coordinator.setNativeOverlayBlocked(false);
         coordinator.restoreFocus(focusTarget);
-        if (typeof resolver === 'function') resolver(result === true);
+        if (typeof resolver === 'function') resolver(['model', 'projector', 'tool', 'skill', 'image'].indexOf(closingMode) >= 0 ? result : result === true);
         return true;
     }
 
@@ -7097,12 +8060,65 @@ function onNodeParamChange(el) {
 
     async function commit() {
         if (!isActive() || busy) return false;
-        var api = bridge();
         var ui = elements();
         try {
             busy = true;
             updateCommitState();
             setError('');
+            if (isFilesystemMode()) {
+                var selectedPath = String(selectedLocalPath || '');
+                var modelApi = modelBridge();
+                if (mode === 'tool') {
+                    var requestedPaths = isFilesystemMultiMode() ? selectedLocalPaths.slice() : (selectedPath ? [selectedPath] : []);
+                    if (!requestedPaths.length) throw new Error(filesystemMultiple ? 'Choose one or more Python tool files.' : 'Choose a Python tool file.');
+                    if (!modelApi || typeof modelApi.browseModelFiles !== 'function') throw new Error('Local tool validation is unavailable in this build.');
+                    var validatedPaths = [];
+                    for (var toolIndex = 0; toolIndex < requestedPaths.length; toolIndex++) {
+                        var toolValidation = await modelApi.browseModelFiles({ kind: 'tool', path: requestedPaths[toolIndex] });
+                        if (!toolValidation || toolValidation.success !== true || !toolValidation.selectedPath) throw new Error(toolValidation && toolValidation.error ? toolValidation.error : 'A selected Python tool could not be validated.');
+                        var validatedPath = String(toolValidation.selectedPath);
+                        if (validatedPaths.indexOf(validatedPath) < 0) validatedPaths.push(validatedPath);
+                    }
+                    close({ paths: validatedPaths, path: validatedPaths[0], fileName: String(validatedPaths[0]).split(/[\\/]/).pop() || String(validatedPaths[0]) });
+                    return true;
+                }
+                if (mode === 'skill') {
+                    var skillPaths = isFilesystemMultiMode() ? selectedLocalPaths.slice() : (selectedPath ? [selectedPath] : []);
+                    if (!skillPaths.length) throw new Error(filesystemMultiple ? 'Choose one or more SKILL.md files.' : 'Choose a SKILL.md file.');
+                    if (!modelApi || typeof modelApi.browseModelFiles !== 'function') throw new Error('Local skill validation is unavailable in this build.');
+                    var validatedSkills = [];
+                    for (var skillIndex = 0; skillIndex < skillPaths.length; skillIndex++) {
+                        var skillValidation = await modelApi.browseModelFiles({ kind: 'skill', path: skillPaths[skillIndex] });
+                        if (!skillValidation || skillValidation.success !== true || !skillValidation.selectedPath) throw new Error(skillValidation && skillValidation.error ? skillValidation.error : 'A selected skill could not be validated.');
+                        var validatedSkillPath = String(skillValidation.selectedPath);
+                        if (validatedSkills.indexOf(validatedSkillPath) < 0) validatedSkills.push(validatedSkillPath);
+                    }
+                    close({ paths: validatedSkills, path: validatedSkills[0], fileName: String(validatedSkills[0]).split(/[\\/]/).pop() || String(validatedSkills[0]) });
+                    return true;
+                }
+                if (!selectedPath) throw new Error(mode === 'projector' ? 'Choose a projector file.' : mode === 'image' ? 'Choose an image file.' : 'Choose a .gguf model file.');
+                if (mode === 'image') {
+                    if (!modelApi || typeof modelApi.browseModelFiles !== 'function') throw new Error('Local image validation is unavailable in this build.');
+                    var imageValidation = await modelApi.browseModelFiles({ kind: 'image', path: selectedPath, includeData: true });
+                    if (!imageValidation || imageValidation.success !== true || !imageValidation.selectedPath || !imageValidation.selectedFile) throw new Error(imageValidation && imageValidation.error ? imageValidation.error : 'The selected image could not be loaded.');
+                    close({ path: String(imageValidation.selectedPath), fileName: String(imageValidation.selectedFile.name || ''), image: imageValidation.selectedFile });
+                    return true;
+                }
+                if (mode === 'projector') {
+                    if (!modelApi || typeof modelApi.browseModelFiles !== 'function') throw new Error('Local projector validation is unavailable in this build.');
+                    var validated = await modelApi.browseModelFiles({ kind: 'projector', path: selectedPath });
+                    if (!validated || validated.success !== true || !validated.selectedPath) throw new Error(validated && validated.error ? validated.error : 'The selected projector could not be validated.');
+                    close({ path: String(validated.selectedPath), fileName: String(validated.selectedPath).split(/[\\/]/).pop() || String(validated.selectedPath) });
+                    return true;
+                }
+                if (!modelApi || typeof modelApi.inspectModel !== 'function') throw new Error('Local GGUF validation is unavailable in this build.');
+                var inspected = await modelApi.inspectModel(selectedPath);
+                if (!inspected || inspected.success !== true || !inspected.model) throw new Error(inspected && inspected.error ? inspected.error : 'The selected GGUF model could not be validated.');
+                close({ path: String(inspected.model.id || selectedPath), model: inspected.model });
+                return true;
+            }
+
+            var api = workflowBridge();
             if (mode === 'save') {
                 var requestedName = ui.nameInput ? String(ui.nameInput.value || '').trim() : '';
                 if (!requestedName) throw new Error('Enter a workflow name before committing the save.');
@@ -7118,9 +8134,7 @@ function onNodeParamChange(el) {
             if (!api || typeof api.load !== 'function') throw new Error('Workflow loading is unavailable in this build.');
             var loaded = await api.load({ fileName: fileName });
             if (!loaded || loaded.success !== true) throw new Error(loaded && loaded.error ? loaded.error : 'The workflow could not be loaded.');
-            var result = loaded.kind === 'legacy-json'
-                ? root.restoreWorkflowDocument(loaded.document)
-                : root.restoreWorkflowSnapshot(loaded.snapshot);
+            var result = loaded.kind === 'legacy-json' ? await root.restoreWorkflowDocument(loaded.document) : await root.restoreWorkflowSnapshot(loaded.snapshot);
             root.scheduleWorkflowSessionSave(0);
             close(true);
             if (result.unrecognizedNames.length) root.showNodeEditorToast('Unrecognized Nodes: ' + result.unrecognizedNames.join(', '), 'warning', 7600);
@@ -7134,49 +8148,121 @@ function onNodeParamChange(el) {
         }
     }
 
-    function open(requestedMode) {
+    function open(requestedMode, options) {
         if (isActive()) return Promise.resolve(false);
         var ui = elements();
         if (!ui.modal || !ui.title || !ui.list || !ui.commitButton || !ui.abortButton) {
             root.showNodeEditorToast('Workflow dialog is unavailable in this build.', 'error', 5600);
             return Promise.resolve(false);
         }
-        mode = requestedMode === 'load' ? 'load' : 'save';
+        mode = ['model', 'projector', 'tool', 'skill', 'image'].indexOf(requestedMode) >= 0 ? requestedMode : requestedMode === 'load' ? 'load' : 'save';
         selectedName = '';
+        selectedLocalPath = '';
+        selectedLocalPaths = [];
+        selectionAnchorPath = '';
+        filesystemMultiple = (mode === 'tool' || mode === 'skill') && Boolean(options && options.multiple === true);
+        resetDragSelection();
         busy = false;
+        navigationPending = false;
+        navigationHistory = [];
+        navigationHistoryIndex = -1;
+        navigationSerial += 1;
         previousFocus = document.activeElement && document.activeElement !== document.body ? document.activeElement : null;
         setError('');
+        var filesystemMode = isFilesystemMode();
+        if (ui.modal) ui.modal.classList.toggle('filesystem-mode', filesystemMode);
+        if (ui.pickerSection) ui.pickerSection.classList.toggle('filesystem-mode', filesystemMode);
+        if (ui.sidebar) ui.sidebar.hidden = !filesystemMode;
+        if (ui.historyControls) ui.historyControls.hidden = !filesystemMode;
+        if (filesystemMode) renderFilesystemSidebar([]);
+        updateFilesystemHistoryControls();
         if (mode === 'save') {
             ui.title.textContent = 'Save Workflow';
             if (ui.subtitle) ui.subtitle.textContent = 'Enter a required name, or choose an existing workflow below to replace it. Files stay inside ./workflows.';
             if (ui.nameSection) ui.nameSection.hidden = false;
             if (ui.nameInput) ui.nameInput.value = '';
+            setFieldCopy('Name', 'A name is required. The saved file will use the .dswf extension.', 'Enter workflow name');
             if (ui.pickerLabel) ui.pickerLabel.textContent = 'Existing workflows';
             ui.commitButton.textContent = 'Commit';
-        } else {
+            ui.abortButton.textContent = 'Abort';
+        } else if (mode === 'load') {
             ui.title.textContent = 'Load Workflow';
             if (ui.subtitle) ui.subtitle.textContent = 'Choose a .dswf workflow from ./workflows.';
             if (ui.nameSection) ui.nameSection.hidden = true;
+            setFieldCopy('Name', 'A name is required. The saved file will use the .dswf extension.', 'Enter workflow name');
             if (ui.pickerLabel) ui.pickerLabel.textContent = 'Available workflows';
             ui.commitButton.textContent = 'Load';
+            ui.abortButton.textContent = 'Abort';
+        } else if (mode === 'projector') {
+            ui.title.textContent = 'Browse Local Filesystem';
+            if (ui.subtitle) ui.subtitle.textContent = 'Choose a local projector using Darkstar’s filesystem browser. No native file dialog is opened.';
+            if (ui.nameSection) ui.nameSection.hidden = false;
+            if (ui.nameInput) ui.nameInput.value = '';
+            setFieldCopy('Location', 'Folders and .mproj, .mmproj, or projector .gguf files only. Enter an absolute path and press Enter to navigate.', 'Absolute path');
+            if (ui.pickerLabel) ui.pickerLabel.textContent = 'Folders and projectors';
+            ui.commitButton.textContent = 'Select Projector';
+            ui.abortButton.textContent = 'Cancel';
+        } else if (mode === 'tool') {
+            ui.title.textContent = 'Browse Local Filesystem';
+            if (ui.subtitle) ui.subtitle.textContent = filesystemMultiple ? 'Choose one or more Python tool files. Ctrl-click toggles files, Shift-click selects a range, and dragging empty space selects multiple files.' : 'Choose a Python tool file using Darkstar’s filesystem browser.';
+            if (ui.nameSection) ui.nameSection.hidden = false;
+            if (ui.nameInput) ui.nameInput.value = '';
+            setFieldCopy('Location', 'Folders and .py tool files only. Enter an absolute path and press Enter to navigate.', 'Absolute path');
+            if (ui.pickerLabel) ui.pickerLabel.textContent = filesystemMultiple ? 'Folders and Python tools · Multi-select' : 'Folders and Python tools';
+            ui.commitButton.textContent = filesystemMultiple ? 'Add Selected Tools' : 'Select Tool';
+            ui.abortButton.textContent = 'Cancel';
+        } else if (mode === 'skill') {
+            ui.title.textContent = 'Browse Local Filesystem';
+            if (ui.subtitle) ui.subtitle.textContent = filesystemMultiple ? 'Choose one or more SKILL.md files. Ctrl-click toggles files, Shift-click selects a range, and dragging empty space selects multiple files.' : 'Choose a SKILL.md file using Darkstar’s filesystem browser.';
+            if (ui.nameSection) ui.nameSection.hidden = false;
+            if (ui.nameInput) ui.nameInput.value = '';
+            setFieldCopy('Location', 'Folders and SKILL.md files only. Enter an absolute path and press Enter to navigate.', 'Absolute path');
+            if (ui.pickerLabel) ui.pickerLabel.textContent = filesystemMultiple ? 'Folders and skills · Multi-select' : 'Folders and skills';
+            ui.commitButton.textContent = filesystemMultiple ? 'Add Selected Skills' : 'Select Skill';
+            ui.abortButton.textContent = 'Cancel';
+        } else if (mode === 'image') {
+            ui.title.textContent = 'Browse Local Filesystem';
+            if (ui.subtitle) ui.subtitle.textContent = 'Choose an image using Darkstar’s filesystem browser. No native file dialog is opened.';
+            if (ui.nameSection) ui.nameSection.hidden = false;
+            if (ui.nameInput) ui.nameInput.value = '';
+            setFieldCopy('Location', 'Folders and supported image files only. Enter an absolute path and press Enter to navigate.', 'Absolute path');
+            if (ui.pickerLabel) ui.pickerLabel.textContent = 'Folders and images';
+            ui.commitButton.textContent = 'Select Image';
+            ui.abortButton.textContent = 'Cancel';
+        } else {
+            ui.title.textContent = 'Browse Local Filesystem';
+            if (ui.subtitle) ui.subtitle.textContent = 'Choose a local .gguf model using Darkstar’s filesystem browser. No native file dialog is opened.';
+            if (ui.nameSection) ui.nameSection.hidden = false;
+            if (ui.nameInput) ui.nameInput.value = '';
+            setFieldCopy('Location', 'Folders and .gguf model files only. Enter an absolute path and press Enter to navigate.', 'Absolute path');
+            if (ui.pickerLabel) ui.pickerLabel.textContent = 'Folders and GGUF models';
+            ui.commitButton.textContent = 'Select Model';
+            ui.abortButton.textContent = 'Cancel';
         }
-        ui.abortButton.textContent = 'Abort';
         updateCommitState();
         ui.modal.classList.add('active');
         ui.modal.setAttribute('aria-hidden', 'false');
         coordinator.blockBackground(true);
         coordinator.setNativeOverlayBlocked(true);
         var completion = new Promise(function(resolve) { completionResolver = resolve; });
-        refreshList().then(function() {
-            if (!isActive()) return;
-            if (mode === 'save' && ui.nameInput) coordinator.focus(ui.nameInput);
-            else coordinator.focus((ui.list.querySelector && ui.list.querySelector('.workflow-file-list-item')) || ui.abortButton);
-        }).catch(function(error) {
-            if (!isActive()) return;
-            renderList([]);
-            setError(error && error.message ? error.message : String(error));
-            coordinator.focus(mode === 'save' && ui.nameInput ? ui.nameInput : ui.abortButton);
-        });
+        if (isFilesystemMode()) {
+            var initialPath = options && options.initialPath ? String(options.initialPath) : '';
+            navigateFilesystemDirectory(initialPath, false, true).then(function() {
+                if (!isActive() || !isFilesystemMode()) return;
+                coordinator.focus(ui.nameInput || ui.abortButton);
+            });
+        } else {
+            refreshList().then(function() {
+                if (!isActive()) return;
+                if (mode === 'save' && ui.nameInput) coordinator.focus(ui.nameInput);
+                else coordinator.focus((ui.list.querySelector && ui.list.querySelector('.workflow-file-list-item')) || ui.abortButton);
+            }).catch(function(error) {
+                if (!isActive()) return;
+                renderList([]);
+                setError(error && error.message ? error.message : String(error));
+                coordinator.focus(mode === 'save' && ui.nameInput ? ui.nameInput : ui.abortButton);
+            });
+        }
         return completion;
     }
 
@@ -7184,17 +8270,38 @@ function onNodeParamChange(el) {
         var ui = elements();
         if (ui.abortButton) ui.abortButton.addEventListener('click', abort);
         if (ui.commitButton) ui.commitButton.addEventListener('click', function() { commit(); });
+        if (ui.backButton) ui.backButton.addEventListener('click', function() { navigateFilesystemHistory(-1); });
+        if (ui.forwardButton) ui.forwardButton.addEventListener('click', function() { navigateFilesystemHistory(1); });
+        if (ui.list) ui.list.addEventListener('mousedown', beginFilesystemDragSelection);
+        document.addEventListener('mousemove', updateFilesystemDragSelection);
+        document.addEventListener('mouseup', finishFilesystemDragSelection);
+        if (ui.sidebar && typeof ui.sidebar.querySelectorAll === 'function') {
+            ui.sidebar.querySelectorAll('.workflow-file-sidebar-item').forEach(function(button) {
+                button.addEventListener('click', function() {
+                    if (!isActive() || !isFilesystemMode() || button.disabled) return;
+                    navigateFilesystemDirectory(String(button.dataset.localPath || ''), button.dataset.rootView === 'true', false);
+                });
+            });
+        }
         if (ui.nameInput) {
             ui.nameInput.addEventListener('input', function() {
-                selectedName = '';
+                if (isFilesystemMode()) {
+                    selectedLocalPath = '';
+                    selectedLocalPaths = [];
+                    selectionAnchorPath = '';
+                } else selectedName = '';
                 markSelection();
                 setError('');
                 updateCommitState();
             });
             ui.nameInput.addEventListener('keydown', function(event) {
-                if (event.key !== 'Enter' || ui.commitButton.disabled) return;
+                if (event.key !== 'Enter') return;
                 event.preventDefault();
-                commit();
+                if (isFilesystemMode()) {
+                    navigateFilesystemDirectory(String(ui.nameInput.value || '').trim(), false, false);
+                    return;
+                }
+                if (!ui.commitButton.disabled) commit();
             });
         }
         document.addEventListener('keydown', function(event) {
@@ -7211,6 +8318,26 @@ function onNodeParamChange(el) {
         isActive: isActive,
         openSave: function() { return open('save'); },
         openLoad: function() { return open('load'); }
+    });
+    root.Darkstar.modelFiles = Object.freeze({
+        isActive: isActive,
+        open: function(options) { return open('model', options || {}); }
+    });
+    root.Darkstar.projectorFiles = Object.freeze({
+        isActive: isActive,
+        open: function(options) { return open('projector', options || {}); }
+    });
+    root.Darkstar.toolFiles = Object.freeze({
+        isActive: isActive,
+        open: function(options) { return open('tool', options || {}); }
+    });
+    root.Darkstar.skillFiles = Object.freeze({
+        isActive: isActive,
+        open: function(options) { return open('skill', options || {}); }
+    });
+    root.Darkstar.imageFiles = Object.freeze({
+        isActive: isActive,
+        open: function(options) { return open('image', options || {}); }
     });
 })(globalThis);
 // <DARKSTAR_SOURCE_END path="backend/renderer/workflow-file-modal.js">
@@ -7594,7 +8721,7 @@ function adaptPrimaryOutput(nodeId, output, graphNodes) {
             reasoning: output.reasoning || '',
             usage: output.usage || null,
             contextUsage: output.contextUsage || null,
-            finishReason: output.finishReason || null,
+            finishReason: output.finishReason || null, stopDetails: output.stopDetails && typeof output.stopDetails === 'object' ? structuredClone(output.stopDetails) : null, browserCompartmentActivated: output.browserCompartmentActivated === true,
             working: Array.isArray(output.working) ? output.working : [],
             toolMessages: Array.isArray(output.toolMessages) ? output.toolMessages : [],
             agentTimeline: Array.isArray(output.agentTimeline) ? output.agentTimeline : [],
@@ -7953,7 +9080,7 @@ async function executeGraphToNodeType(nodeType, context) {
 function isGraphReady() {
     return traceGraph().valid;
 }
-    // <DARKSTAR_SOURCE_END path="backend/renderer/graph-execution.js">
+// <DARKSTAR_SOURCE_END path="backend/renderer/graph-execution.js">
     // --------------------------------------------------------------------------
     // [9600] CANONICAL CHAT STATE :: atomic tools, context contract, projects and workspace
     // --------------------------------------------------------------------------
@@ -8863,7 +9990,7 @@ function clearComposerForProjectSwitch() {
     var input = document.getElementById('messageInput');
     if (input) {
         input.value = '';
-        input.style.height = 'auto';
+        input.style.height = 'auto'; input.style.overflowY = 'hidden';
     }
     if (typeof pendingImage !== 'undefined') pendingImage = null;
     if (typeof removeImage === 'function') removeImage();
@@ -9888,6 +11015,17 @@ function workspaceStateForWorkspaceId(workspaceId) {
     return found;
 }
 
+function applyWorkspaceRootFromAttention(workspaceId, response) {
+    if (!response || !response.root) return false;
+    var state = workspaceStateForWorkspaceId(workspaceId), match = /^project-(\d+)$/.exec(String(workspaceId || ''));
+    if (!state && match) state = workspaceStateForProject(Number(match[1]));
+    if (!state) return false;
+    Object.assign(state, { generation: state.generation + 1, root: response.root, entriesByDirectory: new Map([['', Array.isArray(response.entries) ? response.entries : []]]), expandedDirectories: new Set(['']), selectedPath: null, error: null });
+    if (isWorkspaceStateActive(state)) renderWorkspaceFiles(); if (typeof renderProjects === 'function') renderProjects(); if (typeof syncProjectComposerGate === 'function') syncProjectComposerGate();
+    if (typeof updateModelReadyState === 'function') updateModelReadyState(); if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
+    return true;
+}
+
 function scheduleWorkspaceRefresh(payload) {
     var state = payload && payload.workspaceId ? workspaceStateForWorkspaceId(payload.workspaceId) : workspaceExplorerState;
     if (!state) return;
@@ -9997,6 +11135,188 @@ if (typeof document !== 'undefined' && document && typeof document.addEventListe
     }, true);
 }
     // <DARKSTAR_SOURCE_END path="backend/renderer/workspace.js">
+    // RENDERER MODULE :: backend/renderer/attention.js
+    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/attention.js">
+// === ATTENTION.JS ===
+// Reusable renderer-side attention surface. Tool execution remains suspended
+// inside Core until the user resolves the current request.
+var agentAttentionRequests = new Map();
+var agentAttentionErrors = new Map();
+var agentAttentionBusyRequestId = '';
+var agentAttentionInitialized = false;
+var agentAttentionUnsubscribers = [];
+
+function agentAttentionBridge() {
+    return window.darkstar && window.darkstar.attention ? window.darkstar.attention : null;
+}
+function normalizeAgentAttentionRequest(value) {
+    if (!value || typeof value !== 'object') return null;
+    var id = String(value.id || '').trim();
+    if (!id) return null;
+    return {
+        id: id,
+        kind: String(value.kind || ''),
+        status: String(value.status || 'active'),
+        workspaceId: String(value.workspaceId || ''),
+        requiresProjectIdle: value.requiresProjectIdle === true,
+        tabId: value.tabId !== undefined && value.tabId !== null && Number.isFinite(Number(value.tabId)) ? Number(value.tabId) : null,
+        projectId: value.projectId !== undefined && value.projectId !== null && Number.isFinite(Number(value.projectId)) ? Number(value.projectId) : null,
+        createdAt: String(value.createdAt || ''),
+        decisionMode: String(value.decisionMode || 'allow-reject') === 'yes-no' ? 'yes-no' : 'allow-reject',
+        title: String(value.title || 'Permission required'),
+        prompt: String(value.prompt || 'A model action is waiting for your decision.')
+    };
+}
+function orderedAgentAttentionRequests() {
+    return Array.from(agentAttentionRequests.values()).sort(function(left, right) {
+        return String(left.createdAt || '').localeCompare(String(right.createdAt || ''));
+    });
+}
+function agentAttentionRequestsForTab(tabId) {
+    if (tabId === undefined || tabId === null) return [];
+    var numericTabId = Number(tabId);
+    if (!Number.isFinite(numericTabId)) return [];
+    return orderedAgentAttentionRequests().filter(function(request) { return Number(request.tabId) === numericTabId; });
+}
+function currentAgentAttentionRequest(tabId) {
+    var requestedTabId = tabId === undefined ? (typeof activeTabId === 'undefined' ? null : activeTabId) : tabId;
+    return agentAttentionRequestsForTab(requestedTabId)[0] || null;
+}
+function agentAttentionPendingForTab(tabId) {
+    return agentAttentionRequestsForTab(tabId).length > 0;
+}
+function agentAttentionBlocksAutomaticDispatch(tabId) {
+    return agentAttentionPendingForTab(tabId);
+}
+function setAgentAttentionError(message, requestId) {
+    var id = String(requestId || '');
+    if (id) {
+        if (message) agentAttentionErrors.set(id, String(message));
+        else agentAttentionErrors.delete(id);
+    }
+    var request = currentAgentAttentionRequest();
+    var error = document.getElementById('agentAttentionError');
+    if (error) error.textContent = request ? String(agentAttentionErrors.get(request.id) || '') : '';
+}
+function renderAgentAttention() {
+    var card = document.getElementById('agentAttentionCard');
+    if (!card) return;
+    var request = currentAgentAttentionRequest();
+    card.hidden = !request;
+    if (!request) { setAgentAttentionError(''); return; }
+    var title = document.getElementById('agentAttentionTitle');
+    var prompt = document.getElementById('agentAttentionPrompt');
+    var count = document.getElementById('agentAttentionCount');
+    var allow = document.getElementById('agentAttentionAllow');
+    var reject = document.getElementById('agentAttentionReject');
+    var busy = agentAttentionBusyRequestId === request.id;
+    if (title) title.textContent = request.title;
+    if (prompt) prompt.textContent = request.prompt;
+    if (count) {
+        var total = agentAttentionRequestsForTab(request.tabId).length;
+        count.hidden = total <= 1;
+        count.textContent = total > 1 ? String(total) + ' requests waiting' : '';
+    }
+    if (allow) allow.textContent = request.decisionMode === 'yes-no' ? 'Yes' : 'Allow';
+    if (reject) reject.textContent = request.decisionMode === 'yes-no' ? 'No' : 'Reject';
+    [allow, reject].forEach(function(button) { if (button) button.disabled = busy; });
+    var error = document.getElementById('agentAttentionError');
+    if (error) error.textContent = String(agentAttentionErrors.get(request.id) || '');
+}
+function rememberAgentAttentionRequest(value) {
+    var request = normalizeAgentAttentionRequest(value);
+    if (!request || request.status !== 'active') return null;
+    agentAttentionRequests.set(request.id, request);
+    renderAgentAttention();
+    return request;
+}
+function forgetAgentAttentionRequest(requestId) {
+    var id = String(requestId || '');
+    agentAttentionRequests.delete(id);
+    agentAttentionErrors.delete(id);
+    if (agentAttentionBusyRequestId === id) agentAttentionBusyRequestId = '';
+    renderAgentAttention();
+}
+async function cancelAgentAttentionForTab(tabId, reason) {
+    var numericTabId = Number(tabId);
+    if (!Number.isFinite(numericTabId)) return 0;
+    var matchingIds = Array.from(agentAttentionRequests.values()).filter(function(request) {
+        return request && Number(request.tabId) === numericTabId;
+    }).map(function(request) { return String(request.id || ''); }).filter(Boolean);
+    var bridge = agentAttentionBridge();
+    if (!bridge || typeof bridge.cancelForTab !== 'function') return 0;
+    try {
+        var response = await bridge.cancelForTab(numericTabId, String(reason || 'history-rewritten'));
+        if (!response || response.success !== true) throw new Error(response && response.error ? response.error : 'Attention cancellation failed.');
+        var cancelled = Math.max(0, Number(response.cancelled) || 0);
+        matchingIds.forEach(forgetAgentAttentionRequest);
+        return cancelled;
+    } catch (error) {
+        console.warn('[ATTENTION] Could not cancel superseded requests:', error && error.message ? error.message : error);
+        return 0;
+    }
+}
+async function resolveAgentAttentionDecision(decision) {
+    var request = currentAgentAttentionRequest();
+    var bridge = agentAttentionBridge();
+    if (!request || !bridge || typeof bridge.respond !== 'function' || agentAttentionBusyRequestId) return false;
+    agentAttentionBusyRequestId = request.id;
+    renderAgentAttention();
+    var response;
+    try { response = await bridge.respond(request.id, { decision: decision }); }
+    catch (error) { response = { success: false, error: error && error.message ? error.message : 'Could not submit the decision.' }; }
+    agentAttentionBusyRequestId = '';
+    if (!response || response.success !== true) {
+        setAgentAttentionError(response && response.error ? response.error : 'This request could not be resolved.', request.id);
+        renderAgentAttention();
+        return false;
+    }
+    var effect = response.uiEffect && typeof response.uiEffect === 'object' ? response.uiEffect : null;
+    if (effect && effect.type === 'workspace-root-changed' && effect.success === true && effect.root
+        && typeof applyWorkspaceRootFromAttention === 'function') {
+        applyWorkspaceRootFromAttention(effect.workspaceId || request.workspaceId, effect);
+    }
+    forgetAgentAttentionRequest(request.id);
+    return true;
+}
+async function preflightAgentAttentionSend(tab, message, options) {
+    if (!tab || !agentAttentionPendingForTab(tab.id)) return { blocked: false };
+    var request = currentAgentAttentionRequest(tab.id);
+    setAgentAttentionError(request && request.decisionMode === 'yes-no'
+        ? 'Choose Yes or No before sending another message.'
+        : 'Choose Allow or Reject before sending another message.', request && request.id);
+    return { blocked: true, reason: 'attention-required' };
+}
+function agentAttentionBlocksFreshSend(tabId) {
+    return agentAttentionPendingForTab(tabId);
+}
+async function initializeAgentAttention() {
+    if (agentAttentionInitialized) return;
+    agentAttentionInitialized = true;
+    var allow = document.getElementById('agentAttentionAllow');
+    var reject = document.getElementById('agentAttentionReject');
+    if (allow) allow.addEventListener('click', function() { resolveAgentAttentionDecision('allow'); });
+    if (reject) reject.addEventListener('click', function() { resolveAgentAttentionDecision('reject'); });
+    var bridge = agentAttentionBridge();
+    if (!bridge) return;
+    if (typeof bridge.onRequested === 'function') agentAttentionUnsubscribers.push(bridge.onRequested(function(payload) {
+        rememberAgentAttentionRequest(payload && payload.request ? payload.request : payload);
+    }));
+    if (typeof bridge.onResolved === 'function') agentAttentionUnsubscribers.push(bridge.onResolved(function(payload) {
+        var request = payload && payload.request ? payload.request : payload;
+        if (request && request.id) forgetAgentAttentionRequest(request.id);
+    }));
+    if (typeof bridge.list === 'function') {
+        try {
+            var response = await bridge.list();
+            if (response && response.success === true && Array.isArray(response.requests)) response.requests.forEach(rememberAgentAttentionRequest);
+        } catch (error) {
+            console.warn('[ATTENTION] Could not restore pending attention UI:', error && error.message ? error.message : error);
+        }
+    }
+    renderAgentAttention();
+}
+// <DARKSTAR_SOURCE_END path="backend/renderer/attention.js">
     // --------------------------------------------------------------------------
     // [9700] CHAT SURFACES :: Application Interface, sessions, browser, messages and timeline
     // --------------------------------------------------------------------------
@@ -10770,8 +12090,8 @@ if (typeof document !== 'undefined' && document && typeof document.addEventListe
         var input = document.getElementById('messageInput');
         if (input) {
             input.value = state ? state.text : '';
-            input.style.height = 'auto';
-            input.style.height = Math.min(input.scrollHeight || 0, 200) + 'px';
+            input.style.height = 'auto'; input.style.overflowY = 'hidden';
+            input.style.height = Math.min(input.scrollHeight || 0, 200) + 'px'; input.style.overflowY = (input.scrollHeight || 0) > 200 ? 'auto' : 'hidden';
         }
         if (state && state.image) {
             pendingImage = state.image;
@@ -10996,10 +12316,10 @@ if (typeof document !== 'undefined' && document && typeof document.addEventListe
 (function initializeOfflineBrowser(root) {
     'use strict';
 
-    var WIDTH_KEY = 'darkstar.secureBrowser.width';
+    var WIDTH_KEY = 'darkstar.browser.width';
     var LEGACY_WIDTH_KEY = 'darkstar.offlineBrowser.width';
-    var WIDTH_RATIO_KEY = 'darkstar.secureBrowser.widthRatio';
-    var SNAP_KEY = 'darkstar.secureBrowser.snappedToWorkspace';
+    var WIDTH_RATIO_KEY = 'darkstar.browser.widthRatio';
+    var SNAP_KEY = 'darkstar.browser.snappedToWorkspace';
     var MIN_WIDTH = 360;
     var MIN_READABLE_CHAT_WIDTH = 480;
     var SNAP_DISTANCE = 24;
@@ -11007,7 +12327,7 @@ if (typeof document !== 'undefined' && document && typeof document.addEventListe
     var state = {
         open: false,
         mode: 'offline',
-        status: { loading: false, path: '', title: 'Secure Browser', error: '', canGoBack: false, canGoForward: false },
+        status: { loading: false, path: '', title: 'Browser', error: '', canGoBack: false, canGoForward: false },
         resizeObserver: null,
         boundsFrame: null,
         boundsInFlight: false,
@@ -11093,7 +12413,7 @@ if (typeof document !== 'undefined' && document && typeof document.addEventListe
             if (state.overlayBlockApplied === desired) return desired;
             return Promise.resolve(api.setOverlayBlocked(desired)).then(function(response) {
                 if (response && response.success === false) {
-                    throw new Error(response.error || 'Secure Browser foreground synchronization failed.');
+                    throw new Error(response.error || 'Browser foreground synchronization failed.');
                 }
                 state.overlayBlockApplied = desired;
                 if (response && response.status) applyStatus(response.status);
@@ -11202,13 +12522,10 @@ if (typeof document !== 'undefined' && document && typeof document.addEventListe
 
     function footerText(next) {
         if (next.error) return next.error;
-        if (next.loading) return isOnline() ? 'Securely loading HTTPS page…' : 'Rendering local page…';
-        if (isOnline() && (next.url || next.path)) {
-            var blocked = Number(next.blockedCrossSiteCookies || 0) + Number(next.blockedPrivateNetwork || 0) + Number(next.blockedTrackers || 0) + Number(next.blockedPermissions || 0);
-            return 'Strict privacy · ephemeral session · ' + blocked + ' blocked event' + (blocked === 1 ? '' : 's');
-        }
-        if (next.path) return 'Offline workspace page · network disabled';
-        return 'Secure Browser · no page loaded';
+        if (next.loading) return isOnline() ? 'Loading page…' : 'Rendering local page…';
+        if (isOnline() && (next.url || next.path)) return 'Online page';
+        if (next.path) return 'Workspace page';
+        return 'Browser · no page loaded';
     }
 
     function applyStatus(next) {
@@ -11224,8 +12541,8 @@ if (typeof document !== 'undefined' && document && typeof document.addEventListe
         if (notificationToggle) {
             notificationToggle.classList.toggle('has-unseen-update', Boolean(state.status.attentionRequired) && !state.open);
             notificationToggle.setAttribute('aria-label', Boolean(state.status.attentionRequired) && !state.open
-                ? 'Open Secure Browser — new update available'
-                : 'Toggle Secure Browser');
+                ? 'Open Browser — new update available'
+                : 'Toggle Browser');
         }
         var sidebar = document.getElementById('offlineBrowserSidebar');
         var address = document.getElementById('offlineBrowserAddress');
@@ -11235,7 +12552,7 @@ if (typeof document !== 'undefined' && document && typeof document.addEventListe
         var forward = document.getElementById('offlineBrowserForward');
         var reload = document.getElementById('offlineBrowserReload');
         var reset = document.getElementById('offlineBrowserReset');
-        var badge = document.getElementById('offlineBrowserPrivacyBadge');
+        var badge = document.getElementById('offlineBrowserModeBadge');
         var network = document.getElementById('offlineBrowserNetworkState');
         var frame = document.getElementById('offlineBrowserOnlineFrame');
         var locationValue = next.url || next.path;
@@ -11243,18 +12560,16 @@ if (typeof document !== 'undefined' && document && typeof document.addEventListe
             if (locationValue) address.value = locationValue;
             else if (isOnline() && Object.prototype.hasOwnProperty.call(next, 'url')) address.value = '';
         }
-        if (title) title.textContent = next.title || (isOnline() ? 'Secure Browser' : 'Offline Browser');
+        if (title) title.textContent = next.title || 'Browser';
         if (footer) {
             footer.textContent = footerText(next);
             footer.classList.toggle('error', Boolean(next.error));
         }
         if (badge) {
-            badge.textContent = isOnline() ? 'STRICT' : 'OFFLINE';
-            badge.title = isOnline()
-                ? 'Separate ephemeral browser host · HTTPS only · private networks, common trackers, and cross-site cookie headers blocked'
-                : 'Workspace-local page · all external network access blocked';
+            badge.textContent = isOnline() ? 'ONLINE' : 'LOCAL';
+            badge.title = isOnline() ? 'Online page' : 'Workspace file';
         }
-        if (network) network.textContent = isOnline() ? 'Ephemeral · no cross-site cookies' : 'Local files only';
+        if (network) network.textContent = isOnline() ? 'Online' : 'Workspace file';
         if (back) back.disabled = !next.canGoBack;
         if (forward) forward.disabled = !next.canGoForward;
         if (reload) reload.classList.toggle('loading', Boolean(next.loading));
@@ -11338,7 +12653,7 @@ if (typeof document !== 'undefined' && document && typeof document.addEventListe
                     // failed or was dropped by the native compositor.
                     state.pendingBounds = normalizedViewportBounds() || requested;
                     if (root.console && typeof root.console.warn === 'function') {
-                        root.console.warn('Secure Browser bounds synchronization failed; retrying.', error);
+                        root.console.warn('Browser bounds synchronization failed; retrying.', error);
                     }
                     scheduleBoundsRetry();
                     break;
@@ -11441,7 +12756,7 @@ if (typeof document !== 'undefined' && document && typeof document.addEventListe
         var api = bridge();
         var browserId = activeBrowserId();
         if (!api || typeof api[action] !== 'function') {
-            applyStatus({ browserId: browserId, error: 'Secure Browser is unavailable in this build.', loading: false });
+            applyStatus({ browserId: browserId, error: 'Browser is unavailable in this build.', loading: false });
             return null;
         }
         try {
@@ -11450,7 +12765,7 @@ if (typeof document !== 'undefined' && document && typeof document.addEventListe
             else if (action === 'choose') response = await api.choose(activeWorkspaceId(), browserId);
             else response = value === undefined ? await api[action](browserId) : await api[action](value, browserId);
             if (browserId === activeBrowserId() && response && response.status) applyStatus(response.status);
-            if (browserId === activeBrowserId() && response && response.success === false) applyStatus({ browserId: browserId, error: response.error || 'Secure Browser failed.', loading: false });
+            if (browserId === activeBrowserId() && response && response.success === false) applyStatus({ browserId: browserId, error: response.error || 'Browser failed.', loading: false });
             return response;
         } catch (error) {
             if (browserId === activeBrowserId()) applyStatus({ browserId: browserId, error: error && error.message ? error.message : String(error), loading: false });
@@ -11661,7 +12976,7 @@ if (typeof document !== 'undefined' && document && typeof document.addEventListe
     root.offlineBrowserBack = function() { return invoke('back'); };
     root.offlineBrowserForward = function() { return invoke('forward'); };
     root.offlineBrowserReload = function() { return invoke('reload'); };
-    root.resetSecureBrowser = function() { return invoke('reset'); };
+    root.resetBrowser = function() { return invoke('reset'); };
     root.onOfflineBrowserAddressKeydown = onAddressKeydown;
     root.updateOfflineBrowserBounds = scheduleBoundsUpdate;
 
@@ -11790,10 +13105,10 @@ function assistantContinuationVisible(messageIndex, messageId) {
 function actionIcon(kind) {
     var start = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">';
     if (kind === 'edit') return start + '<path d="M4 20h4.2L19 9.2a2.1 2.1 0 0 0-3-3L5.2 17 4 20Z"/><path d="m14.8 7.4 3 3"/></svg>';
-    if (kind === 'retry') return '<span class="action-symbol action-symbol-retry" aria-hidden="true">↻</span>';
+    if (kind === 'retry') return start + '<path d="M20 11a8 8 0 1 0-2.34 5.66"/><path d="M20 4v7h-7"/></svg>';
     if (kind === 'copy') return start + '<rect x="9" y="9" width="10" height="10" rx="2"/><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3"/></svg>';
     if (kind === 'continue') return start + '<path d="M5 12h13"/><path d="m14 8 4 4-4 4"/></svg>';
-    if (kind === 'delete') return '<span class="action-symbol action-symbol-delete" aria-hidden="true">−</span>';
+    if (kind === 'delete') return start + '<path d="M7 12h10"/></svg>';
     return '';
 }
 
@@ -13512,7 +14827,7 @@ function scheduleMessage() {
     var entry = enqueueScheduledMessage(tab, input.value, image);
     if (!entry) return false;
     input.value = '';
-    input.style.height = 'auto';
+    input.style.height = 'auto'; input.style.overflowY = 'hidden';
     if (image && typeof removeImage === 'function') removeImage();
     updateScheduleButton();
     renderQueue();
@@ -13549,6 +14864,7 @@ function nextScheduledMessage() {
     tabs.forEach(function(tab) {
         if (!tab || !Array.isArray(tab.scheduled)) return;
         if (typeof getTabWorkspaceRoot === 'function' && !getTabWorkspaceRoot(tab.id)) return;
+        if (typeof agentAttentionBlocksAutomaticDispatch === 'function' && agentAttentionBlocksAutomaticDispatch(tab.id)) return;
         if (typeof composerContextContractBlocked === 'function' && composerContextContractBlocked(tab)) return;
         if (typeof generationSessionForTab === 'function' && generationSessionForTab(tab.id)) return;
         if (scheduledDispatchReservedForTab(tab.id)) return;
@@ -13818,6 +15134,7 @@ function scheduleTabLayoutRefresh() {
 
 
 function renderTabs() {
+    if (typeof renderAgentAttention === 'function') renderAgentAttention();
     const tabBar = document.getElementById('tabBar');
     if (!tabBar) return false;
     var barWidth = visibleTabBarWidth(tabBar);
@@ -13954,7 +15271,7 @@ function switchTab(tabId) {
     const input = document.getElementById('messageInput');
     if (input) {
         input.value = '';
-        input.style.height = 'auto';
+        input.style.height = 'auto'; input.style.overflowY = 'hidden';
     }
     if (typeof updateScheduleButton === 'function') updateScheduleButton();
     if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
@@ -13986,7 +15303,7 @@ function createNewTab() {
         updateTokenCounter();
         renderQueue();
         const input = document.getElementById('messageInput');
-        if (input) { input.value = ''; input.style.height = 'auto'; }
+        if (input) { input.value = ''; input.style.height = 'auto'; input.style.overflowY = 'hidden'; }
         if (typeof updateButtonStates === 'function') updateButtonStates(false);
         if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
         return;
@@ -14037,7 +15354,7 @@ function createNewTab() {
     const input = document.getElementById('messageInput');
     if (input) {
         input.value = '';
-        input.style.height = 'auto';
+        input.style.height = 'auto'; input.style.overflowY = 'hidden';
     }
     if (typeof updateScheduleButton === 'function') updateScheduleButton();
     if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
@@ -14207,6 +15524,17 @@ function normalizeModelRecords(records) {
     }).filter(Boolean);
 }
 
+function normalizeProjectorRecords(records) {
+    var seen = Object.create(null);
+    return (Array.isArray(records) ? records : []).map(function(projector) {
+        if (!projector || typeof projector !== 'object') return null;
+        var projectorPath = String(projector.path || '').trim();
+        if (!projectorPath || seen[projectorPath]) return null;
+        seen[projectorPath] = true;
+        return { path: projectorPath, fileName: String(projector.fileName || projectorPath.split(/[\\/]/).pop() || projectorPath) };
+    }).filter(Boolean);
+}
+
 function modelInventorySignature(models) {
     return JSON.stringify((Array.isArray(models) ? models : []).map(function(model) {
         return [String(model.id || ''), String(model.displayName || ''), model.layerCount || null, model.contextLength || null, model.reasoning || null, model.mtp || null];
@@ -14229,16 +15557,29 @@ function rerenderModelReasoningNodes() {
     });
 }
 
-function applyModelInventory(records) {
+function applyModelInventory(records, projectorRecords) {
     var select = document.getElementById('modelSelect');
     if (!select) return false;
     var models = normalizeModelRecords(records);
     window.Darkstar = window.Darkstar || {};
-    var previousSignature = modelInventorySignature(window.Darkstar.modelInventory || []);
+    var previousInventory = Array.isArray(window.Darkstar.modelInventory) ? window.Darkstar.modelInventory : [];
+    var previousProjectors = Array.isArray(window.Darkstar.projectorInventory) ? window.Darkstar.projectorInventory : [];
+    var projectors = normalizeProjectorRecords(projectorRecords);
+    var loader = typeof nodeEditorState !== 'undefined' && nodeEditorState && Array.isArray(nodeEditorState.nodes)
+        ? nodeEditorState.nodes.find(function(node) { return node.type === 'modelLoader'; })
+        : null;
+    var selectedId = String(loader && loader.selectedModel || '');
+    var retainedLocal = previousInventory.find(function(model) {
+        return model && model.localFilesystem === true && String(model.id || '') === selectedId;
+    });
+    if (retainedLocal && !models.some(function(model) { return String(model.id || '') === selectedId; })) models.push(retainedLocal);
+    var previousSignature = modelInventorySignature(previousInventory);
     var nextSignature = modelInventorySignature(models);
-    var changed = previousSignature !== nextSignature;
+    var projectorChanged = JSON.stringify(previousProjectors) !== JSON.stringify(projectors);
+    var changed = previousSignature !== nextSignature || projectorChanged;
 
     window.Darkstar.modelInventory = models.slice();
+    window.Darkstar.projectorInventory = projectors.slice();
     select.innerHTML = '';
     if (!models.length) {
         var emptyOption = document.createElement('option');
@@ -14258,7 +15599,7 @@ function applyModelInventory(records) {
 
     // The graph remains authoritative. Refreshing inventory must never silently
     // replace a saved model selection, even if that model is temporarily absent.
-    var loader = nodeEditorState.nodes.find(function(node) { return node.type === 'modelLoader'; });
+    loader = nodeEditorState.nodes.find(function(node) { return node.type === 'modelLoader'; });
     if (loader && typeof syncHiddenModelSelectFromNode === 'function') {
         syncHiddenModelSelectFromNode({ rerender: false });
     } else {
@@ -14298,15 +15639,17 @@ async function loadModelList(options) {
     if (!select) return false;
     try {
         var records = [];
+        var projectors = [];
         if (window.darkstar && window.darkstar.nodes && typeof window.darkstar.nodes.listModels === 'function') {
             var response = await window.darkstar.nodes.listModels();
             if (response && response.success && Array.isArray(response.models)) records = response.models;
+            if (response && response.success && Array.isArray(response.projectors)) projectors = response.projectors;
         }
         if (!records.length && window.darkstar && typeof window.darkstar.listModels === 'function') {
             var listedModels = await window.darkstar.listModels();
             records = Array.isArray(listedModels) ? listedModels : [];
         }
-        return applyModelInventory(records);
+        return applyModelInventory(records, projectors);
     } catch (error) {
         if (!options.quiet) console.error('[LM] Error:', error && error.message ? error.message : error);
         showModelInventoryError();
@@ -14322,7 +15665,8 @@ function startAutomaticModelRefresh() {
     if (nodeBridge && typeof nodeBridge.onModelsChanged === 'function') {
         nodeBridge.onModelsChanged(function(payload) {
             var records = payload && Array.isArray(payload.models) ? payload.models : payload;
-            applyModelInventory(records);
+            var projectors = payload && Array.isArray(payload.projectors) ? payload.projectors : [];
+            applyModelInventory(records, projectors);
         });
     }
 
@@ -14429,10 +15773,15 @@ function attachImageFile(file, options) {
 }
 
 
-function handleImageSelect(ev) {
-    const file = ev && ev.target && ev.target.files ? ev.target.files[0] : null;
-    if (!file) return;
-    attachImageFile(file, { fallbackName: 'image.png', allowUnknownImage: true });
+async function chooseComposerImage() {
+    var browser = window.Darkstar && window.Darkstar.imageFiles;
+    if (!browser || typeof browser.open !== 'function') throw new Error('Darkstar’s image browser is unavailable in this build.');
+    var result = await browser.open({ multiple: false });
+    var image = result && result.image;
+    if (!image || !image.base64 || !image.mimeType) return false;
+    var file = { name: String(image.name || 'image.png'), size: Number(image.size) || 0, type: String(image.mimeType) };
+    var dataUrl = Darkstar.imageData.safeDataUrl({ base64: String(image.base64), mimeType: file.type }, file.type);
+    return dataUrl ? showPendingImage(file, dataUrl, file.name, file.type) : false;
 }
 
 
@@ -14572,7 +15921,7 @@ function formatFileSize(bytes) {
     function clearComposer(input) {
         if (!input) return;
         input.value = '';
-        if (input.style) input.style.height = 'auto';
+        if (input.style) { input.style.height = 'auto'; input.style.overflowY = 'hidden'; }
         if (typeof root.closeSlashCommandMenu === 'function') root.closeSlashCommandMenu();
         if (typeof root.updateScheduleButton === 'function') root.updateScheduleButton();
     }
@@ -14822,7 +16171,7 @@ function formatFileSize(bytes) {
     // <DARKSTAR_SOURCE_END path="backend/renderer/adversary-context.js">
     // RENDERER MODULE :: backend/renderer/send.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/send.js">
-var darkstarChatRuntime = (typeof Darkstar !== 'undefined' && Darkstar)
+var AUTO_COMPACT_TRIGGER_FRACTION = 0.90; var darkstarChatRuntime = (typeof Darkstar !== 'undefined' && Darkstar)
     ? (Darkstar.chatRuntime || (Darkstar.nodes && Darkstar.nodes.services) || null)
     : null;
 function getDarkstarChatRuntime() {
@@ -15207,7 +16556,7 @@ async function nameConversationBeforeReply(tab, request, abortSignal) {
             ? await request.generateTitle({ model: model, messages: titleMessages, sampler: titleSampler })
             : await getDarkstarChatRuntime().streamChat(Object.assign({
                 model: String(model.id || ''), messages: titleMessages, cachePrompt: false, cacheIdentity: 'aux:title:' + String(tab.id) + ':' + String(titleRequestId),
-                control: { reasoning: 'off', reasoningFormat: 'none' }
+                control: { reasoning: 'off', reasoningFormat: 'none', modelIdleUnloadSeconds: request && request.control ? Number(request.control.modelIdleUnloadSeconds) || 0 : 0 }
             }, titleSampler), { abortSignal: abortSignal });
         title = normalizeConversationTitle(result && result.text);
     } catch (error) {
@@ -15319,7 +16668,7 @@ async function interveneGeneration() {
     appendHistoryMessage(tab, userMessage);
     if (input) {
         input.value = '';
-        input.style.height = 'auto';
+        input.style.height = 'auto'; input.style.overflowY = 'hidden';
     }
     pendingImage = null;
     if (typeof removeImage === 'function') removeImage();
@@ -15371,7 +16720,7 @@ function queueGenerationLaunch(request) {
             enqueueScheduledMessage(tab, message, messageImage);
             if (readsVisibleInput && Number(tab.id) === Number(activeTabId)) {
                 var scheduledInput = document.getElementById('messageInput');
-                if (scheduledInput) { scheduledInput.value = ''; scheduledInput.style.height = 'auto'; }
+                if (scheduledInput) { scheduledInput.value = ''; scheduledInput.style.height = 'auto'; scheduledInput.style.overflowY = 'hidden'; }
                 if (typeof removeImage === 'function') removeImage();
             }
             if (typeof renderQueue === 'function') renderQueue();
@@ -15399,7 +16748,7 @@ function queueGenerationLaunch(request) {
     }
     if (readsVisibleInput && Number(tab.id) === Number(activeTabId)) {
         var input = document.getElementById('messageInput');
-        if (input) { input.value = ''; input.style.height = 'auto'; }
+        if (input) { input.value = ''; input.style.height = 'auto'; input.style.overflowY = 'hidden'; }
         if (typeof removeImage === 'function') removeImage();
     }
     generationLaunchSequence += 1;
@@ -15430,7 +16779,7 @@ function dispatchQueuedGenerations() {
                 && (Number.isInteger(Number(entry.options.continueFromIndex)) && Number(entry.options.continueFromIndex) >= 0
                     || Boolean(String(entry.options.continueMessageId || '').trim()));
             return !hasSession && typeof tabs !== 'undefined' && Array.isArray(tabs) && tabs.some(function(tab) {
-                return Number(tab.id) === Number(entry.tabId) && !tab._closing
+                return Number(tab.id) === Number(entry.tabId) && !tab._closing && (typeof agentAttentionBlocksAutomaticDispatch !== 'function' || !agentAttentionBlocksAutomaticDispatch(tab.id))
                     && (Number(entry.regenerateFromIndex) >= 0 || queuedContinuation
                         || typeof composerContextContractBlocked !== 'function' || !composerContextContractBlocked(tab));
             });
@@ -15531,9 +16880,9 @@ async function prepareGenerationLaunch(regenerateFromIndex, options) {
     const message = regenerateFromIndex >= 0
         ? ''
         : (options.messageOverride !== undefined ? String(options.messageOverride).trim() : input.value.trim());
-    const messageImage = options.imageOverride !== undefined
-        ? options.imageOverride
+    const messageImage = options.imageOverride !== undefined ? options.imageOverride
         : (readsVisibleInput && tab.id === activeTabId ? pendingImage : null);
+    if (regenerateFromIndex < 0 && typeof preflightAgentAttentionSend === 'function') { var attentionPreflight = await preflightAgentAttentionSend(tab, message, options); if (attentionPreflight.blocked) return { stopped: true, value: attentionPreflight }; }
     if (regenerateFromIndex < 0 && options.commandBypass !== true && /^\//u.test(message)
         && typeof Darkstar !== 'undefined' && Darkstar.systemCommands && typeof Darkstar.systemCommands.invoke === 'function') {
         var commandResult = await Darkstar.systemCommands.invoke(message, {
@@ -15614,9 +16963,9 @@ async function prepareGenerationLaunch(regenerateFromIndex, options) {
     }
     generationStopped = false;
     tab.tokensPerSecond = 0;
-    const welcomeScreen = document.getElementById('welcomeScreen');
-    if (welcomeScreen) welcomeScreen.style.display = 'none';
+    const welcomeScreen = document.getElementById('welcomeScreen'); if (welcomeScreen) welcomeScreen.style.display = 'none';
     if (regenerateFromIndex >= 0) {
+        if (typeof cancelAgentAttentionForTab === 'function') await cancelAgentAttentionForTab(tab.id, options.cancelReason || 'history-rewritten');
         if (Darkstar.kvCacheContract && typeof Darkstar.kvCacheContract.invalidateFromHistory === 'function') {
             Darkstar.kvCacheContract.invalidateFromHistory(tab, regenerateFromIndex, 'regenerate-truncated');
         }
@@ -15638,7 +16987,7 @@ async function prepareGenerationLaunch(regenerateFromIndex, options) {
         appendSubmittedUserMessage(tab, message, messageImage);
         if (readsVisibleInput && tab.id === activeTabId) {
             input.value = '';
-            input.style.height = 'auto';
+            input.style.height = 'auto'; input.style.overflowY = 'hidden';
             removeImage();
         }
     }
@@ -16426,7 +17775,7 @@ function clearChat(options) {
         pendingImage = null;
         if (typeof removeImage === 'function') removeImage();
         var input = document.getElementById('messageInput');
-        if (input) { input.value = ''; input.style.height = 'auto'; }
+        if (input) { input.value = ''; input.style.height = 'auto'; input.style.overflowY = 'hidden'; }
         var queue = document.getElementById('messageQueue');
         var toggle = document.getElementById('queueToggle');
         if (queue) queue.classList.remove('expanded');
@@ -17091,8 +18440,8 @@ function clearNodeContext() {
         var input = composerInput();
         if (!command || !input) return false;
         input.value = command.insert;
-        input.style.height = 'auto';
-        input.style.height = Math.min(input.scrollHeight, 200) + 'px';
+        input.style.height = 'auto'; input.style.overflowY = 'hidden';
+        input.style.height = Math.min(input.scrollHeight, 200) + 'px'; input.style.overflowY = input.scrollHeight > 200 ? 'auto' : 'hidden';
         closeSlashCommandMenu();
         input.focus();
         if (typeof input.setSelectionRange === 'function') input.setSelectionRange(input.value.length, input.value.length);
@@ -17676,42 +19025,7 @@ function clearNodeContext() {
                 return { success: true, continued: continued };
             }
         });
-        systemCommands.register({
-            name: 'hug',
-            usage: '/hug',
-            insert: '/hug',
-            description: 'Send a supportive user turn to the model.',
-            concurrency: 'intervention',
-            async execute(context) {
-                var activeSession = context.activeSession;
-                var hugContent = '**The user hugged you** You are doing great, keep going!';
-                if (activeSession && typeof persistInterruptedGeneration === 'function') persistInterruptedGeneration(context.tab, activeSession);
-                appendUserCommandMessage(context.tab, hugContent, 'hug', { intervention: Boolean(activeSession) });
-                if (activeSession && typeof cancelGenerationSession === 'function') {
-                    cancelGenerationSession(activeSession, 'hug-command-intervention', { clearUi: false, updateButtons: false });
-                }
-                if (Number(context.tab.id) === Number(activeTabId)) {
-                    if (typeof renderChat === 'function') renderChat();
-                    if (typeof renderQueue === 'function') renderQueue();
-                    if (typeof renderTabs === 'function') renderTabs();
-                    if (typeof updateTokenCounter === 'function') updateTokenCounter();
-                    if (typeof updateButtonStates === 'function') updateButtonStates(false);
-                }
-                if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
-                if (typeof sendMessage === 'function') {
-                    await sendMessage(-1, {
-                        targetTabId: context.tab.id,
-                        messageOverride: hugContent,
-                        userMessageAlreadyAppended: true,
-                        commandBypass: true,
-                        replaceActiveGeneration: Boolean(activeSession),
-                        cancelReason: activeSession ? 'hug-command-intervention' : undefined,
-                        intervention: Boolean(activeSession)
-                    });
-                }
-                return { success: true, intervention: Boolean(activeSession) };
-            }
-        });
+
     }
 
     registerSystemCommands();
@@ -18339,12 +19653,15 @@ var nodeRuntimeUnloadInFlight = null;
 function nodeRuntimeUnloadRelevantSignature(node) {
     if (!node || !node.params || typeof node.params !== 'object') return null;
     var type = String(node.type || '');
-    if (type === 'control' || type === 'loadServer' || type === 'context') {
-        return JSON.stringify(node.params);
+    if (type === 'control') {
+        return JSON.stringify({ nameConversations: node.params.nameConversations, autoCompact: node.params.autoCompact });
     }
+    if (type === 'loadServer' || type === 'context') return JSON.stringify(node.params);
     if (type === 'sampler') {
         return JSON.stringify({ contextSize: node.params.contextSize });
     }
+    if (type === 'modelLoader') return JSON.stringify({ projectorPath: String(node.params.projectorPath || '').trim() });
+    if (type === 'skills') return JSON.stringify((Array.isArray(node.params.skills) ? node.params.skills : []).map(function(skill) { return String(skill && skill.path || '').trim(); }));
     return null;
 }
 
@@ -18700,7 +20017,7 @@ bindClickById('offlineBrowserForward', offlineBrowserForward);
 bindClickById('offlineBrowserReload', offlineBrowserReload);
 bindClickById('offlineBrowserOpenButton', openOfflineBrowserAddress);
 bindClickById('offlineBrowserChooseFileButton', chooseOfflineBrowserFile);
-bindClickById('offlineBrowserReset', resetSecureBrowser);
+bindClickById('offlineBrowserReset', resetBrowser);
 bindClickById('offlineBrowserCloseButton', function() { toggleOfflineBrowser(false); });
 bindClickById('offlineBrowserFocusAddressButton', function() {
     var address = document.getElementById('offlineBrowserAddress');
@@ -18710,8 +20027,10 @@ bindClickById('queueToggle', toggleQueue);
 bindClickById('removeImageButton', removeImage);
 bindClickById('projectDirectoryChooseButton', chooseActiveProjectDirectory);
 bindClickById('imageUploadButton', function() {
-    var input = document.getElementById('imageInput');
-    if (input) input.click();
+    Promise.resolve(chooseComposerImage()).catch(function(error) {
+        if (typeof showNodeEditorToast === 'function') showNodeEditorToast(error && error.message ? error.message : String(error), 'error', 6200);
+        else console.error('[IMAGE]', error && error.message ? error.message : error);
+    });
 });
 bindClickEventById('scheduleBtn', handleGenerationAction);
 bindClickEventById('sendBtn', handleComposerPrimaryAction);
@@ -18732,15 +20051,12 @@ if (nodeSearchInput) {
 var offlineBrowserAddress = document.getElementById('offlineBrowserAddress');
 if (offlineBrowserAddress) offlineBrowserAddress.addEventListener('keydown', onOfflineBrowserAddressKeydown);
 
-var imageInput = document.getElementById('imageInput');
-if (imageInput) imageInput.addEventListener('change', handleImageSelect);
-
 const messageInput = document.getElementById('messageInput');
 if (messageInput) {
     messageInput.addEventListener('keydown', handleKeydown);
     messageInput.addEventListener('input', function() {
-        this.style.height = 'auto';
-        this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+        this.style.height = 'auto'; this.style.overflowY = 'hidden';
+        this.style.height = Math.min(this.scrollHeight, 200) + 'px'; this.style.overflowY = this.scrollHeight > 200 ? 'auto' : 'hidden';
         updateScheduleButton();
         if (typeof updateSlashCommandMenu === 'function') updateSlashCommandMenu(this.value);
         if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(500);
@@ -18861,6 +20177,9 @@ function setDarkstarStartupUiReady(ready) {
         renderChat();
         updateTokenCounter();
         renderQueue();
+        if (typeof initializePermissionPolicyUi === 'function') await initializePermissionPolicyUi();
+        if (typeof initializeFilesystemAccessUi === 'function') await initializeFilesystemAccessUi();
+        if (typeof initializeAgentAttention === 'function') await initializeAgentAttention();
         if (typeof applyRestoredChatComposer === 'function') applyRestoredChatComposer();
         if (typeof initializeProjectsUi === 'function') {
             await initializeProjectsUi({ promptForDirectory: chatSessionRestored !== true });
@@ -19411,12 +20730,14 @@ function setDarkstarStartupUiReady(ready) {
             if (!loader) throw new Error('[ Custom ] Autoregressive Sampler (API): the connected API loader is unavailable.');
             var p = ensureSamplerParams(node);
             var continuingFinalMessage = context.continueFinalMessage === true;
-            var secureContinuationBoundary = continuingFinalMessage && context.continuationBrowserCompartmentActivated === true;
+            var browserContinuationBoundary = continuingFinalMessage && context.continuationBrowserCompartmentActivated === true;
             var toolConfiguration = Object.assign({}, inputs.tools || { providers: [], maxRounds: 'auto', toolChoice: 'auto' }, {
                 workspaceId: context.workspaceId || 'default',
+                projectId: Number(context.projectId) || 0,
+                tabId: Number(context.tabId) || 0,
                 uipScopeId: context.uipScopeId || ('project-' + String(Number(context.projectId) || 0)),
                 browserId: String(context.tabId === undefined || context.tabId === null ? '0' : context.tabId),
-                executionDisabled: secureContinuationBoundary
+                executionDisabled: browserContinuationBoundary
             });
             if (!continuingFinalMessage && context.adversaryMode !== true && inputs.while && inputs.while.nameConversations === true && typeof context.ensureConversationTitle === 'function') {
                 node.statusMessage = 'Naming conversation via API…';

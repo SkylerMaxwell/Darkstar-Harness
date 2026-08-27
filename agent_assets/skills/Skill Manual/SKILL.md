@@ -657,7 +657,7 @@ Relative writes go into the run directory. To create an artifact, write it benea
 
 ### Purpose
 
-Control the isolated internal browser with native pointer and keyboard events.
+Control the internal browser with native pointer and keyboard events.
 
 ### Reliable operating loop
 
@@ -688,7 +688,7 @@ The page must be inside the active tab's workspace. A browser session opened by 
 
 ### Purpose
 
-Open a workspace `.html` or `.htm` file in Darkstar's visible, network-isolated right-side browser, capture the displayed browser viewport as PNG, and attach that screenshot to the model's next context turn.
+Open a workspace `.html` or `.htm` file in Darkstar's visible right-side browser, capture the displayed browser viewport as PNG, and attach that screenshot to the model's next context turn.
 
 ### Requirements
 
