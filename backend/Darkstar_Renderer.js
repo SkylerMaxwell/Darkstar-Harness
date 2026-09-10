@@ -19902,7 +19902,7 @@ async function sendMessage(regenerateFromIndex, options) {
         continueMessageId: continuingFinalMessage ? session.continuationMessageId : '',
         continuationBrowserCompartmentActivated: continuingFinalMessage && session.continuationBaseBrowserCompartmentActivated === true,
         kvCacheReuseRequired: continuingFinalMessage || Boolean(Darkstar.kvCacheContract && typeof Darkstar.kvCacheContract.pending === 'function' && Darkstar.kvCacheContract.pending(tab)),
-        kvCacheIdentity: 'project:' + String(Number(tab.projectId || currentProjectId || 0)) + ':tab:' + String(tab.id),
+        kvCacheIdentity: 'project:' + String(Number(tab.projectId ?? 0)) + ':tab:' + String(tab.id),
         kvReconciliation: Darkstar.kvCacheContract && typeof Darkstar.kvCacheContract.beginReconciliation === 'function' ? Darkstar.kvCacheContract.beginReconciliation(tab) : null,
         requestId: session.requestId,
         parallelSlots: typeof configuredParallelSlots === 'function' ? configuredParallelSlots() : 1,

@@ -22845,6 +22845,7 @@ TEST_FACTORIES.set("backend/Dev/tests/conversation-architecture-hardening.test.j
 'use strict';
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const vm = require('node:vm');
 function source(id) {
     const fs = require('node:fs'); const path = require('node:path');
     const monolithName = id.startsWith('backend/renderer/') ? 'Darkstar_Renderer.js' : 'Darkstar_Core.js';
@@ -22887,6 +22888,16 @@ test('queue cancellation preserves accepted user history and filesystem project 
     const removeQueued = send.slice(send.indexOf('function removeQueuedGenerationById'), send.indexOf('function discardQueuedGenerationForTab'));
     assert.doesNotMatch(removeQueued, /history\.splice/u, 'cancelling generation scheduling must not erase an accepted user turn');
     assert.match(projects, /removedTabs\.forEach[\s\S]*?discardQueuedGenerationForTab\(tab\.id\)[\s\S]*?discardScheduledMessagesForTab\(tab\.id\)/u);
+});
+
+test('default project id initializes generation context without falling through to unrelated global state', () => {
+    const send = source('backend/renderer/send.js');
+    const match = send.match(/kvCacheIdentity:\s*([^,\n]+)/u);
+    assert.ok(match, 'generation execution context must define a KV-cache identity');
+    const sandbox = { tab: { id: 3, projectId: 0 }, result: null };
+    vm.runInNewContext('result = ' + match[1], sandbox);
+    assert.equal(sandbox.result, 'project:0:tab:3');
+    assert.doesNotMatch(match[1], /currentProjectId/u, 'generation context must derive project identity from its owning tab');
 });
 });
 
