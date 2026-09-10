@@ -827,7 +827,7 @@ Load the instructions for one connected Skill, or read one supporting file from 
 3. Call `screenshot_html`.
 4. Correct visible defects.
 5. Repeat capture until stable.
-6. Do not rely on external network assets because the browser is offline. Packaged Three.js r184 is already available as `window.THREE` before page scripts run, so do not add a Three.js CDN script or core import.
+6. Do not rely on external network assets because the browser is offline. Before adding or installing Three.js, call `inspect_threejs_environment`. If `threejs_availability.browser.available` is `true`, Darkstar has already loaded the bundled browser runtime and `threejs_availability.browser.access` gives the model-facing global (normally `window.THREE`); use it directly instead of adding a CDN script, npm install, or core import. Keep this distinct from `threejs_availability.node`, which reports whether the active project can import the Node package.
 
 ## Rename or restructure
 

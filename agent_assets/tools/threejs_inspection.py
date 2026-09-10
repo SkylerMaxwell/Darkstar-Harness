@@ -24,10 +24,12 @@ SCHEMA = {
     "description": (
         "Return a compact, read-only compatibility report for Node.js, Electron, and Three.js in the "
         "current Darkstar installation and active project. Use it before writing or debugging Three.js "
-        "software to learn the exact available revisions, Node/Electron/Chromium runtime versions, module "
-        "format, package availability, browser preload mode, offline loading behavior, and whether common "
-        "Three.js addons are bundled. It performs no network requests, modifies no files, and omits paths, "
-        "machine identity, credentials, and unrelated system details."
+        "software. The result clearly distinguishes Darkstar's bundled embedded-browser runtime from a "
+        "project-local Node package: when the bundled runtime is ready, browser code can use window.THREE "
+        "directly without a CDN, npm install, or core import. The report also includes exact revisions, "
+        "Node/Electron/Chromium versions, module format, project package availability, preload/offline behavior, "
+        "and addon availability. It performs no network requests, modifies no files, and omits paths, machine "
+        "identity, credentials, and unrelated system details."
     ),
     "parameters": {
         "$schema": "http://json-schema.org/draft-07/schema#",
@@ -74,11 +76,20 @@ def _workspace_root(context: dict[str, Any]) -> Path:
     return _safe_root(context.get("workspace")) or Path.cwd().resolve(strict=False)
 
 
+def _is_darkstar_host(candidate: Path) -> bool:
+    if not (candidate / "backend" / "shell" / "package.json").is_file() or not (candidate / "agent_assets").is_dir():
+        return False
+    # Support both Darkstar's packaged Core monolith and a split-source checkout.
+    return (candidate / "backend" / "Darkstar_Core.js").is_file() or (
+        candidate / "backend" / "browser" / "offline-browser-service.js"
+    ).is_file()
+
+
 def _host_root(context: dict[str, Any], workspace: Path) -> Path | None:
     skills_root = _safe_root(context.get("skills_root"))
     if skills_root and skills_root.name == "skills" and skills_root.parent.name == "agent_assets":
         candidate = skills_root.parent.parent
-        if (candidate / "backend" / "shell" / "package.json").is_file():
+        if _is_darkstar_host(candidate):
             return candidate
 
     candidates: list[Path] = []
@@ -86,11 +97,7 @@ def _host_root(context: dict[str, Any], workspace: Path) -> Path | None:
     candidates.extend(tool_path.parents[:5])
     candidates.extend([workspace, *workspace.parents[:3]])
     for candidate in candidates:
-        if (
-            (candidate / "backend" / "shell" / "package.json").is_file()
-            and (candidate / "backend" / "browser" / "offline-browser-service.js").is_file()
-            and (candidate / "agent_assets").is_dir()
-        ):
+        if _is_darkstar_host(candidate):
             return candidate
     return None
 
@@ -326,28 +333,52 @@ def _extract_revision_from_spec(specifier: str | None) -> str | None:
     return match.group(1) if match else None
 
 
+def _browser_service_source(root: Path) -> str:
+    split_source = _read_text(root / "backend" / "browser" / "offline-browser-service.js", 4_000_000)
+    if split_source is not None:
+        return split_source
+
+    # Production Darkstar packages logical sources inside Darkstar_Core.js. Read only
+    # the owning module so this probe remains compatible with both source layouts.
+    core_source = _read_text(root / "backend" / "Darkstar_Core.js", _MAX_TEXT_BYTES) or ""
+    begin_marker = '// <DARKSTAR_SOURCE_BEGIN path="backend/browser/offline-browser-service.js">'
+    end_marker = '// <DARKSTAR_SOURCE_END path="backend/browser/offline-browser-service.js">'
+    begin = core_source.find(begin_marker)
+    if begin < 0:
+        return ""
+    end = core_source.find(end_marker, begin + len(begin_marker))
+    return core_source[begin:end if end >= 0 else None]
+
+
+def _three_vendor_roots(root: Path) -> list[Path]:
+    # Packaged Darkstar keeps runtime assets under backend/vendor; retain support
+    # for older/split layouts that place vendor assets at the repository root.
+    return [root / "backend" / "vendor" / "three", root / "vendor" / "three"]
+
+
 def _browser_runtime(root: Path | None) -> dict[str, Any]:
     if root is None:
-        return {"available": False}
+        return {"available": False, "embedded_browser_ready": False}
 
-    vendor_root = root / "vendor" / "three"
     revision_dirs: list[tuple[int, Path]] = []
-    try:
-        if vendor_root.is_dir():
+    for vendor_root in _three_vendor_roots(root):
+        try:
+            if not vendor_root.is_dir():
+                continue
             for candidate in vendor_root.iterdir():
                 match = re.fullmatch(r"r(\d+)", candidate.name)
                 if match and candidate.is_dir() and not candidate.is_symlink():
                     revision_dirs.append((int(match.group(1)), candidate))
-    except OSError:
-        revision_dirs = []
+        except OSError:
+            continue
 
     if not revision_dirs:
-        return {"available": False}
+        return {"available": False, "embedded_browser_ready": False}
 
     revision_number, runtime_root = max(revision_dirs, key=lambda item: item[0])
     global_path = runtime_root / "three.global.js"
     global_source = _read_text(global_path) or ""
-    service_source = _read_text(root / "backend" / "browser" / "offline-browser-service.js", 4_000_000) or ""
+    service_source = _browser_service_source(root)
 
     assets = {
         "global_bundle": global_path.is_file(),
@@ -355,6 +386,7 @@ def _browser_runtime(root: Path | None) -> dict[str, Any]:
         "core_bundle": (runtime_root / "three.core.js").is_file(),
         "preload": (runtime_root / "three.preload.js").is_file(),
     }
+
     def is_exported(name: str) -> bool:
         return bool(re.search(r"(?:^|[,\{])" + re.escape(name) + r":", global_source))
 
@@ -366,11 +398,18 @@ def _browser_runtime(root: Path | None) -> dict[str, Any]:
         "EffectComposer": is_exported("EffectComposer"),
     }
     addons_bundled = any((runtime_root / name).exists() for name in ("addons", "examples", "jsm"))
+    runtime_assets_available = all((assets["global_bundle"], assets["preload"]))
+    configured_as_browser_preload = "preload: this.threePreloadPath" in service_source
+    embedded_browser_ready = runtime_assets_available and configured_as_browser_preload
 
     return {
-        "available": all((assets["global_bundle"], assets["preload"])),
+        "available": runtime_assets_available,
+        "embedded_browser_ready": embedded_browser_ready,
+        "source": "darkstar_bundled_browser_runtime",
         "revision": str(revision_number),
         "exposure": "window.THREE",
+        "load_required": not embedded_browser_ready,
+        "network_required": False if embedded_browser_ready else None,
         "mode": "document-start" if "mode: 'document-start'" in service_source else "preload",
         "offline": "NETWORK_PROTOCOLS" in service_source and "callback({ cancel: true })" in service_source,
         "common_cdn_urls_redirect_to_packaged_runtime": (
@@ -378,7 +417,7 @@ def _browser_runtime(root: Path | None) -> dict[str, Any]:
             and "unpkg" in service_source
             and "jsdelivr" in service_source
         ),
-        "configured_as_browser_preload": "preload: this.threePreloadPath" in service_source,
+        "configured_as_browser_preload": configured_as_browser_preload,
         "assets": assets,
         "exports": exports,
         "addons_directory_bundled": addons_bundled,
@@ -417,6 +456,40 @@ def _alignment(host_project: dict[str, Any] | None, browser: dict[str, Any]) -> 
     else:
         status = "mismatch"
     return {"status": status, "revisions": sources}
+
+
+
+
+def _availability_summary(workspace_project: dict[str, Any], browser: dict[str, Any]) -> dict[str, Any]:
+    node_import = (workspace_project.get("three") or {}).get("node_import") or {}
+    browser_ready = bool(browser.get("embedded_browser_ready"))
+    node_ready = bool(node_import.get("importable"))
+    browser_summary = {
+        "available": browser_ready,
+        "environment": "darkstar_embedded_browser",
+        "source": browser.get("source") if browser_ready else None,
+        "revision": browser.get("revision") if browser_ready else None,
+        "access": browser.get("exposure") if browser_ready else None,
+        "already_loaded": browser_ready,
+        "network_required": False if browser_ready else None,
+    }
+    if browser_ready:
+        browser_summary["instruction"] = (
+            "For HTML opened in Darkstar's embedded browser, use window.THREE directly. "
+            "Do not add a Three.js CDN script, npm install, or core import for that browser runtime."
+        )
+
+    node_summary = {
+        "available": node_ready,
+        "environment": "active_project_node",
+        "revision": node_import.get("revision") if node_ready else None,
+        "access": "import 'three'" if node_ready else None,
+    }
+    return {
+        "browser": browser_summary,
+        "node": node_summary,
+        "preferred_for_darkstar_browser_html": "browser" if browser_ready else None,
+    }
 
 
 def _compatibility_rules(
@@ -458,9 +531,11 @@ def handler(_arguments: dict[str, Any], **context: Any) -> str:
     browser = _browser_runtime(host_root)
     electron_runtime = _electron_runtime_probe(host_root or workspace_root)
     alignment = _alignment(host_project, browser)
+    availability = _availability_summary(workspace_project, browser)
 
     result = {
         "success": True,
+        "threejs_availability": availability,
         "node_runtime": {
             key: node_runtime.get(key)
             for key in ("available", "version", "major", "platform", "architecture", "module_abi", "napi", "v8")

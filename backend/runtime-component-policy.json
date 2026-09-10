@@ -65,6 +65,31 @@
         }
       },
       {
+        "id": "stable-diffusion.cpp",
+        "name": "stable-diffusion.cpp runtime",
+        "license": "MIT",
+        "patterns": [
+          "diffusion/*/sd-cli.exe",
+          "diffusion/*/sd-server.exe",
+          "diffusion/*/stable-diffusion*.dll",
+          "diffusion/*/ggml*.dll"
+        ],
+        "notices": [
+          "backend/bin/licenses/stable-diffusion.cpp-LICENSE",
+          "backend/bin/licenses/stable-diffusion.cpp-ggml-LICENSE"
+        ],
+        "noticeChecks": {
+          "backend/bin/licenses/stable-diffusion.cpp-LICENSE": [
+            "Permission is hereby granted, free of charge",
+            "THE SOFTWARE IS PROVIDED"
+          ],
+          "backend/bin/licenses/stable-diffusion.cpp-ggml-LICENSE": [
+            "Permission is hereby granted, free of charge",
+            "THE SOFTWARE IS PROVIDED"
+          ]
+        }
+      },
+      {
         "id": "nvidia-cuda-runtime",
         "name": "NVIDIA CUDA 12.4 runtime components",
         "license": "NVIDIA CUDA Toolkit EULA 12.4",
@@ -189,6 +214,33 @@
           "sha256": "6ada441ae5a45a4a3d51ade8850fa2229fc6dd95de0c9da6e2cdd7a46701b844"
         }
       ]
+    },
+    "diffusionBootstrap": {
+      "bundleVersion": 1,
+      "releaseTag": "master-830-50d6405",
+      "commit": "50d6405",
+      "backends": {
+        "cpu": {
+          "label": "CPU",
+          "archives": [
+            {
+              "asset": "sd-master-50d6405-bin-win-cpu-x64.zip",
+              "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-830-50d6405/sd-master-50d6405-bin-win-cpu-x64.zip",
+              "sha256": "a51eaf6b5e779142ef58a0a983fd629589d6a8e76ce2779ed12721c9686b26ce"
+            }
+          ]
+        },
+        "vulkan": {
+          "label": "Vulkan",
+          "archives": [
+            {
+              "asset": "sd-master-50d6405-bin-win-vulkan-x64.zip",
+              "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-830-50d6405/sd-master-50d6405-bin-win-vulkan-x64.zip",
+              "sha256": "633771a830ad3e7e6ca5b602acc4d57fe44fc13a09a5f79bfeb38e7f58af98f9"
+            }
+          ]
+        }
+      }
     }
   }
 }

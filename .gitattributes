@@ -1,0 +1,3 @@
+# Windows Command Prompt batch files require CRLF for reliable CALL :label parsing.
+*.bat text eol=crlf
+*.cmd text eol=crlf

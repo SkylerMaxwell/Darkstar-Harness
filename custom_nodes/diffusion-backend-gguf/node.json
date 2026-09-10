@@ -1,0 +1,12 @@
+{
+  "id": "com.darkstar.diffusion-backend-gguf",
+  "name": "Darkstar Diffusion Backend (GGUF)",
+  "version": "1.2.0",
+  "apiVersion": 1,
+  "description": "Selects and analyzes a GGUF diffusion model, derives required encoder/VAE roles, and conservatively resolves compatible same-directory companions with manual browsing.",
+  "renderer": "renderer.js",
+  "backend": "backend.js",
+  "permissions": [
+    "backend:trusted"
+  ]
+}

@@ -353,7 +353,14 @@ async function writeFileAtomic(filePathValue, content, options = {}) {
         await handle.sync();
         await handle.close();
         handle = null;
-        await fsPromises.rename(temporaryPath, filePath);
+        if (typeof options.commitGuard === 'function') {
+            if (!options.commitGuard()) return filePath;
+            // Keep the guard decision and final rename in one event-loop turn so a
+            // newer synchronous shutdown save cannot be overtaken by this write.
+            fs.renameSync(temporaryPath, filePath);
+        } else {
+            await fsPromises.rename(temporaryPath, filePath);
+        }
         await fsyncDirectory(directory);
     } finally {
         if (handle) {
@@ -507,6 +514,54 @@ module.exports = {
 };
 // <DARKSTAR_SOURCE_END path="backend/persistence/binary-envelope.js">
 });
+// MODULE :: backend/project/project-storage.js
+__darkstarDefineModule("backend/project/project-storage.js", function darkstarModule(module, exports, require, __filename, __dirname) {
+// <DARKSTAR_SOURCE_BEGIN path="backend/project/project-storage.js">
+'use strict';
+
+const path = require('node:path');
+
+const PROJECT_METADATA_DIRECTORY = '.darkstar';
+const PROJECT_CHAT_SESSION_FILE = 'chat-session.dscs';
+
+function portableRelative(value) {
+    return String(value === undefined || value === null ? '' : value).replace(/\\/gu, '/').replace(/^\.\//u, '');
+}
+
+function isInternalProjectRelativePath(value) {
+    const relative = portableRelative(value);
+    if (!relative) return false;
+    const firstSegment = relative.split('/')[0];
+    return firstSegment.toLowerCase() === PROJECT_METADATA_DIRECTORY;
+}
+
+function isInternalProjectPath(candidatePath, projectRoot) {
+    const root = String(projectRoot || '').trim();
+    if (!root) return false;
+    const relative = path.relative(path.resolve(root), path.resolve(String(candidatePath || '')));
+    if (!relative || relative === '.') return false;
+    if (relative.startsWith('..' + path.sep) || relative === '..' || path.isAbsolute(relative)) return false;
+    return isInternalProjectRelativePath(relative);
+}
+
+function projectMetadataDirectory(projectRoot) {
+    return path.join(path.resolve(String(projectRoot || '')), PROJECT_METADATA_DIRECTORY);
+}
+
+function projectChatSessionPath(projectRoot) {
+    return path.join(projectMetadataDirectory(projectRoot), PROJECT_CHAT_SESSION_FILE);
+}
+
+module.exports = {
+    PROJECT_CHAT_SESSION_FILE,
+    PROJECT_METADATA_DIRECTORY,
+    isInternalProjectPath,
+    isInternalProjectRelativePath,
+    projectChatSessionPath,
+    projectMetadataDirectory,
+};
+// <DARKSTAR_SOURCE_END path="backend/project/project-storage.js">
+});
 // --------------------------------------------------------------------------
 // [1200] PREFERENCES :: session stores, protected payloads, theme/dialog state
 // --------------------------------------------------------------------------
@@ -517,62 +572,244 @@ __darkstarDefineModule("backend/preferences/chat-session-store.js", function dar
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { Worker } = require('node:worker_threads');
 const {
     MAX_SESSION_BYTES,
     decodeChatSessionSnapshot,
     encodeChatSessionSnapshot,
-    encodeChatSessionSnapshotAsync,
     isChatSessionBuffer,
 } = require('../chat/chat-session-codec');
-const { isProtectedPayload, protectPayload, unprotectPayload } = require('./protected-payload');
-const { writeFileAtomicSync } = require('../persistence/atomic-file');
+const { projectChatSessionPath, projectMetadataDirectory } = require('../project/project-storage');
+const { isProtectedPayload, protectPayload, protectPayloadAsync, unprotectPayload } = require('./protected-payload');
+const { writeFileAtomic, writeFileAtomicSync } = require('../persistence/atomic-file');
+
+const ROOT_REGISTRY_FORMAT = 'darkstar-chat-project-roots';
+const ROOT_REGISTRY_VERSION = 1;
+
+const CHAT_SESSION_ENCODER_WORKER_SOURCE = String.raw`'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const { parentPort, workerData } = require('node:worker_threads');
+const core = require(workerData.corePath);
+const { encodeChatSessionSnapshot } = core.requireModule('backend/chat/chat-session-codec.js');
+function validDirectoryRoot(rootPath) {
+    const supplied = String(rootPath || '').trim();
+    if (!supplied) return '';
+    try {
+        const resolved = fs.realpathSync(path.resolve(supplied));
+        return fs.statSync(resolved).isDirectory() ? resolved : '';
+    } catch (_) { return ''; }
+}
+function cloneJson(value) {
+    if (value === undefined) return undefined;
+    return JSON.parse(JSON.stringify(value));
+}
+function partitionSnapshot(snapshot, rootHints) {
+    const hints = new Map((Array.isArray(rootHints) ? rootHints : []).map((item) => [Number(item && item.projectId), String(item && item.rootPath || '')]));
+    const projects = Array.isArray(snapshot && snapshot.projects) ? snapshot.projects : [];
+    const tabs = Array.isArray(snapshot && snapshot.tabs) ? snapshot.tabs : [];
+    const records = [];
+    for (const project of projects) {
+        if (!project || !Number.isFinite(Number(project.id))) continue;
+        const projectId = Number(project.id);
+        const rootPath = validDirectoryRoot(hints.get(projectId) || (project.workspace && project.workspace.rootPath));
+        if (!rootPath) continue;
+        const projectTabs = tabs.filter((tab) => tab && Number(tab.projectId) === projectId);
+        const projectCopy = cloneJson(project);
+        projectCopy.workspace = projectCopy.workspace && typeof projectCopy.workspace === 'object' ? projectCopy.workspace : {};
+        projectCopy.workspace.rootPath = rootPath;
+        const ownedTabIds = new Set(projectTabs.map((tab) => Number(tab.id)));
+        const activeTabId = ownedTabIds.has(Number(projectCopy.activeTabId)) ? Number(projectCopy.activeTabId) : (projectTabs[0] ? Number(projectTabs[0].id) : 0);
+        projectCopy.activeTabId = activeTabId;
+        const projectSnapshot = {
+            ...cloneJson(snapshot),
+            activeTabId: Number(snapshot && snapshot.activeProjectId) === projectId ? Number(snapshot && snapshot.activeTabId) : activeTabId,
+            composer: snapshot && snapshot.composer && ownedTabIds.has(Number(snapshot.composer.tabId)) ? cloneJson(snapshot.composer) : null,
+            projects: [projectCopy],
+            tabs: cloneJson(projectTabs),
+        };
+        records.push({ projectId, rootPath, envelope: encodeChatSessionSnapshot(projectSnapshot) });
+    }
+    return records;
+}
+parentPort.on('message', (message) => {
+    const id = Number(message && message.id) || 0;
+    try {
+        const records = partitionSnapshot(message && message.snapshot, message && message.rootHints);
+        const transfer = [];
+        const responseRecords = records.map((record) => {
+            const envelope = Uint8Array.from(record.envelope);
+            transfer.push(envelope.buffer);
+            return { projectId: record.projectId, rootPath: record.rootPath, envelope };
+        });
+        parentPort.postMessage({ id, success: true, records: responseRecords }, transfer);
+    } catch (error) {
+        parentPort.postMessage({ id, success: false, error: String(error && error.message || error) });
+    }
+});`;
+
+class AsyncChatSessionEncoder {
+    constructor(options = {}) {
+        this.corePath = path.resolve(options.corePath || path.join(__dirname, '..', 'Darkstar_Core.js'));
+        this.Worker = options.Worker || Worker;
+        this.worker = null;
+        this.sequence = 0;
+        this.pending = new Map();
+        this.closed = false;
+    }
+
+    _rejectPending(error) {
+        for (const pending of this.pending.values()) pending.reject(error);
+        this.pending.clear();
+    }
+
+    _worker() {
+        if (this.worker) return this.worker;
+        if (this.closed) throw new Error('Chat-session encoder is closed.');
+        const worker = new this.Worker(CHAT_SESSION_ENCODER_WORKER_SOURCE, {
+            eval: true,
+            workerData: { corePath: this.corePath },
+        });
+        worker.on('message', (message) => {
+            const id = Number(message && message.id) || 0;
+            const pending = this.pending.get(id);
+            if (!pending) return;
+            this.pending.delete(id);
+            if (message.success === true) {
+                pending.resolve((Array.isArray(message.records) ? message.records : []).map((record) => ({
+                    projectId: Number(record.projectId),
+                    rootPath: String(record.rootPath || ''),
+                    envelope: Buffer.from(record.envelope || []),
+                })));
+            } else pending.reject(new Error(String(message.error || 'Chat-session encoding failed.')));
+            if (!this.pending.size) worker.unref?.();
+        });
+        worker.on('error', (error) => {
+            if (this.worker === worker) this.worker = null;
+            this._rejectPending(error);
+        });
+        worker.on('exit', (code) => {
+            if (this.worker === worker) this.worker = null;
+            if (!this.closed && Number(code) !== 0) this._rejectPending(new Error(`Chat-session encoder worker exited with code ${code}.`));
+        });
+        worker.unref?.();
+        this.worker = worker;
+        return worker;
+    }
+
+    encode(snapshot, rootHints) {
+        return new Promise((resolve, reject) => {
+            const id = ++this.sequence;
+            this.pending.set(id, { resolve, reject });
+            try {
+                const worker = this._worker();
+                worker.ref?.();
+                worker.postMessage({ id, snapshot, rootHints });
+            } catch (error) {
+                this.pending.delete(id);
+                if (!this.pending.size) this.worker?.unref?.();
+                reject(error);
+            }
+        });
+    }
+
+    close() {
+        this.closed = true;
+        const worker = this.worker;
+        this.worker = null;
+        this._rejectPending(new Error('Chat-session encoder closed.'));
+        try { worker?.terminate?.(); } catch (_) {}
+    }
+}
+
+function sameFilesystemPath(left, right) {
+    const a = path.resolve(String(left || ''));
+    const b = path.resolve(String(right || ''));
+    return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function validDirectoryRoot(rootPath) {
+    const supplied = String(rootPath || '').trim();
+    if (!supplied) return '';
+    try {
+        const resolved = fs.realpathSync(path.resolve(supplied));
+        return fs.statSync(resolved).isDirectory() ? resolved : '';
+    } catch (_error) {
+        return '';
+    }
+}
+
+async function validDirectoryRootAsync(rootPath) {
+    const supplied = String(rootPath || '').trim();
+    if (!supplied) return '';
+    try {
+        const resolved = await fs.promises.realpath(path.resolve(supplied));
+        const stat = await fs.promises.stat(resolved);
+        return stat.isDirectory() ? resolved : '';
+    } catch (_error) {
+        return '';
+    }
+}
+
+function sessionSummary(snapshot) {
+    return {
+        projects: Array.isArray(snapshot?.projects) ? snapshot.projects.length : 0,
+        tabs: Array.isArray(snapshot?.tabs) ? snapshot.tabs.length : 0,
+        messages: Array.isArray(snapshot?.tabs)
+            ? snapshot.tabs.reduce((total, tab) => total + (Array.isArray(tab?.history) ? tab.history.length : 0), 0)
+            : 0,
+    };
+}
+
+function cloneJson(value) {
+    if (value === undefined) return undefined;
+    return JSON.parse(JSON.stringify(value));
+}
 
 class ChatSessionStore {
     constructor(options = {}) {
-        if (!options.filePath) throw new Error('ChatSessionStore requires a filePath.');
-        this.filePath = path.resolve(String(options.filePath));
+        const legacyFilePath = options.legacyFilePath || options.filePath;
+        if (!legacyFilePath) throw new Error('ChatSessionStore requires a legacyFilePath or filePath.');
+        this.legacyFilePath = path.resolve(String(legacyFilePath));
+        // Keep filePath as a compatibility alias for diagnostics/tests. New writes
+        // are project-owned and never target this path.
+        this.filePath = this.legacyFilePath;
+        this.registryPath = path.resolve(String(options.registryPath || path.join(path.dirname(this.legacyFilePath), 'chat-project-roots.json')));
+        this.baseDir = path.resolve(String(options.baseDir || path.join(__dirname, '..', '..')));
         this.protector = options.protector || null;
+        this.rootForProject = typeof options.rootForProject === 'function' ? options.rootForProject : null;
         this.onDiagnosticEvent = typeof options.onDiagnosticEvent === 'function' ? options.onDiagnosticEvent : null;
         this.saveSequence = 0;
         this.committedSaveSequence = 0;
         this.asyncSaveInFlight = false;
         this.pendingAsyncSave = null;
+        this.encoder = options.encoder || new AsyncChatSessionEncoder({ corePath: options.corePath });
     }
 
     load() {
-        try {
-            const stat = fs.statSync(this.filePath);
-            if (!stat.isFile() || stat.size > MAX_SESSION_BYTES * 2) return null;
-            const stored = fs.readFileSync(this.filePath);
-            const buffer = unprotectPayload(stored, this.protector);
-            if (!isChatSessionBuffer(buffer)) return null;
-            return decodeChatSessionSnapshot(buffer);
-        } catch (_error) {
-            return null;
-        }
+        this._migrateLegacySnapshotBestEffort();
+        const records = this._loadProjectRecords();
+        if (records.length) return this._mergeProjectRecords(records);
+        return this._loadLegacySnapshot();
     }
 
     save(snapshot) {
         const saveSequence = ++this.saveSequence;
+        const records = this._partitionSnapshot(snapshot);
         const memory = process.memoryUsage?.() || {};
-        const summary = {
-            tabs: Array.isArray(snapshot?.tabs) ? snapshot.tabs.length : 0,
-            messages: Array.isArray(snapshot?.tabs)
-                ? snapshot.tabs.reduce((total, tab) => total + (Array.isArray(tab?.history) ? tab.history.length : 0), 0)
-                : 0,
-            rss: Number(memory.rss) || 0,
-            heapUsed: Number(memory.heapUsed) || 0,
-        };
+        const summary = { ...sessionSummary(snapshot), projectFiles: records.length, rss: Number(memory.rss) || 0, heapUsed: Number(memory.heapUsed) || 0 };
         this._diagnostic('encode-start', summary);
-        const serializedEnvelope = encodeChatSessionSnapshot(snapshot);
-        this._diagnostic('encode-complete', { ...summary, envelopeBytes: serializedEnvelope.length });
-        const encoded = protectPayload(serializedEnvelope, this.protector);
-        this._diagnostic('write-start', { ...summary, storedBytes: encoded.length });
-        this._writeEncodedSync(encoded);
+        const encodedRecords = records.map((record) => ({ ...record, envelope: encodeChatSessionSnapshot(record.snapshot) }));
+        const envelopeBytes = encodedRecords.reduce((total, record) => total + record.envelope.length, 0);
+        this._diagnostic('encode-complete', { ...summary, envelopeBytes });
+        const storedRecords = encodedRecords.map((record) => ({ ...record, stored: protectPayload(record.envelope, this.protector) }));
+        const storedBytes = storedRecords.reduce((total, record) => total + record.stored.length, 0);
+        this._diagnostic('write-start', { ...summary, storedBytes });
+        for (const record of storedRecords) this._writeProjectRecord(record.rootPath, record.stored);
+        this._rememberProjectRoots(storedRecords.map((record) => record.rootPath));
         this.committedSaveSequence = Math.max(this.committedSaveSequence, saveSequence);
-        const result = { bytes: encoded.length, filePath: this.filePath, protected: isProtectedPayload(encoded) };
-        this._diagnostic('write-complete', { ...summary, storedBytes: encoded.length });
-        return result;
+        this._diagnostic('write-complete', { ...summary, storedBytes });
+        return { bytes: storedBytes, projectFiles: storedRecords.length, protected: storedRecords.some((record) => isProtectedPayload(record.stored)) };
     }
 
     saveAsync(snapshot) {
@@ -582,16 +819,9 @@ class ChatSessionStore {
                 this.pendingAsyncSave.snapshot = snapshot;
                 this.pendingAsyncSave.saveSequence = saveSequence;
                 this.pendingAsyncSave.waiters.push({ resolve, reject });
-                this._diagnostic('save-coalesced', {
-                    saveSequence,
-                    pendingWaiters: this.pendingAsyncSave.waiters.length,
-                });
+                this._diagnostic('save-coalesced', { saveSequence, pendingWaiters: this.pendingAsyncSave.waiters.length });
             } else {
-                this.pendingAsyncSave = {
-                    snapshot,
-                    saveSequence,
-                    waiters: [{ resolve, reject }],
-                };
+                this.pendingAsyncSave = { snapshot, saveSequence, waiters: [{ resolve, reject }] };
             }
             this._drainAsyncSaves();
         });
@@ -617,45 +847,362 @@ class ChatSessionStore {
         }
     }
 
+    _projectRootHints(snapshot) {
+        return (Array.isArray(snapshot?.projects) ? snapshot.projects : []).map((project) => {
+            const projectId = Number(project?.id);
+            let rootPath = '';
+            try {
+                rootPath = this.rootForProject ? this.rootForProject(projectId) : String(project?.workspace?.rootPath || '');
+            } catch (_error) { rootPath = ''; }
+            return { projectId, rootPath: String(rootPath || '') };
+        });
+    }
+
     async _saveAsyncBatch(snapshot, saveSequence) {
         const memory = process.memoryUsage?.() || {};
+        // Normal autosaves must not walk the full chat payload on Electron's main
+        // event loop merely to populate diagnostics. Exact partitioning, cloning,
+        // serialization, and compression are owned by the encoder worker.
         const summary = {
+            projects: Array.isArray(snapshot?.projects) ? snapshot.projects.length : 0,
             tabs: Array.isArray(snapshot?.tabs) ? snapshot.tabs.length : 0,
-            messages: Array.isArray(snapshot?.tabs)
-                ? snapshot.tabs.reduce((total, tab) => total + (Array.isArray(tab?.history) ? tab.history.length : 0), 0)
-                : 0,
+            messages: null,
+            projectFiles: Array.isArray(snapshot?.projects) ? snapshot.projects.length : 0,
             rss: Number(memory.rss) || 0,
             heapUsed: Number(memory.heapUsed) || 0,
             saveSequence,
         };
-
         if (saveSequence < this.committedSaveSequence) {
             this._diagnostic('write-skipped-stale', { ...summary, committedSaveSequence: this.committedSaveSequence });
-            return { bytes: 0, filePath: this.filePath, protected: false, stale: true };
+            return { bytes: 0, projectFiles: 0, protected: false, stale: true };
         }
-
         this._diagnostic('encode-start', summary);
-        const serializedEnvelope = await encodeChatSessionSnapshotAsync(snapshot);
-        this._diagnostic('encode-complete', { ...summary, envelopeBytes: serializedEnvelope.length });
-
-        // A newer synchronous save (notably the shutdown save) may commit while
-        // gzip is running off-thread. Never let this older result overwrite it.
+        const encodedRecords = await this.encoder.encode(snapshot, this._projectRootHints(snapshot));
+        summary.projectFiles = encodedRecords.length;
+        const envelopeBytes = encodedRecords.reduce((total, record) => total + record.envelope.length, 0);
+        this._diagnostic('encode-complete', { ...summary, envelopeBytes });
         if (saveSequence < this.committedSaveSequence) {
             this._diagnostic('write-skipped-stale', { ...summary, committedSaveSequence: this.committedSaveSequence });
-            return { bytes: 0, filePath: this.filePath, protected: false, stale: true };
+            return { bytes: 0, projectFiles: 0, protected: false, stale: true };
         }
-
-        const encoded = protectPayload(serializedEnvelope, this.protector);
-        this._diagnostic('write-start', { ...summary, storedBytes: encoded.length });
-        this._writeEncodedSync(encoded);
+        const storedRecords = [];
+        for (const record of encodedRecords) storedRecords.push({ ...record, stored: await protectPayloadAsync(record.envelope, this.protector) });
+        const storedBytes = storedRecords.reduce((total, record) => total + record.stored.length, 0);
+        this._diagnostic('write-start', { ...summary, storedBytes });
+        for (const record of storedRecords) {
+            if (saveSequence < this.committedSaveSequence) {
+                this._diagnostic('write-skipped-stale', { ...summary, committedSaveSequence: this.committedSaveSequence });
+                return { bytes: 0, projectFiles: 0, protected: false, stale: true };
+            }
+            await this._writeProjectRecordAsync(record.rootPath, record.stored, saveSequence);
+        }
+        await this._rememberProjectRootsAsync(storedRecords.map((record) => record.rootPath));
         this.committedSaveSequence = Math.max(this.committedSaveSequence, saveSequence);
-        const result = { bytes: encoded.length, filePath: this.filePath, protected: isProtectedPayload(encoded) };
-        this._diagnostic('write-complete', { ...summary, storedBytes: encoded.length });
-        return result;
+        this._diagnostic('write-complete', { ...summary, storedBytes });
+        return { bytes: storedBytes, projectFiles: storedRecords.length, protected: storedRecords.some((record) => isProtectedPayload(record.stored)) };
     }
 
-    _writeEncodedSync(encoded) {
-        writeFileAtomicSync(this.filePath, encoded);
+    _partitionSnapshot(snapshot, options = {}) {
+        const projects = Array.isArray(snapshot?.projects) ? snapshot.projects : [];
+        const tabs = Array.isArray(snapshot?.tabs) ? snapshot.tabs : [];
+        const records = [];
+        for (const project of projects) {
+            if (!project || !Number.isFinite(Number(project.id))) continue;
+            const projectId = Number(project.id);
+            const rootPath = this._rootForSnapshotProject(project, options);
+            if (!rootPath) continue;
+            const projectTabs = tabs.filter((tab) => tab && Number(tab.projectId) === projectId);
+            const projectCopy = cloneJson(project);
+            projectCopy.workspace = projectCopy.workspace && typeof projectCopy.workspace === 'object' ? projectCopy.workspace : {};
+            projectCopy.workspace.rootPath = rootPath;
+            const ownedTabIds = new Set(projectTabs.map((tab) => Number(tab.id)));
+            const activeTabId = ownedTabIds.has(Number(projectCopy.activeTabId))
+                ? Number(projectCopy.activeTabId)
+                : (projectTabs[0] ? Number(projectTabs[0].id) : 0);
+            projectCopy.activeTabId = activeTabId;
+            const projectSnapshot = {
+                ...cloneJson(snapshot),
+                activeTabId: Number(snapshot?.activeProjectId) === projectId ? Number(snapshot?.activeTabId) : activeTabId,
+                composer: snapshot?.composer && ownedTabIds.has(Number(snapshot.composer.tabId)) ? cloneJson(snapshot.composer) : null,
+                projects: [projectCopy],
+                tabs: cloneJson(projectTabs),
+            };
+            records.push({ projectId, rootPath, snapshot: projectSnapshot });
+        }
+        return records;
+    }
+
+    _rootForSnapshotProject(project, options = {}) {
+        const projectId = Number(project?.id);
+        if (options.migration === true) return validDirectoryRoot(project?.workspace?.rootPath);
+        if (this.rootForProject) return validDirectoryRoot(this.rootForProject(projectId));
+        return validDirectoryRoot(project?.workspace?.rootPath);
+    }
+
+    _writeProjectRecord(rootPath, stored) {
+        const metadataDirectory = projectMetadataDirectory(rootPath);
+        fs.mkdirSync(metadataDirectory, { recursive: true });
+        const metadataStat = fs.lstatSync(metadataDirectory);
+        if (!metadataStat.isDirectory() || metadataStat.isSymbolicLink()) throw new Error('Darkstar project metadata path must be a real directory.');
+        writeFileAtomicSync(projectChatSessionPath(rootPath), stored);
+    }
+
+    async _writeProjectRecordAsync(rootPath, stored, saveSequence) {
+        const metadataDirectory = projectMetadataDirectory(rootPath);
+        await fs.promises.mkdir(metadataDirectory, { recursive: true });
+        const metadataStat = await fs.promises.lstat(metadataDirectory);
+        if (!metadataStat.isDirectory() || metadataStat.isSymbolicLink()) throw new Error('Darkstar project metadata path must be a real directory.');
+        await writeFileAtomic(projectChatSessionPath(rootPath), stored, {
+            commitGuard: () => saveSequence >= this.committedSaveSequence,
+        });
+    }
+
+    _readSnapshotFile(filePath) {
+        try {
+            const stat = fs.statSync(filePath);
+            if (!stat.isFile() || stat.size > MAX_SESSION_BYTES * 2) return null;
+            const stored = fs.readFileSync(filePath);
+            const buffer = unprotectPayload(stored, this.protector);
+            if (!isChatSessionBuffer(buffer)) return null;
+            return decodeChatSessionSnapshot(buffer);
+        } catch (_error) {
+            return null;
+        }
+    }
+
+    _loadLegacySnapshot() {
+        return this._readSnapshotFile(this.legacyFilePath);
+    }
+
+    _managedProjectRoots() {
+        const projectsRoot = path.join(this.baseDir, 'projects');
+        try {
+            const root = fs.realpathSync(projectsRoot);
+            return fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => {
+                const candidate = path.join(root, entry.name);
+                try {
+                    const stat = fs.lstatSync(candidate);
+                    return stat.isDirectory() && !stat.isSymbolicLink() ? fs.realpathSync(candidate) : '';
+                } catch (_error) { return ''; }
+            }).filter(Boolean);
+        } catch (_error) {
+            return [];
+        }
+    }
+
+    _loadRegistryRoots() {
+        try {
+            const stored = fs.readFileSync(this.registryPath);
+            const decoded = unprotectPayload(stored, this.protector);
+            const payload = JSON.parse(decoded.toString('utf8'));
+            if (!payload || payload.format !== ROOT_REGISTRY_FORMAT || Number(payload.version) !== ROOT_REGISTRY_VERSION || !Array.isArray(payload.roots)) return [];
+            return payload.roots.map((value) => String(value || '').trim()).filter(Boolean);
+        } catch (_error) {
+            return [];
+        }
+    }
+
+    _writeRegistryRoots(roots) {
+        const normalized = [];
+        for (const root of roots || []) {
+            const value = String(root || '').trim();
+            if (!value || normalized.some((existing) => sameFilesystemPath(existing, value))) continue;
+            normalized.push(path.resolve(value));
+        }
+        const payload = Buffer.from(JSON.stringify({ format: ROOT_REGISTRY_FORMAT, version: ROOT_REGISTRY_VERSION, roots: normalized }, null, 2), 'utf8');
+        writeFileAtomicSync(this.registryPath, protectPayload(payload, this.protector));
+    }
+
+    async _loadRegistryRootsAsync() {
+        try {
+            const stored = await fs.promises.readFile(this.registryPath);
+            const decoded = unprotectPayload(stored, this.protector);
+            const payload = JSON.parse(decoded.toString('utf8'));
+            if (!payload || payload.format !== ROOT_REGISTRY_FORMAT || Number(payload.version) !== ROOT_REGISTRY_VERSION || !Array.isArray(payload.roots)) return [];
+            return payload.roots.map((value) => String(value || '').trim()).filter(Boolean);
+        } catch (_error) {
+            return [];
+        }
+    }
+
+    async _writeRegistryRootsAsync(roots) {
+        const normalized = [];
+        for (const root of roots || []) {
+            const value = String(root || '').trim();
+            if (!value || normalized.some((existing) => sameFilesystemPath(existing, value))) continue;
+            normalized.push(path.resolve(value));
+        }
+        const payload = Buffer.from(JSON.stringify({ format: ROOT_REGISTRY_FORMAT, version: ROOT_REGISTRY_VERSION, roots: normalized }, null, 2), 'utf8');
+        await writeFileAtomic(this.registryPath, protectPayload(payload, this.protector));
+    }
+
+    async _rememberProjectRootsAsync(roots) {
+        const combined = await this._loadRegistryRootsAsync();
+        for (const root of roots || []) {
+            const canonical = await validDirectoryRootAsync(root);
+            if (canonical && !combined.some((existing) => sameFilesystemPath(existing, canonical))) combined.push(canonical);
+        }
+        await this._writeRegistryRootsAsync(combined);
+    }
+
+    _rememberProjectRoots(roots) {
+        const combined = this._loadRegistryRoots();
+        for (const root of roots || []) {
+            const canonical = validDirectoryRoot(root);
+            if (canonical && !combined.some((existing) => sameFilesystemPath(existing, canonical))) combined.push(canonical);
+        }
+        this._writeRegistryRoots(combined);
+    }
+
+    rememberProjectRoot(rootPath) {
+        const canonical = validDirectoryRoot(rootPath);
+        if (!canonical) return false;
+        this._rememberProjectRoots([canonical]);
+        return true;
+    }
+
+    forgetProjectRoot(rootPath) {
+        const supplied = String(rootPath || '').trim();
+        if (!supplied) return false;
+        const before = this._loadRegistryRoots();
+        const after = before.filter((entry) => !sameFilesystemPath(entry, supplied));
+        if (after.length === before.length) return false;
+        this._writeRegistryRoots(after);
+        return true;
+    }
+
+    _candidateRoots() {
+        const candidates = [...this._managedProjectRoots(), ...this._loadRegistryRoots()];
+        const roots = [];
+        for (const candidate of candidates) {
+            const canonical = validDirectoryRoot(candidate);
+            if (canonical && !roots.some((existing) => sameFilesystemPath(existing, canonical))) roots.push(canonical);
+        }
+        return roots;
+    }
+
+    _loadProjectRecords() {
+        const records = [];
+        for (const rootPath of this._candidateRoots()) {
+            const snapshot = this._readSnapshotFile(projectChatSessionPath(rootPath));
+            if (!snapshot || !Array.isArray(snapshot.projects) || snapshot.projects.length !== 1 || !Array.isArray(snapshot.tabs)) continue;
+            const project = cloneJson(snapshot.projects[0]);
+            project.workspace = project.workspace && typeof project.workspace === 'object' ? project.workspace : {};
+            project.workspace.rootPath = rootPath;
+            records.push({ rootPath, snapshot: { ...snapshot, projects: [project] } });
+        }
+        return records;
+    }
+
+    _mergeProjectRecords(records) {
+        const projects = [];
+        const tabs = [];
+        const usedProjectIds = new Set();
+        const usedTabIds = new Set();
+        let activeProjectId = null;
+        let activeTabId = null;
+        let newest = null;
+        let scheduledMessageSequence = 0;
+        let messageIdentitySequence = 0;
+
+        const nextFreeId = (used, requested) => {
+            let id = Number.isFinite(Number(requested)) ? Math.max(0, Math.floor(Number(requested))) : 0;
+            while (used.has(id)) id += 1;
+            used.add(id);
+            return id;
+        };
+
+        for (const record of records) {
+            const snapshot = record.snapshot;
+            const sourceProject = cloneJson(snapshot.projects[0]);
+            const originalProjectId = Number(sourceProject.id);
+            const projectId = nextFreeId(usedProjectIds, originalProjectId);
+            sourceProject.id = projectId;
+            sourceProject.workspace = sourceProject.workspace && typeof sourceProject.workspace === 'object' ? sourceProject.workspace : {};
+            sourceProject.workspace.rootPath = record.rootPath;
+            const tabIdMap = new Map();
+            const projectTabs = [];
+            for (const sourceTab of snapshot.tabs) {
+                if (!sourceTab || Number(sourceTab.projectId) !== originalProjectId) continue;
+                const tab = cloneJson(sourceTab);
+                const originalTabId = Number(tab.id);
+                const tabId = nextFreeId(usedTabIds, originalTabId);
+                tabIdMap.set(originalTabId, tabId);
+                tab.id = tabId;
+                tab.projectId = projectId;
+                projectTabs.push(tab);
+                tabs.push(tab);
+            }
+            const requestedActiveTab = tabIdMap.get(Number(sourceProject.activeTabId));
+            sourceProject.activeTabId = requestedActiveTab !== undefined ? requestedActiveTab : (projectTabs[0]?.id ?? 0);
+            projects.push(sourceProject);
+            if (Number(snapshot.activeProjectId) === originalProjectId) {
+                activeProjectId = projectId;
+                const mappedActiveTab = tabIdMap.get(Number(snapshot.activeTabId));
+                activeTabId = mappedActiveTab !== undefined ? mappedActiveTab : sourceProject.activeTabId;
+            }
+            scheduledMessageSequence = Math.max(scheduledMessageSequence, Number(snapshot.scheduledMessageSequence) || 0);
+            messageIdentitySequence = Math.max(messageIdentitySequence, Number(snapshot.messageIdentitySequence) || 0);
+            const savedAt = Date.parse(String(snapshot.savedAt || ''));
+            if (!newest || (Number.isFinite(savedAt) && savedAt > newest.savedAt)) newest = { savedAt: Number.isFinite(savedAt) ? savedAt : 0, snapshot };
+        }
+
+        if (!projects.length || !tabs.length) return null;
+        if (activeProjectId === null || !projects.some((project) => Number(project.id) === Number(activeProjectId))) activeProjectId = Number(projects[0].id);
+        const activeProject = projects.find((project) => Number(project.id) === Number(activeProjectId)) || projects[0];
+        const activeProjectTabIds = new Set(tabs.filter((tab) => Number(tab.projectId) === Number(activeProject.id)).map((tab) => Number(tab.id)));
+        if (activeTabId === null || !activeProjectTabIds.has(Number(activeTabId))) activeTabId = Number(activeProject.activeTabId);
+        activeProject.activeTabId = activeTabId;
+        const highestProjectId = projects.reduce((maximum, project) => Math.max(maximum, Number(project.id) || 0), 0);
+        const highestTabId = tabs.reduce((maximum, tab) => Math.max(maximum, Number(tab.id) || 0), 0);
+        const activeTab = tabs.find((tab) => Number(tab.id) === Number(activeTabId));
+        const composerDraft = activeTab?.composerDraft || { text: '', image: null };
+        return {
+            format: 'darkstar-chat-session',
+            version: 2,
+            savedAt: newest?.snapshot?.savedAt || new Date().toISOString(),
+            activeProjectId,
+            nextProjectId: highestProjectId + 1,
+            activeTabId,
+            nextTabId: highestTabId + 1,
+            scheduledMessageSequence,
+            messageIdentitySequence,
+            workspaceSidebarCollapsed: newest?.snapshot?.workspaceSidebarCollapsed === true,
+            composer: { tabId: activeTabId, text: String(composerDraft.text || ''), image: cloneJson(composerDraft.image || null) },
+            projects,
+            tabs,
+        };
+    }
+
+    _migrateLegacySnapshotBestEffort() {
+        const legacy = this._loadLegacySnapshot();
+        if (!legacy || Number(legacy.version) !== 2 || !Array.isArray(legacy.projects) || !Array.isArray(legacy.tabs)) return false;
+        let records;
+        try { records = this._partitionSnapshot(legacy, { migration: true }); }
+        catch (_error) { return false; }
+        if (!records.length) return false;
+        let complete = records.length === legacy.projects.length;
+        const migratedRoots = [];
+        for (const record of records) {
+            try {
+                const target = projectChatSessionPath(record.rootPath);
+                if (!fs.existsSync(target)) this._writeProjectRecord(record.rootPath, protectPayload(encodeChatSessionSnapshot(record.snapshot), this.protector));
+                migratedRoots.push(record.rootPath);
+            } catch (_error) {
+                complete = false;
+            }
+        }
+        if (migratedRoots.length) this._rememberProjectRoots(migratedRoots);
+        if (!complete) return false;
+        let backupPath = this.legacyFilePath + '.migrated-backup';
+        try {
+            if (fs.existsSync(backupPath)) backupPath += '-' + Date.now();
+            fs.renameSync(this.legacyFilePath, backupPath);
+            this._diagnostic('legacy-migrated', { projectFiles: records.length, backupPath });
+            return true;
+        } catch (_error) {
+            return false;
+        }
     }
 
     _diagnostic(phase, details = {}) {
@@ -664,20 +1211,25 @@ class ChatSessionStore {
         catch (_) { /* Crash diagnostics must never alter persistence behavior. */ }
     }
 
+    close() {
+        try { this.encoder?.close?.(); } catch (_) {}
+    }
+
     clear() {
         const clearSequence = ++this.saveSequence;
         this.committedSaveSequence = Math.max(this.committedSaveSequence, clearSequence);
-        try {
-            fs.unlinkSync(this.filePath);
-            return true;
-        } catch (error) {
-            if (error?.code === 'ENOENT') return false;
-            throw error;
+        let removed = false;
+        for (const rootPath of this._candidateRoots()) {
+            try { fs.unlinkSync(projectChatSessionPath(rootPath)); removed = true; }
+            catch (error) { if (error?.code !== 'ENOENT') throw error; }
         }
+        try { fs.unlinkSync(this.legacyFilePath); removed = true; }
+        catch (error) { if (error?.code !== 'ENOENT') throw error; }
+        return removed;
     }
 }
 
-module.exports = { ChatSessionStore };
+module.exports = { AsyncChatSessionEncoder, ChatSessionStore, ROOT_REGISTRY_FORMAT, ROOT_REGISTRY_VERSION };
 // <DARKSTAR_SOURCE_END path="backend/preferences/chat-session-store.js">
 });
 // MODULE :: backend/preferences/dialog-location-store.js
@@ -691,6 +1243,7 @@ const { protectPayload, unprotectPayload } = require('./protected-payload');
 
 const DIALOG_LOCATION_KEYS = Object.freeze({
     MODELS: 'models',
+    DIFFUSION_MODELS: 'diffusion-models',
     PROJECTORS: 'projectors',
     TOOLS: 'tools',
     SKILLS: 'skills',
@@ -791,7 +1344,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { protectPayload, unprotectPayload } = require('./protected-payload');
 
-const LOCAL_MODEL_HISTORY_KEYS = Object.freeze({ MODELS: 'models', PROJECTORS: 'projectors' });
+const LOCAL_MODEL_HISTORY_KEYS = Object.freeze({ MODELS: 'models', DIFFUSION_MODELS: 'diffusionModels', PROJECTORS: 'projectors' });
 const VALID_HISTORY_KEYS = new Set(Object.values(LOCAL_MODEL_HISTORY_KEYS));
 
 function normalizedHistoryPath(value) {
@@ -831,10 +1384,11 @@ class LocalModelHistoryStore {
             const parsed = JSON.parse(unprotectPayload(stored, this.protector).toString('utf8'));
             return {
                 models: normalizeHistoryList(parsed?.models),
+                diffusionModels: normalizeHistoryList(parsed?.diffusionModels),
                 projectors: normalizeHistoryList(parsed?.projectors),
             };
         } catch (_error) {
-            return { models: [], projectors: [] };
+            return { models: [], diffusionModels: [], projectors: [] };
         }
     }
 
@@ -892,7 +1446,14 @@ __darkstarDefineModule("backend/preferences/protected-payload.js", function dark
 // <DARKSTAR_SOURCE_BEGIN path="backend/preferences/protected-payload.js">
 'use strict';
 
+const crypto = require('node:crypto');
+
 const MAGIC = Buffer.from([0x42, 0x53, 0x50, 0x52, 0x4f, 0x54, 0x01, 0x00]); // BSPROT\x01\0
+const ASYNC_MAGIC = Buffer.from([0x42, 0x53, 0x50, 0x52, 0x4f, 0x54, 0x02, 0x00]); // BSPROT\x02\0
+const WRAPPED_LENGTH_BYTES = 4;
+const AES_KEY_BYTES = 32;
+const AES_IV_BYTES = 12;
+const AES_TAG_BYTES = 16;
 
 function encryptionAvailable(protector) {
     try {
@@ -908,10 +1469,12 @@ function encryptionAvailable(protector) {
     }
 }
 
+function hasMagic(source, magic) {
+    return Buffer.isBuffer(source) && source.length > magic.length && source.subarray(0, magic.length).equals(magic);
+}
+
 function isProtectedPayload(buffer) {
-    return Buffer.isBuffer(buffer)
-        && buffer.length > MAGIC.length
-        && buffer.subarray(0, MAGIC.length).equals(MAGIC);
+    return hasMagic(buffer, MAGIC) || hasMagic(buffer, ASYNC_MAGIC);
 }
 
 function protectPayload(buffer, protector) {
@@ -921,21 +1484,66 @@ function protectPayload(buffer, protector) {
     return Buffer.concat([MAGIC, Buffer.from(encrypted)]);
 }
 
+async function protectPayloadAsync(buffer, protector) {
+    const source = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
+    if (!encryptionAvailable(protector)) return source;
+    const key = crypto.randomBytes(AES_KEY_BYTES);
+    try {
+        // safeStorage is synchronous in Electron. Wrap only a tiny random data key
+        // there; encrypt the potentially large payload through asynchronous WebCrypto.
+        const wrappedKey = Buffer.from(protector.encryptString(key.toString('base64')));
+        const iv = crypto.randomBytes(AES_IV_BYTES);
+        const cryptoKey = await crypto.webcrypto.subtle.importKey('raw', key, { name: 'AES-GCM' }, false, ['encrypt']);
+        const ciphertext = Buffer.from(await crypto.webcrypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, source));
+        const header = Buffer.alloc(WRAPPED_LENGTH_BYTES);
+        header.writeUInt32BE(wrappedKey.length, 0);
+        return Buffer.concat([ASYNC_MAGIC, header, wrappedKey, iv, ciphertext]);
+    } finally {
+        key.fill(0);
+    }
+}
+
+function unprotectAsyncPayload(source, protector) {
+    const lengthOffset = ASYNC_MAGIC.length;
+    if (source.length < lengthOffset + WRAPPED_LENGTH_BYTES + AES_IV_BYTES + AES_TAG_BYTES) throw new Error('The protected payload is truncated.');
+    const wrappedLength = source.readUInt32BE(lengthOffset);
+    const wrappedStart = lengthOffset + WRAPPED_LENGTH_BYTES;
+    const wrappedEnd = wrappedStart + wrappedLength;
+    const ivEnd = wrappedEnd + AES_IV_BYTES;
+    if (wrappedLength <= 0 || ivEnd + AES_TAG_BYTES > source.length) throw new Error('The protected payload header is invalid.');
+    const key = Buffer.from(String(protector.decryptString(source.subarray(wrappedStart, wrappedEnd)) || ''), 'base64');
+    if (key.length !== AES_KEY_BYTES) throw new Error('The protected payload key is invalid.');
+    try {
+        const iv = source.subarray(wrappedEnd, ivEnd);
+        const encrypted = source.subarray(ivEnd);
+        const ciphertext = encrypted.subarray(0, encrypted.length - AES_TAG_BYTES);
+        const tag = encrypted.subarray(encrypted.length - AES_TAG_BYTES);
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+        decipher.setAuthTag(tag);
+        return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    } finally {
+        key.fill(0);
+    }
+}
+
 function unprotectPayload(buffer, protector) {
     const source = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
     if (!isProtectedPayload(source)) return source;
     if (!encryptionAvailable(protector)) {
         throw new Error('This private session is encrypted, but operating-system secure storage is unavailable.');
     }
+    if (hasMagic(source, ASYNC_MAGIC)) return unprotectAsyncPayload(source, protector);
     const encoded = protector.decryptString(source.subarray(MAGIC.length));
     return Buffer.from(String(encoded || ''), 'base64');
 }
 
 module.exports = {
+    ASYNC_MAGIC,
     MAGIC,
     encryptionAvailable,
     isProtectedPayload,
     protectPayload,
+    protectPayloadAsync,
     unprotectPayload,
 };
 // <DARKSTAR_SOURCE_END path="backend/preferences/protected-payload.js">
@@ -945,11 +1553,16 @@ __darkstarDefineModule("backend/preferences/window-theme.js", function darkstarM
 // <DARKSTAR_SOURCE_BEGIN path="backend/preferences/window-theme.js">
 'use strict';
 
+const fs = require('node:fs');
+const { writeFileAtomicSync } = require('../persistence/atomic-file');
+
 const TITLE_BAR_OVERLAY_COLOR = '#00000000';
 const TITLE_BAR_HEIGHT = 40;
+const DEFAULT_WINDOW_THEME = 'space';
+const THEME_PREFERENCE_SCHEMA_VERSION = 1;
 
 const WINDOW_THEMES = Object.freeze({
-    'deep-blue': Object.freeze({ backgroundColor: '#03060c', symbolColor: '#f5f7ff' }),
+    // Retired theme slot intentionally omitted; legacy selections normalize to Space.
     light: Object.freeze({ backgroundColor: '#eef2f8', symbolColor: '#182033' }),
     quantum: Object.freeze({ backgroundColor: '#000000', symbolColor: '#e6e6e6' }),
     terminal: Object.freeze({ backgroundColor: '#020503', symbolColor: '#d8ffe2' }),
@@ -958,8 +1571,8 @@ const WINDOW_THEMES = Object.freeze({
 });
 
 function normalizeWindowTheme(theme) {
-    const migrated = theme === 'dark' ? 'deep-blue' : theme === 'blue-bird' ? 'quantum' : theme === 'horizon' ? 'terminal' : theme === 'sunset' ? 'deep-blue' : theme;
-    return Object.prototype.hasOwnProperty.call(WINDOW_THEMES, migrated) ? migrated : 'deep-blue';
+    const migrated = theme === 'deep-blue' || theme === 'dark' || theme === 'sunset' ? 'space' : theme === 'blue-bird' ? 'quantum' : theme === 'horizon' ? 'terminal' : theme;
+    return Object.prototype.hasOwnProperty.call(WINDOW_THEMES, migrated) ? migrated : DEFAULT_WINDOW_THEME;
 }
 
 function windowThemeOptions(theme) {
@@ -982,9 +1595,49 @@ function applyWindowTheme(window, theme) {
     return options.normalized;
 }
 
+class ThemePreferenceStore {
+    constructor(filePath) {
+        this.filePath = String(filePath || '').trim();
+        this.loaded = false;
+        this.persisted = false;
+        this.theme = DEFAULT_WINDOW_THEME;
+    }
+
+    load() {
+        if (this.loaded) return { theme: this.theme, persisted: this.persisted };
+        this.loaded = true;
+        if (!this.filePath) return { theme: this.theme, persisted: false };
+        try {
+            const payload = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
+            if (Number(payload?.schemaVersion) === THEME_PREFERENCE_SCHEMA_VERSION && typeof payload?.theme === 'string') {
+                this.theme = normalizeWindowTheme(payload.theme);
+                this.persisted = true;
+            }
+        } catch (error) {
+            if (error?.code !== 'ENOENT') this.persisted = false;
+        }
+        return { theme: this.theme, persisted: this.persisted };
+    }
+
+    save(theme) {
+        const normalized = normalizeWindowTheme(theme);
+        if (this.loaded && this.persisted && this.theme === normalized) return normalized;
+        if (!this.filePath) return normalized;
+        const payload = `${JSON.stringify({ schemaVersion: THEME_PREFERENCE_SCHEMA_VERSION, theme: normalized }, null, 2)}\n`;
+        writeFileAtomicSync(this.filePath, payload, { mode: 0o600 });
+        this.loaded = true;
+        this.persisted = true;
+        this.theme = normalized;
+        return normalized;
+    }
+}
+
 module.exports = {
+    DEFAULT_WINDOW_THEME,
+    THEME_PREFERENCE_SCHEMA_VERSION,
     TITLE_BAR_HEIGHT,
     TITLE_BAR_OVERLAY_COLOR,
+    ThemePreferenceStore,
     WINDOW_THEMES,
     applyWindowTheme,
     normalizeWindowTheme,
@@ -999,14 +1652,15 @@ __darkstarDefineModule("backend/preferences/workflow-session-store.js", function
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { Worker } = require('node:worker_threads');
 const {
     MAX_WORKFLOW_BYTES,
     decodeWorkflowSnapshot,
     encodeWorkflowSnapshot,
     isWorkflowSnapshotBuffer,
 } = require('../workflow/workflow-snapshot-codec');
-const { isProtectedPayload, protectPayload, unprotectPayload } = require('./protected-payload');
-const { writeFileAtomicSync } = require('../persistence/atomic-file');
+const { isProtectedPayload, protectPayload, protectPayloadAsync, unprotectPayload } = require('./protected-payload');
+const { writeFileAtomic, writeFileAtomicSync } = require('../persistence/atomic-file');
 const { sanitizeWorkflowState } = require('../workflow/workflow-sanitizer');
 
 const MAX_SESSION_BYTES = MAX_WORKFLOW_BYTES;
@@ -1026,6 +1680,153 @@ function parseLegacySession(value) {
     return parsed;
 }
 
+const WORKFLOW_ENCODER_WORKER_SOURCE = String.raw`'use strict';
+const { parentPort, workerData } = require('node:worker_threads');
+const core = require(workerData.corePath);
+const { sanitizeWorkflowState } = core.requireModule('backend/workflow/workflow-sanitizer.js');
+const { encodeWorkflowSnapshot } = core.requireModule('backend/workflow/workflow-snapshot-codec.js');
+let currentSnapshot = null;
+function parseLegacy(value) {
+    const json = String(value || '');
+    if (!json.trim()) throw new Error('No legacy workflow session JSON was supplied.');
+    if (Buffer.byteLength(json, 'utf8') > workerData.legacyMaxBytes) throw new Error('The legacy workflow session exceeds the 20 MiB persistence limit.');
+    const parsed = JSON.parse(json);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Legacy workflow session JSON must contain an object.');
+    if (!Array.isArray(parsed.nodes) || !Array.isArray(parsed.connections)) throw new Error('Legacy workflow session JSON must contain nodes and connections arrays.');
+    return parsed;
+}
+function normalizeSnapshot(snapshot, baseDir) {
+    const normalized = typeof snapshot === 'string' ? parseLegacy(snapshot) : snapshot;
+    const sanitized = sanitizeWorkflowState(normalized, { baseDir: String(baseDir || '') });
+    currentSnapshot = sanitized.value;
+    return currentSnapshot;
+}
+function applyNodePatches(nodes, baseDir) {
+    if (!currentSnapshot || !currentSnapshot.editor || !Array.isArray(currentSnapshot.editor.nodes)) return false;
+    const replacements = new Map((Array.isArray(nodes) ? nodes : []).map((node) => [Number(node && node.id), node]));
+    if (!replacements.size) return true;
+    const nextNodes = currentSnapshot.editor.nodes.map((node) => replacements.get(Number(node && node.id)) || node);
+    const patched = { ...currentSnapshot, editor: { ...currentSnapshot.editor, nodes: nextNodes } };
+    normalizeSnapshot(patched, baseDir);
+    return true;
+}
+function postEnvelope(id, envelope) {
+    const bytes = Uint8Array.from(envelope);
+    parentPort.postMessage({ id, success: true, envelope: bytes }, [bytes.buffer]);
+}
+parentPort.on('message', (message) => {
+    const id = Number(message && message.id) || 0;
+    try {
+        const action = String(message && message.action || 'encode');
+        if (action === 'adopt') {
+            normalizeSnapshot(message.snapshot, message.baseDir);
+            parentPort.postMessage({ id, success: true, adopted: true });
+            return;
+        }
+        if (action === 'patch-nodes') {
+            if (!applyNodePatches(message.nodes, message.baseDir)) {
+                parentPort.postMessage({ id, success: true, needsSnapshot: true });
+                return;
+            }
+            postEnvelope(id, encodeWorkflowSnapshot(currentSnapshot));
+            return;
+        }
+        postEnvelope(id, encodeWorkflowSnapshot(normalizeSnapshot(message.snapshot, message.baseDir)));
+    } catch (error) {
+        parentPort.postMessage({ id, success: false, error: String(error && error.message || error) });
+    }
+});`;
+
+class AsyncWorkflowEncoder {
+    constructor(options = {}) {
+        this.corePath = path.resolve(options.corePath || path.join(__dirname, '..', 'Darkstar_Core.js'));
+        this.Worker = options.Worker || Worker;
+        this.worker = null;
+        this.sequence = 0;
+        this.pending = new Map();
+        this.closed = false;
+    }
+
+    _rejectPending(error) {
+        for (const pending of this.pending.values()) pending.reject(error);
+        this.pending.clear();
+    }
+
+    _worker() {
+        if (this.worker) return this.worker;
+        if (this.closed) throw new Error('Workflow encoder is closed.');
+        const worker = new this.Worker(WORKFLOW_ENCODER_WORKER_SOURCE, {
+            eval: true,
+            workerData: { corePath: this.corePath, legacyMaxBytes: LEGACY_MAX_SESSION_BYTES },
+        });
+        worker.on('message', (message) => {
+            const id = Number(message && message.id) || 0;
+            const pending = this.pending.get(id);
+            if (!pending) return;
+            this.pending.delete(id);
+            if (message.success === true) pending.resolve({
+                adopted: message.adopted === true,
+                needsSnapshot: message.needsSnapshot === true,
+                envelope: message.envelope ? Buffer.from(message.envelope) : null,
+            });
+            else pending.reject(new Error(String(message.error || 'Workflow encoding failed.')));
+            if (!this.pending.size) worker.unref?.();
+        });
+        worker.on('error', (error) => {
+            if (this.worker === worker) this.worker = null;
+            this._rejectPending(error);
+        });
+        worker.on('exit', (code) => {
+            if (this.worker === worker) this.worker = null;
+            if (!this.closed && Number(code) !== 0) this._rejectPending(new Error(`Workflow encoder worker exited with code ${code}.`));
+        });
+        worker.unref?.();
+        this.worker = worker;
+        return worker;
+    }
+
+    _request(message) {
+        return new Promise((resolve, reject) => {
+            const id = ++this.sequence;
+            this.pending.set(id, { resolve, reject });
+            try {
+                const worker = this._worker();
+                worker.ref?.();
+                worker.postMessage({ id, ...message });
+            } catch (error) {
+                this.pending.delete(id);
+                if (!this.pending.size) this.worker?.unref?.();
+                reject(error);
+            }
+        });
+    }
+
+    async encode(snapshot, baseDir) {
+        const response = await this._request({ action: 'encode', snapshot, baseDir: String(baseDir || '') });
+        if (!response.envelope) throw new Error('Workflow encoder returned no envelope.');
+        return response.envelope;
+    }
+
+    adopt(snapshot, baseDir) {
+        return this._request({ action: 'adopt', snapshot, baseDir: String(baseDir || '') });
+    }
+
+    async encodeNodePatches(nodes, baseDir) {
+        const response = await this._request({ action: 'patch-nodes', nodes, baseDir: String(baseDir || '') });
+        if (response.needsSnapshot) return { needsSnapshot: true, envelope: null };
+        if (!response.envelope) throw new Error('Workflow patch encoder returned no envelope.');
+        return { needsSnapshot: false, envelope: response.envelope };
+    }
+
+    close() {
+        this.closed = true;
+        const worker = this.worker;
+        this.worker = null;
+        this._rejectPending(new Error('Workflow encoder closed.'));
+        try { worker?.terminate?.(); } catch (_) { /* Worker may already be exiting. */ }
+    }
+}
+
 class WorkflowSessionStore {
     constructor(options = {}) {
         if (!options.filePath) throw new Error('WorkflowSessionStore requires a filePath.');
@@ -1033,6 +1834,11 @@ class WorkflowSessionStore {
         this.legacyFilePath = options.legacyFilePath ? path.resolve(String(options.legacyFilePath)) : '';
         this.protector = options.protector || null;
         this.baseDir = path.resolve(options.baseDir || path.join(__dirname, '..', '..'));
+        this.encoder = options.encoder || new AsyncWorkflowEncoder({ corePath: options.corePath, Worker: options.Worker });
+        this.saveSequence = 0;
+        this.committedSaveSequence = 0;
+        this.asyncSaveInFlight = false;
+        this.pendingAsyncSave = null;
     }
 
     _read(filePath) {
@@ -1052,6 +1858,7 @@ class WorkflowSessionStore {
                 try { this.save(sanitized.value); }
                 catch (_error) { /* A read-only session may still be restored safely in memory. */ }
             }
+            this.adoptSnapshot(sanitized.value);
             return { kind: 'snapshot', snapshot: sanitized.value, protected: isProtectedPayload(stored) };
         } catch (_error) {
             // A corrupt current session must not prevent legacy recovery below.
@@ -1069,15 +1876,104 @@ class WorkflowSessionStore {
     }
 
     save(snapshot) {
+        const saveSequence = ++this.saveSequence;
+        const encoded = this._encodeSync(snapshot);
+        writeFileAtomicSync(this.filePath, encoded);
+        this.committedSaveSequence = Math.max(this.committedSaveSequence, saveSequence);
+        return this._result(encoded);
+    }
+
+    saveAsync(snapshot) {
+        const saveSequence = ++this.saveSequence;
+        return new Promise((resolve, reject) => {
+            if (this.pendingAsyncSave) {
+                this.pendingAsyncSave.snapshot = snapshot;
+                this.pendingAsyncSave.saveSequence = saveSequence;
+                this.pendingAsyncSave.waiters.push({ resolve, reject });
+            } else {
+                this.pendingAsyncSave = { snapshot, saveSequence, waiters: [{ resolve, reject }] };
+            }
+            this._drainAsyncSaves();
+        });
+    }
+
+    adoptSnapshot(snapshot) {
+        if (!snapshot || typeof snapshot !== 'object' || !this.encoder || typeof this.encoder.adopt !== 'function') return false;
+        this.encoder.adopt(snapshot, this.baseDir).catch(() => {});
+        return true;
+    }
+
+    async patchNodesAsync(nodes) {
+        const saveSequence = ++this.saveSequence;
+        if (saveSequence < this.committedSaveSequence) return this._staleResult();
+        const patchResult = await this.encoder.encodeNodePatches(nodes, this.baseDir);
+        if (patchResult.needsSnapshot) return { ...this._staleResult(), needsSnapshot: true };
+        return this._commitAsyncEnvelope(patchResult.envelope, saveSequence);
+    }
+
+    async _drainAsyncSaves() {
+        if (this.asyncSaveInFlight) return;
+        this.asyncSaveInFlight = true;
+        try {
+            while (this.pendingAsyncSave) {
+                const batch = this.pendingAsyncSave;
+                this.pendingAsyncSave = null;
+                try {
+                    const result = await this._saveAsyncBatch(batch.snapshot, batch.saveSequence);
+                    for (const waiter of batch.waiters) waiter.resolve(result);
+                } catch (error) {
+                    for (const waiter of batch.waiters) waiter.reject(error);
+                }
+            }
+        } finally {
+            this.asyncSaveInFlight = false;
+            if (this.pendingAsyncSave) this._drainAsyncSaves();
+        }
+    }
+
+    async _saveAsyncBatch(snapshot, saveSequence) {
+        if (saveSequence < this.committedSaveSequence) return this._staleResult();
+        const envelope = await this.encoder.encode(snapshot, this.baseDir);
+        return this._commitAsyncEnvelope(envelope, saveSequence);
+    }
+
+    async _commitAsyncEnvelope(envelope, saveSequence) {
+        if (saveSequence < this.committedSaveSequence) return this._staleResult();
+        const encoded = await protectPayloadAsync(envelope, this.protector);
+        let committed = false;
+        await writeFileAtomic(this.filePath, encoded, {
+            commitGuard: () => {
+                if (saveSequence < this.committedSaveSequence) return false;
+                committed = true;
+                return true;
+            },
+        });
+        if (!committed) return this._staleResult();
+        this.committedSaveSequence = Math.max(this.committedSaveSequence, saveSequence);
+        return this._result(encoded);
+    }
+
+    _encodeSync(snapshot) {
         const normalized = typeof snapshot === 'string' ? parseLegacySession(snapshot) : snapshot;
         const sanitized = sanitizeWorkflowState(normalized, { baseDir: this.baseDir });
-        const encoded = protectPayload(encodeWorkflowSnapshot(sanitized.value), this.protector);
-        writeFileAtomicSync(this.filePath, encoded);
+        return protectPayload(encodeWorkflowSnapshot(sanitized.value), this.protector);
+    }
+
+    close() {
+        this.encoder?.close?.();
+    }
+
+    _result(encoded) {
         return { bytes: encoded.length, filePath: this.filePath, protected: isProtectedPayload(encoded) };
+    }
+
+    _staleResult() {
+        return { bytes: 0, filePath: this.filePath, protected: false, stale: true };
     }
 }
 
 module.exports = {
+    AsyncWorkflowEncoder,
     LEGACY_MAX_SESSION_BYTES,
     MAX_SESSION_BYTES,
     WorkflowSessionStore,
@@ -1099,6 +1995,7 @@ const CHANNELS = Object.freeze({
     MODEL_INSPECT: 'llama:nodes:inspect-model',
     MODELS_CHANGED: 'llama:nodes:models-changed',
     LIST_GPUS: 'llama:nodes:list-gpus',
+    LIST_DIFFUSION_DEVICES: 'llama:nodes:list-diffusion-devices',
     START_SERVER: 'llama:nodes:start-server',
     LOAD_MODEL: 'llama:nodes:load-model',
     UNLOAD_MODEL: 'llama:nodes:unload-model',
@@ -1128,6 +2025,7 @@ const CHANNELS = Object.freeze({
     WORKFLOW_LIST: 'darkstar:workflow:list',
     WORKFLOW_SESSION_LOAD: 'darkstar:workflow:session-load',
     WORKFLOW_SESSION_SAVE: 'darkstar:workflow:session-save',
+    WORKFLOW_SESSION_PATCH: 'darkstar:workflow:session-patch',
     WORKFLOW_SESSION_SAVE_SYNC: 'darkstar:workflow:session-save-sync',
     CHAT_SESSION_LOAD: 'darkstar:chat:session-load',
     CHAT_SESSION_SAVE: 'darkstar:chat:session-save',
@@ -1162,6 +2060,8 @@ const CHANNELS = Object.freeze({
     PERMISSION_POLICY_SET: 'darkstar:permission-policy:set',
     FILESYSTEM_ACCESS_GET: 'darkstar:filesystem-access:get',
     FILESYSTEM_ACCESS_SET: 'darkstar:filesystem-access:set',
+    INTERNET_ACCESS_GET: 'darkstar:internet-access:get',
+    INTERNET_ACCESS_SET: 'darkstar:internet-access:set',
 
     AGENT_CHOOSE_SKILL: 'darkstar:agent:choose-skill',
     AGENT_INSPECT_SKILL: 'darkstar:agent:inspect-skill',
@@ -1469,6 +2369,7 @@ const {
     HEADER_BYTES,
     decodeBinaryEnvelope,
     encodeBinaryEnvelope,
+    encodeBinaryEnvelopeAsync,
     hasEnvelopeMagic,
     isLegacyEnvelope,
 } = require('../persistence/binary-envelope');
@@ -1505,9 +2406,16 @@ function assertSnapshot(snapshot) {
     return snapshot;
 }
 
+function serializeSnapshot(snapshot) {
+    return v8.serialize(assertSnapshot(snapshot));
+}
+
 function encodeWorkflowSnapshot(snapshot) {
-    assertSnapshot(snapshot);
-    return encodeBinaryEnvelope(v8.serialize(snapshot), ENVELOPE_OPTIONS);
+    return encodeBinaryEnvelope(serializeSnapshot(snapshot), ENVELOPE_OPTIONS);
+}
+
+function encodeWorkflowSnapshotAsync(snapshot) {
+    return encodeBinaryEnvelopeAsync(serializeSnapshot(snapshot), ENVELOPE_OPTIONS);
 }
 
 function isWorkflowSnapshotBuffer(buffer) {
@@ -1533,6 +2441,7 @@ module.exports = {
     assertSnapshot,
     decodeWorkflowSnapshot,
     encodeWorkflowSnapshot,
+    encodeWorkflowSnapshotAsync,
     isLegacyWorkflowSnapshotBuffer,
     isWorkflowSnapshotBuffer,
 };
@@ -1549,6 +2458,7 @@ __darkstarDefineModule("backend/workspace/workspace-service.js", function darkst
 const fs = require('node:fs');
 const path = require('node:path');
 const { isWithinRoot, portablePath } = require('../filesystem/path-utils');
+const { isInternalProjectRelativePath } = require('../project/project-storage');
 
 function normalizeRenameName(value) {
     const raw = String(value === undefined || value === null ? '' : value);
@@ -1609,6 +2519,7 @@ class WorkspaceService {
     }
 
     _scheduleChange(details = {}) {
+        if (isInternalProjectRelativePath(details.relativePath)) return;
         clearTimeout(this.changeTimer);
         this.changeTimer = setTimeout(() => {
             this.changeTimer = null;
@@ -1679,7 +2590,8 @@ class WorkspaceService {
             }
 
             for (const entry of entries) {
-                if (entry.isDirectory()) pending.push(path.join(directoryPath, entry.name));
+                const relative = portablePath(path.relative(root, path.join(directoryPath, entry.name)));
+                if (entry.isDirectory() && !isInternalProjectRelativePath(relative)) pending.push(path.join(directoryPath, entry.name));
             }
         }
     }
@@ -1742,6 +2654,8 @@ class WorkspaceService {
         if (path.isAbsolute(supplied)) throw new Error('Workspace paths must be relative to the selected root.');
         const candidate = path.resolve(root, supplied);
         if (!isWithinRoot(root, candidate)) throw new Error('Requested path is outside the selected workspace.');
+        const relative = portablePath(path.relative(root, candidate));
+        if (isInternalProjectRelativePath(relative)) throw new Error('Darkstar project metadata is reserved and is not part of the workspace.');
         return candidate;
     }
 
@@ -1765,7 +2679,10 @@ class WorkspaceService {
         const stat = await fs.promises.stat(directoryPath);
         if (!stat.isDirectory()) throw new Error('Requested workspace path is not a directory.');
 
-        const entries = await fs.promises.readdir(directoryPath, { withFileTypes: true });
+        const entries = (await fs.promises.readdir(directoryPath, { withFileTypes: true })).filter((entry) => {
+            const relative = portablePath(path.relative(this.rootPath, path.join(directoryPath, entry.name)));
+            return !isInternalProjectRelativePath(relative);
+        });
         const normalized = await Promise.all(entries.map(async (entry) => {
             const absolutePath = path.join(directoryPath, entry.name);
             const entryStat = await fs.promises.stat(absolutePath);
@@ -2666,11 +3583,12 @@ function applyWindowsWindowIdentity(window, options = {}) {
 }
 
 function createMainWindow(BrowserWindow, baseDir, Menu, options = {}) {
-    const initialTheme = windowThemeOptions('deep-blue');
+    const initialTheme = windowThemeOptions(options.theme);
     const iconPath = options.iconPath || path.join(baseDir, 'backend', 'assets', 'icon.png');
     const window = new BrowserWindow({
         width: WINDOW_WIDTH,
         height: WINDOW_HEIGHT,
+        show: options.show !== false,
         minWidth: 800,
         minHeight: 600,
         title: 'Darkstar',
@@ -2680,7 +3598,10 @@ function createMainWindow(BrowserWindow, baseDir, Menu, options = {}) {
         backgroundColor: initialTheme.backgroundColor,
         webPreferences: {
             preload: path.join(baseDir, 'backend', 'Darkstar_Core.js'),
-            additionalArguments: options.diagnosticsEnabled ? [DARKSTAR_DEBUG_FLAG] : [],
+            additionalArguments: [
+                ...(options.diagnosticsEnabled ? [DARKSTAR_DEBUG_FLAG] : []),
+                `--darkstar-ui-theme=${initialTheme.normalized}`,
+            ],
             contextIsolation: true,
             nodeIntegration: false,
             sandbox: true,
@@ -2808,6 +3729,7 @@ const { DialogLocationStore } = require('../preferences/dialog-location-store');
 const { LocalModelHistoryStore } = require('../preferences/local-model-history-store');
 const { WorkflowSessionStore } = require('../preferences/workflow-session-store');
 const { ChatSessionStore } = require('../preferences/chat-session-store');
+const { ThemePreferenceStore } = require('../preferences/window-theme');
 
 function createPowerProtection(powerSaveBlocker, logger = console) {
     let suspensionBlockerId = null;
@@ -2863,6 +3785,8 @@ function focusExistingMainWindow(window) {
 
 function runMainApp(electron, baseDir, diagnostics = null) {
     const { app, BrowserView, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, Menu, nativeImage, Notification, powerSaveBlocker, safeStorage, shell } = electron;
+    const configuredDataRoot = String(process.env.DARKSTAR_PORTABLE_DATA_ROOT || '').trim();
+    const dataRoot = path.resolve(configuredDataRoot || baseDir);
     app.setName('Darkstar');
     configureWindowsAppIdentity(app);
 
@@ -2875,7 +3799,16 @@ function runMainApp(electron, baseDir, diagnostics = null) {
 
     const powerProtection = createPowerProtection(powerSaveBlocker);
     let mainWindow = null;
+    let services = null;
+    let llamaIpc = null;
+    let workflowSessionStore = null;
+    let chatSessionStore = null;
+    let themePreferenceStore = null;
+    let mainApplicationStarted = false;
+    let shuttingDown = false;
     let pendingSecondInstanceFocus = false;
+    let mainWindowIconPath = sourceIconPath(baseDir);
+
     const focusPrimaryWindow = () => {
         if (focusExistingMainWindow(mainWindow)) {
             pendingSecondInstanceFocus = false;
@@ -2886,35 +3819,63 @@ function runMainApp(electron, baseDir, diagnostics = null) {
     };
     app.on('second-instance', () => { focusPrimaryWindow(); });
 
-    let mainWindowIconPath = sourceIconPath(baseDir);
-    let llamaIpc = null;
-    const services = createRuntimeServices({
-        baseDir,
-        userDataDir: app.getPath('userData'),
-        preferenceProtector: safeStorage,
-        runtimeLog: (...args) => console.log('[Darkstar]', ...args),
-        onServerStopped: (details) => llamaIpc?.onServerStopped(details),
-        BrowserView,
-        desktopCapturer,
-        diagnostics,
-    });
-    diagnostics?.setRuntimeStatusProvider?.(() => services.runtime.getStatus());
-    const shutdownRuntimeServices = () => {
+    const ensureRuntimeServices = () => {
+        if (services) return services;
+        services = createRuntimeServices({
+            baseDir,
+            userDataDir: app.getPath('userData'),
+            preferenceProtector: safeStorage,
+            runtimeLog: (...args) => console.log('[Darkstar]', ...args),
+            onServerStopped: (details) => llamaIpc?.onServerStopped(details),
+            BrowserView,
+            desktopCapturer,
+            diagnostics,
+            runtimeOptions: { modelsDir: path.join(dataRoot, 'models') },
+        });
+        diagnostics?.setRuntimeStatusProvider?.(() => services?.runtime?.getStatus?.() || null);
+        return services;
+    };
+
+    const shutdownRuntimeServices = async () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
         try { llamaIpc?.dispose?.(); } catch (_) {}
+        try { workflowSessionStore?.close?.(); } catch (_) {}
+        try { chatSessionStore?.close?.(); } catch (_) {}
+        workflowSessionStore = null;
+        chatSessionStore = null;
         diagnostics?.writeHealth?.({ trigger: 'shutdown' });
         diagnostics?.stopHealthSampler?.();
-        return services.shutdown();
+        try {
+            if (services) await services.shutdown();
+        } finally {
+            shuttingDown = false;
+        }
     };
+
     const openMainWindow = () => {
+        const runtimeServices = ensureRuntimeServices();
+        const themeState = themePreferenceStore?.load?.() || { theme: 'space', persisted: false };
         mainWindow = createMainWindow(BrowserWindow, baseDir, Menu, {
             iconPath: mainWindowIconPath,
             diagnosticsEnabled: Boolean(diagnostics),
+            theme: themeState.theme,
+            show: false,
         });
-        services.offlineBrowser.attachWindow(mainWindow);
-        mainWindow.on('closed', () => { services.offlineBrowser.attachWindow(null); mainWindow = null; });
+        runtimeServices.offlineBrowser.attachWindow(mainWindow);
+        mainWindow.webContents.once('dom-ready', () => {
+            if (!mainWindow || mainWindow.isDestroyed()) return;
+            mainWindow.show();
+        });
+        mainWindow.on('closed', () => {
+            runtimeServices.offlineBrowser.attachWindow(null);
+            mainWindow = null;
+        });
         if (pendingSecondInstanceFocus) focusPrimaryWindow();
     };
+
     const registerIpc = () => {
+        const runtimeServices = ensureRuntimeServices();
         const getWindow = () => mainWindow;
         const trustedIpcMain = createTrustedIpcMain({ ipcMain, getWindow, expectedUrl: trustedRendererUrl(baseDir), diagnostics });
         const dialogLocations = new DialogLocationStore({
@@ -2932,20 +3893,23 @@ function runMainApp(electron, baseDir, diagnostics = null) {
                 fs.renameSync(previousWorkflowAutosavePath, workflowAutosavePath);
             }
         } catch (_error) { /* Autosave migration is best-effort; persistence will still use the canonical filename. */ }
-        const workflowSessionStore = new WorkflowSessionStore({
+        workflowSessionStore = new WorkflowSessionStore({
             filePath: workflowAutosavePath,
             legacyFilePath: path.join(app.getPath('userData'), 'workflow-session.json'),
             protector: safeStorage,
         });
-        const chatSessionStore = new ChatSessionStore({
-            filePath: path.join(app.getPath('userData'), 'chat-session.dscs'),
+        chatSessionStore = new ChatSessionStore({
+            legacyFilePath: path.join(app.getPath('userData'), 'chat-session.dscs'),
+            registryPath: path.join(app.getPath('userData'), 'chat-project-roots.json'),
+            baseDir: dataRoot,
             protector: safeStorage,
+            rootForProject: (projectId) => runtimeServices.workspace.describeRoot(`project-${Number(projectId)}`)?.path || '',
             onDiagnosticEvent: (phase, details) => diagnostics?.record?.(`chat-session-${phase}`, details),
         });
         const pluginManager = createPluginManager({
             baseDir,
             userDataDir: app.getPath('userData'),
-            services,
+            services: runtimeServices,
             log: (...args) => console.log('[Darkstar plugins]', ...args),
         });
         const modelFileBrowserPaths = {};
@@ -2953,36 +3917,53 @@ function runMainApp(electron, baseDir, diagnostics = null) {
             try { modelFileBrowserPaths[name] = app.getPath(name); } catch (_) { modelFileBrowserPaths[name] = ''; }
         }
         const localFileBrowserDefaults = {
-            model: services.runtime.modelsDir, projector: services.runtime.modelsDir,
+            model: runtimeServices.runtime.modelsDir, diffusion: '', projector: runtimeServices.runtime.modelsDir,
             tool: bundledToolsDirectory() || '', skill: bundledSkillsDirectory() || '', image: modelFileBrowserPaths.pictures || '',
         };
-        llamaIpc = registerLlamaIpc({ ipcMain: trustedIpcMain, runtime: services.runtime, getWindow, diagnostics, modelFileBrowserPaths, localFileBrowserDefaults, dialogLocations, localModelHistory });
+        llamaIpc = registerLlamaIpc({ ipcMain: trustedIpcMain, runtime: runtimeServices.runtime, diffusionRuntime: runtimeServices.diffusionRuntime, getWindow, diagnostics, modelFileBrowserPaths, localFileBrowserDefaults, dialogLocations, localModelHistory });
         registerPluginIpc({ ipcMain: trustedIpcMain, pluginManager });
-        registerAppIpc({ ipcMain: trustedIpcMain, dialog, getWindow, baseDir, workspace: services.workspace, attention: services.attention, permissionPolicy: services.permissionPolicy, filesystemAccess: services.filesystemAccess, Notification, shell, clipboard, diagnostics });
+        registerAppIpc({ ipcMain: trustedIpcMain, dialog, getWindow, baseDir, projectBaseDir: dataRoot, workspace: runtimeServices.workspace, chatSessionStore, attention: runtimeServices.attention, permissionPolicy: runtimeServices.permissionPolicy, filesystemAccess: runtimeServices.filesystemAccess, internetAccess: runtimeServices.offlineBrowser, Notification, shell, clipboard, diagnostics });
         registerAgentIpc({
             ipcMain: trustedIpcMain,
             dialog,
             getWindow,
-            toolService: services.toolService,
-            skillService: services.skillService,
+            toolService: runtimeServices.toolService,
+            skillService: runtimeServices.skillService,
             dialogLocations,
         });
-        registerOfflineBrowserIpc({ ipcMain: trustedIpcMain, dialog, getWindow, offlineBrowser: services.offlineBrowser, dialogLocations });
-        registerUipIpc({ ipcMain: trustedIpcMain, uipService: services.uipService });
+        registerOfflineBrowserIpc({ ipcMain: trustedIpcMain, dialog, getWindow, offlineBrowser: runtimeServices.offlineBrowser, dialogLocations });
+        registerUipIpc({ ipcMain: trustedIpcMain, uipService: runtimeServices.uipService });
         registerChatSessionIpc({ ipcMain: trustedIpcMain, chatSessionStore });
         registerUiIpc({
             ipcMain: trustedIpcMain,
             dialog,
             getWindow,
-            runtime: services.runtime,
+            runtime: runtimeServices.runtime,
             dialogLocations,
             workflowDirectory: path.join(baseDir, 'workflows'),
             workflowSessionStore,
+            themePreferenceStore,
         });
     };
+
+    const startMainApplication = () => {
+        if (mainApplicationStarted) return;
+        mainApplicationStarted = true;
+        try {
+            powerProtection.start();
+            registerIpc();
+            openMainWindow();
+        } catch (error) {
+            mainApplicationStarted = false;
+            powerProtection.stop();
+            dialog.showErrorBox?.('Darkstar could not start', String(error?.message || error || 'Unknown startup error.'));
+            app.quit();
+        }
+    };
+
     app.whenReady().then(() => {
-        powerProtection.start();
         migrateLegacyUserData(app, { log: (...args) => console.log('[Darkstar]', ...args) });
+        themePreferenceStore = new ThemePreferenceStore(path.join(app.getPath('userData'), 'ui-theme.json'));
         try {
             mainWindowIconPath = generateRuntimeIcon({
                 nativeImage,
@@ -2992,19 +3973,27 @@ function runMainApp(electron, baseDir, diagnostics = null) {
         } catch (error) {
             console.warn('[Darkstar] Could not generate the runtime Windows icon; using the PNG directly:', error?.message || error);
         }
-        registerIpc();
-        openMainWindow();
+
+        startMainApplication();
+        if (pendingSecondInstanceFocus) focusPrimaryWindow();
     });
+
     app.on('window-all-closed', async () => {
-        await shutdownRuntimeServices();
+        if (mainApplicationStarted) await shutdownRuntimeServices();
         if (process.platform !== 'darwin') app.quit();
     });
     app.on('before-quit', () => shutdownRuntimeServices().catch(() => undefined));
     app.on('will-quit', () => powerProtection.stop());
     app.on('activate', () => {
-        if (!BrowserWindow.getAllWindows().length) openMainWindow();
+        if (mainApplicationStarted && !BrowserWindow.getAllWindows().length) openMainWindow();
+        else focusPrimaryWindow();
     });
-    return { services, shutdownRuntimeServices, powerProtection };
+    return {
+        get services() { return services; },
+        shutdownRuntimeServices,
+        powerProtection,
+        startMainApplication,
+    };
 }
 
 module.exports = { configureWindowsAppIdentity, createPowerProtection, focusExistingMainWindow, runMainApp };
@@ -3114,7 +4103,7 @@ __darkstarDefineModule("backend/app/services.js", function darkstarModule(module
 // <DARKSTAR_SOURCE_BEGIN path="backend/app/services.js">
 'use strict';
 const path = require('node:path');
-const { LlamaRuntime } = require('../llama-runtime');
+const { LlamaRuntime } = require('../llama-runtime'); const { DiffusionRuntime } = require('../runtime/diffusion-runtime');
 const { WorkspaceRegistry } = require('../workspace/workspace-service');
 const { AttentionRequestService } = require('../agent/attention-request-service');
 const { PermissionPolicyService } = require('../agent/permission-policy');
@@ -3126,7 +4115,6 @@ const { PluginManager } = require('../plugins/plugin-manager');
 const { TabbedBrowserService } = require('../browser/tabbed-browser-service');
 const { AppPythonEnvironment } = require('../agent/python-environment');
 const { UniversalInterfaceService } = require('../uip/uip-service');
-
 function resolveBaseDir(baseDir) {
     return path.resolve(baseDir || path.join(__dirname, '..', '..'));
 }
@@ -3152,6 +4140,7 @@ function createRuntimeServices(options = {}) {
         log: options.runtimeLog,
     });
     const skillService = options.skillService || new SkillService({ baseDir, ...(options.skillServiceOptions || {}) });
+    const diffusionRuntime = options.diffusionRuntime || new DiffusionRuntime({ baseDir, log: options.runtimeLog, ...(options.diffusionRuntimeOptions || {}) });
     const toolService = options.toolService || new ToolService({
         workspace,
         skillService,
@@ -3159,7 +4148,7 @@ function createRuntimeServices(options = {}) {
         permissionPolicy, filesystemAccess,
         baseDir,
         offlineBrowser,
-        uipService, pythonEnvironment,
+        uipService, pythonEnvironment, diffusionRuntime,
         ...(pythonVenvDir ? { pythonVenvDir } : {}),
         ...(options.toolServiceOptions || {}),
     });
@@ -3171,14 +4160,16 @@ function createRuntimeServices(options = {}) {
         onServerStopped: options.onServerStopped,
         diagnostics: options.diagnostics,
         ...(options.runtimeOptions || {}),
-    });
+    }); diffusionRuntime?.setLanguageModelRuntime?.(runtime);
 
     let shutdownPromise = null;
     function shutdown() {
         if (!shutdownPromise) {
             shutdownPromise = Promise.allSettled([
                 toolService.shutdown(),
-                runtime.stopServer(),
+                diffusionRuntime.shutdown(),
+                runtime.stopServer({ force: true }),
+                runtime.closeModelInventory?.(),
                 offlineBrowser.destroy(),
                 Promise.resolve(uipService.shutdown()),
             ]).then(() => {
@@ -3189,8 +4180,7 @@ function createRuntimeServices(options = {}) {
         }
         return shutdownPromise;
     }
-
-    return Object.freeze({ attention, baseDir, filesystemAccess, offlineBrowser, permissionPolicy, runtime, shutdown, skillService, toolService, uipService, workspace });
+    return Object.freeze({ attention, baseDir, diffusionRuntime, filesystemAccess, offlineBrowser, permissionPolicy, runtime, shutdown, skillService, toolService, uipService, workspace });
 }
 
 function createPluginManager(options = {}) {
@@ -3297,6 +4287,11 @@ const electron = require('electron');
 const { contextBridge, ipcRenderer } = electron;
 const webUtils = electron.webUtils;
 const diagnosticsEnabled = Array.isArray(process.argv) && process.argv.includes('--darkstar-debug');
+function preloadArgument(prefix, fallback = '') {
+    const entry = Array.isArray(process.argv) ? process.argv.find((value) => String(value).startsWith(prefix)) : null;
+    return entry ? String(entry).slice(prefix.length) : fallback;
+}
+const initialUiTheme = preloadArgument('--darkstar-ui-theme=', 'space');
 const diagnosticQueue = [];
 let diagnosticFlushTimer = null;
 // The monolith resolver handles logical relative modules without Node path access,
@@ -3316,6 +4311,7 @@ const nodeApi = Object.freeze({
     inspectModel: (modelId) => ipcRenderer.invoke(CHANNELS.MODEL_INSPECT, String(modelId || '')),
     onModelsChanged: (listener) => subscribe(CHANNELS.MODELS_CHANGED, listener),
     listGpus: () => ipcRenderer.invoke(CHANNELS.LIST_GPUS),
+    listDiffusionDevices: () => ipcRenderer.invoke(CHANNELS.LIST_DIFFUSION_DEVICES),
     startServer: (config) => ipcRenderer.invoke(CHANNELS.START_SERVER, config),
     loadModel: (modelId, projectorPath, options) => {
         const autoDetectProjector = !(options && options.autoDetectProjector === false);
@@ -3459,6 +4455,7 @@ const diagnosticsApi = Object.freeze({
 });
 
 const appApi = Object.freeze({
+    initialTheme: initialUiTheme,
     getQuotes: () => ipcRenderer.invoke(CHANNELS.APP_GET_QUOTES),
     getAdversaryPrompt: () => ipcRenderer.invoke(CHANNELS.APP_GET_ADVERSARY_PROMPT),
     getCompactPrompt: () => ipcRenderer.invoke(CHANNELS.APP_GET_COMPACT_PROMPT),
@@ -3472,6 +4469,7 @@ const workflowApi = Object.freeze({
     load: (payload) => ipcRenderer.invoke(CHANNELS.WORKFLOW_LOAD, payload || {}),
     loadSession: () => ipcRenderer.invoke(CHANNELS.WORKFLOW_SESSION_LOAD),
     saveSession: (payload) => ipcRenderer.invoke(CHANNELS.WORKFLOW_SESSION_SAVE, payload || {}),
+    patchSession: (payload) => ipcRenderer.invoke(CHANNELS.WORKFLOW_SESSION_PATCH, payload || {}),
     saveSessionSync: (payload) => ipcRenderer.sendSync(CHANNELS.WORKFLOW_SESSION_SAVE_SYNC, payload || {}),
 });
 
@@ -3507,6 +4505,11 @@ const filesystemAccessApi = Object.freeze({
     set: (level) => ipcRenderer.invoke(CHANNELS.FILESYSTEM_ACCESS_SET, { level: String(level || '') }),
 });
 
+const internetAccessApi = Object.freeze({
+    get: () => ipcRenderer.invoke(CHANNELS.INTERNET_ACCESS_GET),
+    set: (enabled) => ipcRenderer.invoke(CHANNELS.INTERNET_ACCESS_SET, { enabled: enabled === true }),
+});
+
 const attentionApi = Object.freeze({
     list: () => ipcRenderer.invoke(CHANNELS.ATTENTION_LIST),
     respond: (requestId, response) => ipcRenderer.invoke(CHANNELS.ATTENTION_RESPOND, { requestId: String(requestId || ''), ...(response || {}) }),
@@ -3531,6 +4534,7 @@ contextBridge.exposeInMainWorld('darkstar', Object.freeze({
     attention: attentionApi,
     permissionPolicy: permissionPolicyApi,
     filesystemAccess: filesystemAccessApi,
+    internetAccess: internetAccessApi,
     offlineBrowser: offlineBrowserApi,
     workflow: workflowApi,
     chatSession: chatSessionApi,
@@ -3578,6 +4582,47 @@ function runtimeStatus(runtime, contextSizePerSlot) {
 module.exports = { runtimeStatus };
 // <DARKSTAR_SOURCE_END path="backend/runtime/runtime-status.js">
 });
+// MODULE :: backend/runtime/model-selection-service.js
+__darkstarDefineModule("backend/runtime/model-selection-service.js", function darkstarModule(module, exports, require, __filename, __dirname) {
+// <DARKSTAR_SOURCE_BEGIN path="backend/runtime/model-selection-service.js">
+'use strict';
+const path = require('node:path');
+const { resolveModelSelection } = require('./models');
+
+async function inspectModel(runtime, modelId) {
+    const requested = String(modelId || '').trim();
+    if (!requested) return null;
+    if (typeof runtime.modelInventory?.inspectModel === 'function') return runtime.modelInventory.inspectModel(requested);
+    const records = await runtime.listLocalModelsAsync();
+    return resolveModelSelection(requested, [], records).local || null;
+}
+
+async function resolveSelection(runtime, modelId, routerModels = []) {
+    const requested = String(modelId || '').trim();
+    if (!requested) throw new Error('No model is selected in the Invoke Language Model (GGUF) node.');
+    const local = await inspectModel(runtime, requested);
+    if (path.isAbsolute(requested) && local) {
+        const realPath = String(local.path || requested);
+        return { requested: realPath, routerId: String(local.id || realPath), local: { ...local, displayName: local.displayName || path.basename(realPath) }, router: null, directFile: true };
+    }
+    return resolveModelSelection(requested, routerModels, local ? [local] : []);
+}
+
+function listProjectors(runtime, modelPath) {
+    if (typeof runtime.modelInventory?.listProjectors !== 'function') throw new Error('Model inventory worker does not expose projector discovery.');
+    return runtime.modelInventory.listProjectors(modelPath);
+}
+
+async function detectProjector(runtime, modelId) {
+    const selection = await resolveSelection(runtime, modelId);
+    if (!selection.local?.path) return { modelId: selection.requested, modelPath: null, projectorPath: null, projectors: [], detected: false };
+    const projectors = await listProjectors(runtime, selection.local.path);
+    return { modelId: selection.local.id || selection.requested, modelPath: selection.local.path, projectorPath: projectors[0]?.path || null, projectors, detected: projectors.length > 0 };
+}
+
+module.exports = { detectProjector, inspectModel, listProjectors, resolveSelection };
+// <DARKSTAR_SOURCE_END path="backend/runtime/model-selection-service.js">
+});
 // MODULE :: backend/llama-runtime.js
 __darkstarDefineModule("backend/llama-runtime.js", function darkstarModule(module, exports, require, __filename, __dirname) {
 // <DARKSTAR_SOURCE_BEGIN path="backend/llama-runtime.js">
@@ -3589,12 +4634,13 @@ const { DEFAULT_HOST, START_TIMEOUT_MS, LOAD_TIMEOUT_MS, MAX_LOG_LINES } = requi
 const { normalizeFloat, normalizeInteger } = require('./runtime/normalize');
 const { getFreePort, requestJson } = require('./runtime/server-io');
 const { browseModelFiles } = require('./runtime/model-filesystem');
-const { normalizeModelLoadRequest, resolveModelSelection, walkModels } = require('./runtime/models');
+const { AsyncModelInventory, normalizeModelLoadRequest, resolveModelSelection, walkModels } = require('./runtime/models');
 const { consumeChatCompletionStream, parseSseLine, streamIncrement } = require('./runtime/streaming');
 const { delay, killProcessTree, runProcessCapture } = require('./runtime/process-utils');
 const { normalizeChatRequest } = require('./runtime/chat-request');
 const { KV_CACHE_TYPES, applyKvCacheArgs, normalizeKvCacheType } = require('./runtime/server-config');
-const { detectProjectorForModel, listProjectorsForModel, validateProjectorPath } = require('./vision/projector-service');
+const { validateProjectorPath } = require('./vision/projector-service');
+const modelSelection = require('./runtime/model-selection-service');
 const { agentInputBody, streamAgent } = require('./runtime/agent-loop');
 const { performChatCompletion, sanitizeChatBody } = require('./runtime/chat-completion');
 const { assertTokenizableText, countChatInputTokens, countRuntimeChatInputTokens, normalizeTokenizationResponse } = require('./runtime/tokens');
@@ -3610,6 +4656,7 @@ const {
     streamRecordController,
 } = require('./runtime/parallel-streams');
 const { detectProjector, inspectProjector, listRouterModels, loadLegacyModel, loadModel, unloadModel } = require('./runtime/model-lifecycle');
+const { applyRamParkingLaunchArgs, assertExternalWorkAvailable, stopProcessForExternalWork, temporarilyReleaseVramForExternalWork, temporarilyUnloadForExternalWork } = require('./runtime/external-work-lifecycle');
 const { ModelIdleUnloadController } = require('./runtime/model-idle-unload');
 const { runtimeStatus } = require('./runtime/runtime-status');
 const {
@@ -3622,15 +4669,12 @@ const {
 const { injectSkillCatalog, stripSkillCatalog } = require('./runtime/skill-catalog');
 const { initializeBackendRuntime, selectRuntimeBackend } = require('./runtime/backend-selection');
 const { captureLog, detectCapabilities, spawnAndWait, startServer } = require('./runtime/server-process');
-/**
- * Owns llama.cpp lifecycle state and presents the stable API consumed by IPC.
- * Detailed concerns live in backend/runtime; this class intentionally remains
- * an orchestration boundary so tests and Electron wiring can replace methods.
- */
+/** Stable llama.cpp lifecycle orchestration boundary consumed by IPC and tests. */
 class LlamaRuntime {
     constructor(options = {}) {
         this.baseDir = options.baseDir || path.resolve(__dirname, '..');
         this.modelsDir = options.modelsDir || path.join(this.baseDir, 'models');
+        this.modelInventory = options.modelInventory || new AsyncModelInventory({ modelsDir: this.modelsDir });
         initializeBackendRuntime(this, options);
         this.process = null;
         this.processMode = null;
@@ -3644,7 +4688,7 @@ class LlamaRuntime {
         this.preCancelledStreams = new Set();
         this.parallelReservations = new Map();
         this.parallelWaitQueue = [];
-        this.cacheEpoch = 1;
+        this.cacheEpoch = 1; this.externalWorkLease = null;
         this.slotCacheOwners = new Map();
         this.toolService = options.toolService || null; this.diagnostics = options.diagnostics || null;
         this.inputTokenCountCache = {};
@@ -3661,24 +4705,27 @@ class LlamaRuntime {
             : () => {};
         this.maxLogLines = MAX_LOG_LINES;
         this.logLines = [];
+        this.ramParkingMode = options.ramParkingMode === true;
         this.modelIdleUnload = new ModelIdleUnloadController(this, { attentionService: options.attentionService, log: this.log });
     }
-    selectBackend(value) {
-        return selectRuntimeBackend(this, value);
-    }
+    selectBackend(value) { return selectRuntimeBackend(this, value); }
     listLocalModels() { return walkModels(this.modelsDir); }
+    listLocalModelsAsync() { return this.modelInventory.list(); }
+    inspectModelFilesAsync(paths) { return this.modelInventory.inspect(paths); }
+    listProjectorsForModelAsync(modelPath) { return modelSelection.listProjectors(this, modelPath); }
+    inspectModelAsync(modelId) { return modelSelection.inspectModel(this, modelId); }
+    resolveModelSelectionAsync(modelId, routerModels = []) { return modelSelection.resolveSelection(this, modelId, routerModels); }
+    closeModelInventory() { return this.modelInventory.close(); }
     browseModelFiles(request = {}, options = {}) { return browseModelFiles(request, { defaultPath: this.modelsDir, ...options }); }
     inspectModel(modelId) { const selection = this.resolveModelSelection(modelId); if (!selection.local) throw new Error('Choose a local GGUF model file.'); return selection.local; }
     getStatus() { return runtimeStatus(this, contextSizePerSlot); }
-    detectCapabilities() {
-        return detectCapabilities(this, { fs, runProcessCapture });
-    }
+    detectCapabilities() { return detectCapabilities(this, { fs, runProcessCapture }); }
     enqueueLifecycle(operation) {
         const run = this.lifecycleQueue.then(operation, operation);
         this.lifecycleQueue = run.catch(() => undefined);
         return run;
     }
-    startServer(config = {}) {
+    startServer(config = {}) { assertExternalWorkAvailable(this);
         return this.enqueueLifecycle(() => startServer(this, config, {
             defaultHost: DEFAULT_HOST,
             startTimeoutMs: START_TIMEOUT_MS,
@@ -3693,22 +4740,22 @@ class LlamaRuntime {
         });
     }
     buildSharedArgs(config, capabilities) {
-        return applyKvCacheArgs(
+        return applyRamParkingLaunchArgs(this, applyKvCacheArgs(
             buildSharedArgs(config, capabilities, DEFAULT_HOST),
             config,
-        );
+        ), capabilities);
     }
     buildRouterArgs(config, capabilities) {
-        return applyKvCacheArgs(
+        return applyRamParkingLaunchArgs(this, applyKvCacheArgs(
             buildRouterArgs(config, capabilities, {
                 defaultHost: DEFAULT_HOST,
                 modelsDir: this.modelsDir,
             }),
             config,
-        );
+        ), capabilities);
     }
     buildLegacyArgs(config, modelPath, modelId, capabilities, projectorPath = null) {
-        return applyKvCacheArgs(
+        return applyRamParkingLaunchArgs(this, applyKvCacheArgs(
             buildLegacyArgs(config, {
                 modelPath,
                 modelId,
@@ -3717,7 +4764,7 @@ class LlamaRuntime {
                 defaultHost: DEFAULT_HOST,
             }),
             config,
-        );
+        ), capabilities);
     }
     captureLog(source, data) {
         captureLog(this, source, data);
@@ -3742,23 +4789,19 @@ class LlamaRuntime {
     listRouterModels(reload = false) {
         return listRouterModels(this, reload, this.transport.requestJson);
     }
-    resolveModelSelection(modelId, routerModels = []) {
-        return resolveModelSelection(modelId, routerModels, this.listLocalModels());
-    }
+    resolveModelSelection(modelId, routerModels = []) { const requested = String(modelId || '').trim(); return resolveModelSelection(requested, routerModels, path.isAbsolute(requested) ? [] : this.listLocalModels()); }
     normalizeModelLoadRequest(request) { return normalizeModelLoadRequest(request); }
     inspectProjector(sourcePath) {
         return inspectProjector(sourcePath, validateProjectorPath);
     }
-    detectProjector(modelId) {
-        return detectProjector(this, modelId, listProjectorsForModel);
-    }
-    loadModel(request) {
+    detectProjector(modelId) { return modelSelection.detectProjector(this, modelId); }
+    loadModel(request) { assertExternalWorkAvailable(this);
         this.inputTokenCountCache = {};
         this.modelIdleUnload?.modelActivityStarted();
         return this.enqueueLifecycle(async () => {
             const result = await loadModel(this, request, {
                 delay,
-                detectProjectorForModel,
+                detectProjectorForModel: (modelPath) => this.listProjectorsForModelAsync(modelPath).then((projectors) => projectors[0]?.path || null),
                 loadTimeoutMs: LOAD_TIMEOUT_MS,
                 requestJson: this.transport.requestJson,
                 validateProjectorPath,
@@ -3767,19 +4810,15 @@ class LlamaRuntime {
             return result;
         });
     }
-    async loadLegacyModel(modelId, projectorPath = null) {
+    async loadLegacyModel(modelId, projectorPath = null, options = {}) {
+        if (options.allowDuringActiveStream !== true) assertExternalWorkAvailable(this);
         this.inputTokenCountCache = {};
         this.modelIdleUnload?.modelActivityStarted();
-        const result = await loadLegacyModel(this, {
-            modelId,
-            projectorPath,
-            validateProjectorPath,
-            loadTimeoutMs: LOAD_TIMEOUT_MS,
-        });
+        const result = await loadLegacyModel(this, { modelId, projectorPath, selection: options.selection || null, validateProjectorPath, loadTimeoutMs: LOAD_TIMEOUT_MS }, { allowDuringActiveStream: options.allowDuringActiveStream === true });
         this.modelIdleUnload?.modelLoaded();
         return result;
     }
-    unloadModel(modelId = this.loadedModelId) {
+    unloadModel(modelId = this.loadedModelId) { assertExternalWorkAvailable(this);
         this.inputTokenCountCache = {};
         this.modelIdleUnload?.modelActivityStarted();
         return this.enqueueLifecycle(async () => {
@@ -3789,8 +4828,9 @@ class LlamaRuntime {
             return result;
         });
     }
+    temporarilyUnloadForExternalWork(options = {}) { return temporarilyUnloadForExternalWork(this, options); }
     configureModelIdleUnload(value) { return this.modelIdleUnload?.configure(value) || 0; }
-    performChatCompletion(body, signal, handlers = {}) {
+    performChatCompletion(body, signal, handlers = {}) { assertExternalWorkAvailable(this);
         const { contextSizePerSlot: contextSize, contextMeasurementSource: contextSizeSource } = this.getStatus();
         return performChatCompletion({
             body, contextSize, contextSizeSource,
@@ -3803,7 +4843,7 @@ class LlamaRuntime {
             tokenCountCache: this.inputTokenCountCache, diagnostics: this.diagnostics, diagnosticContext: handlers?.diagnosticContext || null,
         });
     }
-    async tokenizeText(content) {
+    async tokenizeText(content) { assertExternalWorkAvailable(this);
         if (!this.server?.port) throw new Error('llama-server has not been started.');
         if (!this.loadedModelId) throw new Error('No model has been loaded.');
         const text = assertTokenizableText(content);
@@ -3827,7 +4867,7 @@ class LlamaRuntime {
             this.modelIdleUnload?.inferenceEnded();
         }
     }
-    async countChatInputTokens(messages) {
+    async countChatInputTokens(messages) { assertExternalWorkAvailable(this);
         this.modelIdleUnload?.inferenceStarted();
         try {
             return await countRuntimeChatInputTokens(this, messages);
@@ -3835,7 +4875,7 @@ class LlamaRuntime {
             this.modelIdleUnload?.inferenceEnded();
         }
     }
-    async countAgentInputTokens(request) {
+    async countAgentInputTokens(request) { assertExternalWorkAvailable(this);
         if (!this.server?.port) throw new Error('llama-server has not been started.');
         if (!this.loadedModelId) throw new Error('No model has been loaded.');
         this.modelIdleUnload?.inferenceStarted();
@@ -3858,7 +4898,7 @@ class LlamaRuntime {
         return streamAgent(this, request, controller, handlers, interactionId);
     }
     async streamChat(requestId, request, handlers = {}) {
-        if (!requestId) throw new Error('A request ID is required for streaming generation.');
+        if (!requestId) throw new Error('A request ID is required for streaming generation.'); assertExternalWorkAvailable(this);
         if (this.preCancelledStreams.delete(requestId)) {
             const preCancelled = new Error('Generation stopped.');
             preCancelled.name = 'AbortError';
@@ -3947,6 +4987,8 @@ class LlamaRuntime {
         }
         return true;
     }
+    temporarilyReleaseVramForExternalWork(options = {}) { return temporarilyReleaseVramForExternalWork(this, { ...options, preferRam: options.preferRam !== false, RuntimeClass: LlamaRuntime }); }
+    stopProcessForExternalWork() { return stopProcessForExternalWork(this); }
     async stopProcessOnly() {
         const processHandle = this.process;
         this.process = null;
@@ -3970,8 +5012,8 @@ class LlamaRuntime {
         this.loadedProjectorPath = null;
         this.modelIdleUnload?.modelUnloaded();
     }
-    stopServer() {
-        return this.enqueueLifecycle(async () => {
+    stopServer(options = {}) {
+        if (options.force !== true) assertExternalWorkAvailable(this); return this.enqueueLifecycle(async () => {
             await this.stopServerInternal();
             return { success: true };
         });
@@ -3983,7 +5025,7 @@ module.exports = {
     normalizeFloat, normalizeInteger, parseSseLine, requestJson,
     streamIncrement, walkModels,
 };
-// <DARKSTAR_SOURCE_END path="backend/llama-runtime.js">
+    // <DARKSTAR_SOURCE_END path="backend/llama-runtime.js">
 });
 // --------------------------------------------------------------------------
 // [3200] GENERATION CORE :: agent loop, completion and request normalization
@@ -3992,14 +5034,13 @@ module.exports = {
 __darkstarDefineModule("backend/runtime/agent-loop.js", function darkstarModule(module, exports, require, __filename, __dirname) {
 // <DARKSTAR_SOURCE_BEGIN path="backend/runtime/agent-loop.js">
 'use strict';
-
 const fs = require('node:fs');
 const path = require('node:path');
 const { injectSkillCatalog } = require('./skill-catalog');
 const { mergeUsage } = require('./tokens');
 const { classifyToolArgumentsJson } = require('./tool-call-state');
 const { createPreparationTracker } = require('./tool-preparation-tracker');
-
+const { parseArguments } = require('../agent/tool-schema');
 function createToolActivity(call, description, round, now = new Date()) {
     return {
         id: `activity-${round}-${String(call.id || now.getTime())}`,
@@ -4016,7 +5057,6 @@ function createToolActivity(call, description, round, now = new Date()) {
         error: null,
     };
 }
-
 function emptyAgentResult(result) {
     return { ...result, working: [], toolMessages: [], agentRounds: 1, toolRounds: 0, browserCompartmentActivated: false };
 }
@@ -4030,6 +5070,7 @@ const MAX_SERVER_PROTOCOL_RETRIES = 1;
 const MAX_CONSECUTIVE_PROTOCOL_FAILURES = 1;
 
 const TOOL_EXECUTION_HEARTBEAT_MS = 1000;
+const MAX_GENERATED_IMAGES_PER_CALL = 50;
 
 const ONLINE_BROWSER_PERSISTENCE_NOTICE = Object.freeze({
     success: true,
@@ -4274,6 +5315,7 @@ function emitToolContextImages(handlers, executed, call, options = {}) {
                 : { kind: 'agent-tool-image', id: `task:${String(call?.id || call?.function?.name || 'tool')}:${imageIndex}` };
             handlers.onToolEvent?.({
                 type: 'context-image',
+                toolName: String(call?.function?.name || ''),
                 toolCallId: String(call?.id || ''),
                 ephemeral: options.ephemeral === true,
                 image: {
@@ -4286,6 +5328,23 @@ function emitToolContextImages(handlers, executed, call, options = {}) {
             });
             imageIndex += 1;
         }
+    }
+    if (imageIndex === 0 && executed?.rawResult?.__darkstarMultimodal === true && Array.isArray(executed.rawResult.images)) {
+        executed.rawResult.images.forEach((rawImage, rawIndex) => {
+            const mimeType = String(rawImage?.mimeType || '').toLowerCase();
+            const base64 = String(rawImage?.base64 || '');
+            if (!/^image\/[a-z0-9.+-]+$/u.test(mimeType) || !base64) return;
+            const source = { kind: 'agent-tool-image', id: `task:${String(call?.id || call?.function?.name || 'tool')}:${rawIndex}` };
+            handlers.onToolEvent?.({
+                type: 'context-image',
+                toolName: String(call?.function?.name || ''),
+                toolCallId: String(call?.id || ''),
+                ephemeral: options.ephemeral === true,
+                image: {
+                    id: source.id, source, mimeType, name: String(rawImage?.name || `tool-image-${rawIndex + 1}`), base64,
+                },
+            });
+        });
     }
 }
 
@@ -4368,6 +5427,55 @@ function hasResolvableSkillReference(skillReferences) {
     });
 }
 
+function agentVisionEnabled(runtime, request = {}) {
+    if (String(runtime?.loadedProjectorPath || '').trim()) return true;
+    const vision = request?.vision && typeof request.vision === 'object' ? request.vision : null;
+    return Boolean(vision?.enabled === true && String(vision.projectorPath || '').trim());
+}
+
+function messageTextContent(content) { return typeof content === 'string' ? content : (Array.isArray(content) ? content.map((part) => String(part?.text || '')).join(' ') : ''); }
+function latestUserText(messages) {
+    const source = Array.isArray(messages) ? messages : [];
+    for (let index = source.length - 1; index >= 0; index -= 1) if (String(source[index]?.role || '') === 'user') return messageTextContent(source[index]?.content).trim();
+    return '';
+}
+
+function directImageGenerationIntent(messages) {
+    const text = latestUserText(messages).toLowerCase();
+    if (!text) return false;
+    if (/\b(?:how|why|what|explain|describe|teach|tutorial|documentation)\b[\s\S]{0,48}\b(?:image|picture|photo|illustration|artwork|render)\b/u.test(text)) return false;
+    if (/\b(?:prompt|prompts)\b[\s\S]{0,32}\b(?:for|about)\b/u.test(text) && !/\b(?:make|create|generate|draw|render|produce)\b/u.test(text)) return false;
+    return /\b(?:make|create|generate|draw|render|produce)\b[\s\S]{0,80}\b(?:image|picture|photo|illustration|artwork|render)\b/u.test(text)
+        || /\b(?:image|picture|photo|illustration|artwork)\s+of\b/u.test(text);
+}
+
+function runtimeForSingleTool(agentRuntime, name) {
+    const toolNameValue = String(name || ''), definition = (Array.isArray(agentRuntime?.definitions) ? agentRuntime.definitions : []).find((candidate) => String(candidate?.function?.name || '') === toolNameValue);
+    const handler = agentRuntime?.handlers instanceof Map ? agentRuntime.handlers.get(toolNameValue) : null;
+    return definition && handler ? { ...agentRuntime, definitions: [definition], handlers: new Map([[toolNameValue, handler]]), toolChoice: 'required', directIntentTool: toolNameValue } : null;
+}
+
+function imageCapabilityUnavailableMessage(messages) {
+    const output = Array.isArray(messages) ? messages.map((message) => ({ ...message })) : [];
+    const notice = '<darkstar_capability_boundary>\nThe user is directly requesting image generation, but generate_image is not available in the active workflow.\nDo not substitute filesystem, terminal, browser, Skill, or unrelated tools for image generation.\nExplain concisely that the active workflow has no image-generation capability and that a Diffusion Backend GGUF plus DM Sampler must expose generate_image.\n</darkstar_capability_boundary>';
+    const systemIndex = output.findIndex((message) => message?.role === 'system' && typeof message.content === 'string');
+    if (systemIndex < 0) output.unshift({ role: 'system', content: notice });
+    else output[systemIndex] = { ...output[systemIndex], content: `${output[systemIndex].content.trimEnd()}\n\n${notice}` };
+    return output;
+}
+
+function toolCallFingerprint(call) {
+    const name = String(call?.function?.name || ''), raw = call?.function?.arguments ?? '{}'; let argumentsText;
+    try { argumentsText = JSON.stringify(parseArguments(raw)); } catch (_) { argumentsText = String(raw); }
+    return `${name}\u0000${argumentsText}`;
+}
+
+function hasImageContextMessage(messages) {
+    return Array.isArray(messages) && messages.some((message) => Array.isArray(message?.content)
+        && message.content.some((part) => String(part?.type || '').toLowerCase() === 'image_url'
+            && Boolean(typeof part?.image_url === 'string' ? part.image_url : part?.image_url?.url)));
+}
+
 
 function buildAgentRequest(baseBody, workingMessages, agentRuntime, modelRound) {
     const body = {
@@ -4402,12 +5510,15 @@ async function executeToolCalls(runtime, options) {
         preparations = [],
         toolMessages,
         toolRound,
+        presentedImageIds, showImageAvailable,
         working,
         workingMessages,
         visionEnabled,
         interactionId,
     } = options;
     const protocolFailures = [];
+    const failedCalls = [];
+    const completedCallFingerprints = [];
     let completedCalls = 0;
     let browserCompartmentActivated = false;
     let browserCompartmentToolName = '';
@@ -4462,9 +5573,45 @@ async function executeToolCalls(runtime, options) {
             const executed = await runtime.toolService.execute(executionRuntime, call, {
                 signal: controller.signal,
                 visionEnabled: visionEnabled === true,
-                interactionId: String(interactionId || ''),
+                interactionId: String(interactionId || ''), imageRegistry: options.imageRegistry, showImageAvailable,
+                onToolProgress: function(imageGeneration) {
+                    activity.executionElapsedMs = Math.max(0, Date.now() - executionStartedAt);
+                    const progressPayload = imageGeneration && typeof imageGeneration === 'object' ? { ...imageGeneration } : null;
+                    handlers.onToolEvent?.({
+                        type: 'image-generation-progress', activity: { ...activity }, imageGeneration: progressPayload,
+                    });
+                    if (progressPayload?.finalImage === true && /^image\/(?:png|jpeg|webp)$/iu.test(String(progressPayload.mimeType || '')) && progressPayload.base64) {
+                        const progressImageIndex = Number.parseInt(progressPayload.imageIndex, 10);
+                        const imageOrdinal = Number.isInteger(progressImageIndex) && progressImageIndex >= 1 && progressImageIndex <= MAX_GENERATED_IMAGES_PER_CALL ? progressImageIndex - 1 : 0;
+                        const imageId = `task:${String(call?.id || call?.function?.name || 'generate_image')}:${imageOrdinal}`;
+                        handlers.onToolEvent?.({
+                            type: 'context-image', toolName: String(call?.function?.name || ''), toolCallId: String(call?.id || ''), ephemeral: false,
+                            image: {
+                                id: imageId, source: { kind: 'agent-tool-image', id: imageId },
+                                mimeType: String(progressPayload.mimeType), name: String(progressPayload.imageName || 'generated-image.png'),
+                                base64: String(progressPayload.base64),
+                                width: Math.max(0, Math.floor(Number(progressPayload.width) || 0)),
+                                height: Math.max(0, Math.floor(Number(progressPayload.height) || 0)),
+                            },
+                        });
+                    }
+                },
             });
             resultText = executed.result;
+            for (const imageId of executed.presentedImageIds || []) if (!presentedImageIds.includes(imageId)) { presentedImageIds.push(imageId); handlers.onToolEvent?.({ type: 'response-image', imageId }); }
+            if (toolName(call) === 'generate_image') {
+                const attached = hasImageContextMessage(executed.contextMessages);
+                if (visionEnabled === true && !attached) {
+                    const error = new Error('Generate Image completed, but its final image was not attached to the multimodal model context.');
+                    error.code = 'GENERATED_IMAGE_CONTEXT_MISSING';
+                    throw error;
+                }
+                if (visionEnabled !== true && attached) {
+                    const error = new Error('Generate Image attempted to attach image context without an active multimodal projector.');
+                    error.code = 'GENERATED_IMAGE_CONTEXT_WITHOUT_PROJECTOR';
+                    throw error;
+                }
+            }
             const activatedToolName = untrustedBrowserToolName(call.function?.name, executed.rawResult, parsedToolArguments(call));
             onlineBrowserCall = Boolean(activatedToolName);
             if (onlineBrowserCall) {
@@ -4486,6 +5633,7 @@ async function executeToolCalls(runtime, options) {
             activity.executionElapsedMs = Math.max(0, Number(executed.durationMs) || (Date.now() - executionStartedAt));
             activity.completedAt = new Date().toISOString();
             completedCalls += 1;
+            completedCallFingerprints.push(toolCallFingerprint(call));
             handlers.onToolEvent?.({
                 type: 'complete',
                 activity: { ...activity },
@@ -4503,6 +5651,7 @@ async function executeToolCalls(runtime, options) {
             activity.durationMs = Math.max(0, Date.now() - executionStartedAt);
             activity.executionElapsedMs = activity.durationMs;
             if (isRecoverableToolProtocolError(error)) protocolFailures.push({ call, error });
+            failedCalls.push({ call: structuredClone(call), error, fingerprint: toolCallFingerprint(call) });
             handlers.onToolEvent?.({ type: 'error', activity: { ...activity } });
         } finally {
             clearInterval(executionHeartbeat);
@@ -4536,7 +5685,7 @@ async function executeToolCalls(runtime, options) {
         }
     }
 
-    return { completedCalls, protocolFailures, browserCompartmentActivated, browserCompartmentToolName };
+    return { completedCalls, completedCallFingerprints, protocolFailures, failedCalls, browserCompartmentActivated, browserCompartmentToolName };
 }
 
 async function prepareAgentStart(runtime, request) {
@@ -4553,8 +5702,13 @@ async function prepareAgentStart(runtime, request) {
         return { direct: true, baseBody, body: baseBody };
     }
     const effectiveSkillConfiguration = staleDisabledSkills ? { ...(request.skills || {}), skills: [] } : (request.skills || {});
-    const visionEnabled = Boolean(runtime.loadedProjectorPath);
+    const visionEnabled = agentVisionEnabled(runtime, request);
     const agentRuntime = await runtime.toolService.buildRuntime({ ...(request.tools || {}), visionEnabled }, effectiveSkillConfiguration);
+    const imageIntent = directImageGenerationIntent(baseBody.messages);
+    const directImageRuntime = imageIntent ? runtimeForSingleTool(agentRuntime, 'generate_image') : null;
+    if (imageIntent && !directImageRuntime) {
+        return { direct: true, baseBody, body: { ...baseBody, messages: imageCapabilityUnavailableMessage(baseBody.messages) } };
+    }
     if (!agentRuntime.definitions.length) {
         return { direct: true, baseBody, body: baseBody };
     }
@@ -4563,13 +5717,16 @@ async function prepareAgentStart(runtime, request) {
     const initialCatalog = retainedOnlineImageContext ? '' : agentRuntime.catalog;
     const workingMessages = injectToolProtocolGuidance(injectSkillCatalog(baseBody.messages, initialCatalog));
     if (retainedOnlineImageContext) ensureOnlineBrowserBoundary(workingMessages, retainedOnlineBrowserTool);
-    let activeAgentRuntime = retainedOnlineImageContext ? retainedOnlineBrowserRuntime(agentRuntime, retainedOnlineBrowserTool) : agentRuntime;
+    let activeAgentRuntime = retainedOnlineImageContext
+        ? retainedOnlineBrowserRuntime(agentRuntime, retainedOnlineBrowserTool)
+        : (directImageRuntime || agentRuntime);
     return {
         direct: false,
         baseBody,
         agentRuntime,
         retainedOnlineBrowserTool,
         retainedOnlineImageContext,
+        directIntentTool: directImageRuntime ? 'generate_image' : '',
         workingMessages,
         activeAgentRuntime, visionEnabled,
         body: buildAgentRequest(baseBody, workingMessages, activeAgentRuntime, 1),
@@ -4585,8 +5742,9 @@ async function streamAgent(runtime, request, controller, handlers = {}, interact
     const preparedStart = await prepareAgentStart(runtime, request);
     const { baseBody } = preparedStart;
     if (preparedStart.direct) return emptyAgentResult(await runtime.performChatCompletion(baseBody, controller.signal, handlers));
-    const { agentRuntime, retainedOnlineBrowserTool, retainedOnlineImageContext, workingMessages, visionEnabled } = preparedStart;
-    const toolMessages = [];
+    const { agentRuntime, retainedOnlineBrowserTool, retainedOnlineImageContext, directIntentTool, workingMessages, visionEnabled } = preparedStart;
+    const toolMessages = [], presentedImageIds = [], imageRegistry = new Map();
+    const failedToolCallCounts = new Map();
     const working = [];
     let aggregateUsage = null;
     let finalFinishReason = null;
@@ -4675,6 +5833,7 @@ async function streamAgent(runtime, request, controller, handlers = {}, interact
                     contextUsage: latestContextUsage,
                     working,
                     toolMessages,
+                    presentedImageIds,
                     agentRounds: modelRound,
                     toolRounds: toolRound,
                     browserCompartmentActivated,
@@ -4740,8 +5899,27 @@ async function streamAgent(runtime, request, controller, handlers = {}, interact
                 working,
                 workingMessages,
                 visionEnabled,
-                interactionId,
+                interactionId, imageRegistry, presentedImageIds, showImageAvailable: agentRuntime.handlers.has('show_image'),
             });
+
+            for (const failure of Array.isArray(execution.failedCalls) ? execution.failedCalls : []) {
+                const fingerprint = String(failure?.fingerprint || toolCallFingerprint(failure?.call));
+                const count = (failedToolCallCounts.get(fingerprint) || 0) + 1;
+                failedToolCallCounts.set(fingerprint, count);
+                if (count === 2) {
+                    workingMessages.push({ role: 'user', content: 'Darkstar blocked an agent-loop repetition: the exact same tool name and arguments have already failed twice. Do not repeat that call. Choose a different valid tool/arguments or answer the user without a tool.' });
+                } else if (count >= 3) {
+                    const loopError = new Error(`Agent tool loop stopped after the same failed call repeated ${count} times: ${String(failure?.call?.function?.name || 'tool')}.`);
+                    loopError.code = 'REPEATED_FAILED_TOOL_CALL';
+                    throw loopError;
+                }
+            }
+            for (const fingerprint of Array.isArray(execution.completedCallFingerprints) ? execution.completedCallFingerprints : []) {
+                failedToolCallCounts.delete(String(fingerprint));
+            }
+            if (directIntentTool && execution.completedCalls > 0 && toolCalls.some((call) => toolName(call) === directIntentTool)) {
+                activeAgentRuntime = agentRuntime;
+            }
 
             if (execution.browserCompartmentActivated && !browserCompartmentActivated) {
                 browserCompartmentActivated = true;
@@ -4779,6 +5957,7 @@ async function streamAgent(runtime, request, controller, handlers = {}, interact
                 reasoning: fullReasoning + activeRoundReasoning,
                 working: structuredClone(working),
                 toolMessages: structuredClone(toolMessages),
+                presentedImageIds: presentedImageIds.slice(),
                 partialToolCall: interruptedToolCall ? structuredClone(interruptedToolCall) : null,
                 agentRounds: modelRound,
                 toolRounds: toolRound,
@@ -4791,6 +5970,7 @@ async function streamAgent(runtime, request, controller, handlers = {}, interact
 
 module.exports = {
     agentInputBody,
+    agentVisionEnabled,
     browserOnlyRuntime,
     buildAgentRequest,
     emptyAgentResult,
@@ -4798,6 +5978,9 @@ module.exports = {
     ephemeralOnlineToolMessage,
     executeToolCalls,
     hasResolvableSkillReference,
+    directImageGenerationIntent,
+    runtimeForSingleTool,
+    toolCallFingerprint,
     injectToolProtocolGuidance,
     isOnlineBrowserResult,
     untrustedBrowserToolName,
@@ -5876,6 +7059,67 @@ function readGgufModelMetadata(filePath) {
     }
 }
 
+function readGgufMemoryMetadata(filePath) {
+    const reader = new GgufReader(filePath);
+    try {
+        if (reader.readBuffer(4).toString('ascii') !== GGUF_MAGIC) return null;
+        const version = reader.readU32();
+        if (version < 2 || version > 3) return null;
+        reader.readU64(); // tensor count
+        const metadataCount = reader.readU64();
+        if (metadataCount > MAX_METADATA_ENTRIES) return null;
+
+        let architecture = '';
+        const values = new Map();
+        const memoryKeys = new Set([
+            'block_count',
+            'embedding_length',
+            'attention.head_count',
+            'attention.head_count_kv',
+            'attention.key_length',
+            'attention.value_length',
+        ]);
+        for (let index = 0; index < metadataCount; index += 1) {
+            const key = reader.readString(MAX_KEY_BYTES);
+            const type = reader.readU32();
+            if (key === 'general.architecture' && type === VALUE_TYPES.STRING) {
+                architecture = reader.readString(MAX_KEY_BYTES).trim();
+                continue;
+            }
+            const dot = key.indexOf('.');
+            const suffix = dot >= 0 ? key.slice(dot + 1) : '';
+            if (dot > 0 && memoryKeys.has(suffix) && Object.hasOwn(FIXED_VALUE_BYTES, type)) {
+                const value = normalizedPositiveInteger(reader.readInteger(type));
+                if (value) values.set(key, value);
+                continue;
+            }
+            reader.skipValue(type);
+        }
+        const pick = (suffix) => {
+            if (architecture) {
+                const direct = normalizedPositiveInteger(values.get(`${architecture}.${suffix}`));
+                if (direct) return direct;
+            }
+            const matches = [];
+            for (const [key, value] of values) if (key.endsWith(`.${suffix}`)) matches.push(value);
+            return matches.length === 1 ? normalizedPositiveInteger(matches[0]) : null;
+        };
+        return {
+            architecture: architecture || null,
+            layerCount: pick('block_count'),
+            embeddingLength: pick('embedding_length'),
+            headCount: pick('attention.head_count'),
+            headCountKv: pick('attention.head_count_kv'),
+            keyLength: pick('attention.key_length'),
+            valueLength: pick('attention.value_length'),
+        };
+    } catch (_error) {
+        return null;
+    } finally {
+        reader.close();
+    }
+}
+
 function readGgufLayerCount(filePath) {
     return readGgufModelMetadata(filePath).layerCount;
 }
@@ -5888,6 +7132,7 @@ module.exports = {
     detectReasoningCapabilities,
     readGgufContextLength,
     readGgufLayerCount,
+    readGgufMemoryMetadata,
     readGgufModelMetadata,
 };
 // <DARKSTAR_SOURCE_END path="backend/runtime/gguf-metadata.js">
@@ -6287,15 +7532,15 @@ async function loadModel(runtime, request, dependencies) {
         requestJson,
         validateProjectorPath,
     } = dependencies;
-    if (!runtime.server) throw new Error('The Load Server node must execute before Load Model (GGUF).');
+    if (!runtime.server) throw new Error('LlamaCPP Server must be running before a GGUF model can be loaded.');
 
     const normalized = runtime.normalizeModelLoadRequest(request);
-    if (!normalized.modelId) throw new Error('No model is selected in the Load Model (GGUF) node.');
+    if (!normalized.modelId) throw new Error('No model is selected in the Invoke Language Model (GGUF) node.');
 
-    const selection = runtime.resolveModelSelection(normalized.modelId);
+    const selection = await runtime.resolveModelSelectionAsync(normalized.modelId);
     const projectorPath = normalized.projectorPath
         ? validateProjectorPath(normalized.projectorPath)
-        : (normalized.autoDetectProjector !== false && selection.local?.path ? detectProjectorForModel(selection.local.path) : null);
+        : (normalized.autoDetectProjector !== false && selection.local?.path ? await detectProjectorForModel(selection.local.path) : null);
 
     const desiredModelId = selection.local?.id || selection.routerId || selection.requested;
     if (inFlightStreamCount(runtime) && runtime.loadedModelId && runtime.loadedModelId !== desiredModelId) {
@@ -6305,12 +7550,14 @@ async function loadModel(runtime, request, dependencies) {
     // Router model loading accepts only a model name. A projector-backed model
     // therefore uses direct server mode so --mmproj is explicit and deterministic.
     if (selection.directFile || projectorPath || runtime.processMode === 'legacy') {
-        return runtime.loadLegacyModel(normalized.modelId, projectorPath);
+        return runtime.loadLegacyModel(normalized.modelId, projectorPath, {
+            allowDuringActiveStream: dependencies.allowDuringActiveStream === true, selection,
+        });
     }
     if (!runtime.process || runtime.process.killed) throw new Error('llama-server is not running.');
 
     const models = await runtime.listRouterModels(true);
-    const routerSelection = runtime.resolveModelSelection(normalized.modelId, models);
+    const routerSelection = runtime.resolveModelSelection(normalized.modelId, models, selection.local ? [selection.local] : []);
     const selected = models.find((item) => item.id === routerSelection.routerId);
     if (!selected) throw new Error(`Model "${normalized.modelId}" was not found by llama.cpp in ${runtime.modelsDir}`);
     if (selected.status?.value === 'loaded') {
@@ -6375,7 +7622,7 @@ async function loadLegacyModel(runtime, request = {}, dependencies = {}) {
     const { modelId, projectorPath = null, validateProjectorPath, loadTimeoutMs } = request;
     if (typeof validateProjectorPath !== 'function') throw new TypeError('validateProjectorPath is required.');
     const config = runtime.server.config;
-    const selection = runtime.resolveModelSelection(modelId);
+    const selection = request.selection || await runtime.resolveModelSelectionAsync(modelId);
     if (!selection.local) throw new Error(`Model "${modelId}" was not found in ${runtime.modelsDir}`);
     const normalizedProjector = projectorPath ? validateProjectorPath(projectorPath) : null;
 
@@ -6401,12 +7648,12 @@ async function loadLegacyModel(runtime, request = {}, dependencies = {}) {
         };
     }
 
-    if (inFlightStreamCount(runtime)) {
-        throw new Error('The loaded model cannot change while tab generations are active. Stop them first.');
-    }
+    const activeCount = runtime.activeStreams instanceof Map ? runtime.activeStreams.size : 0, pendingCount = runtime.pendingStreams instanceof Map ? runtime.pendingStreams.size : 0;
+    const currentStreamOnly = dependencies.allowDuringActiveStream === true && activeCount <= 1 && pendingCount === 0; if (inFlightStreamCount(runtime) && !currentStreamOnly) throw new Error('The loaded model cannot change while tab generations are active. Stop them first.');
+    const stopForReload = dependencies.allowDuringActiveStream === true && typeof runtime.stopProcessForExternalWork === 'function' ? () => runtime.stopProcessForExternalWork() : () => runtime.stopProcessOnly();
     const requestedConfig = runtime.server.requestedConfig || config;
     const gpuSelection = runtime.server.gpuSelection;
-    await runtime.stopProcessOnly();
+    await stopForReload();
     const capabilities = await runtime.detectCapabilities();
     let memoryFallback = null;
     let mtpFallback = null;
@@ -6429,7 +7676,7 @@ async function loadLegacyModel(runtime, request = {}, dependencies = {}) {
 
     if (loadError && config?.mtp?.enabled && config.mtp.requestedMode === 'auto') {
         initialMtpError = loadError;
-        await runtime.stopProcessOnly();
+        await stopForReload();
         lastAttemptConfig = {
             ...config,
             mtp: disableAutoMtpPlan(config.mtp, 'Auto MTP was rejected during model startup; running this model without MTP.'),
@@ -6453,7 +7700,7 @@ async function loadLegacyModel(runtime, request = {}, dependencies = {}) {
             combined.code = loadError.code || initialMtpError.code || 'MODEL_LOAD_FAILED';
             throw combined;
         }
-        await runtime.stopProcessOnly();
+        await stopForReload();
         const fallbackBase = { ...requestedConfig, mtp: lastAttemptConfig.mtp };
         let fallbackConfig = memorySafeServerConfig(fallbackBase, capabilities);
         let fallbackSelection = gpuSelection;
@@ -6509,11 +7756,16 @@ async function loadLegacyModel(runtime, request = {}, dependencies = {}) {
     };
 }
 
-async function unloadModel(runtime, modelId, requestJson) {
+function invalidateLoadedModelResidency(runtime) {
+    runtime.loadedModelId = null; runtime.loadedProjectorPath = null; runtime.cacheEpoch = Number(runtime.cacheEpoch || 0) + 1;
+    runtime.slotCacheOwners?.clear?.(); if (runtime.server) runtime.server.effectiveContext = null;
+}
+async function unloadModel(runtime, modelId, requestJson, options = {}) {
     if (!modelId) return { success: true, unloaded: false };
-    if (inFlightStreamCount(runtime)) {
-        throw new Error('The loaded model cannot be unloaded while tab generations are active. Stop them first.');
-    }
+    const activeCount = inFlightStreamCount(runtime), allowedActiveCount = options.allowDuringActiveStream === true ? 1 : 0;
+    if (activeCount > allowedActiveCount) throw new Error(options.allowDuringActiveStream === true
+        ? 'The loaded model cannot be temporarily unloaded while other tab generations are active. Stop them first.'
+        : 'The loaded model cannot be unloaded while tab generations are active. Stop them first.');
     if (runtime.processMode === 'router' && runtime.process && runtime.server) {
         await requestJson({
             port: runtime.server.port,
@@ -6522,19 +7774,13 @@ async function unloadModel(runtime, modelId, requestJson) {
             body: { model: modelId },
             timeoutMs: 30_000,
         });
-        if (runtime.loadedModelId === modelId) {
-            runtime.loadedModelId = null;
-            runtime.loadedProjectorPath = null;
-            if (runtime.server) runtime.server.effectiveContext = null;
-        }
+        if (runtime.loadedModelId === modelId) invalidateLoadedModelResidency(runtime);
         return { success: true, unloaded: true };
     }
     if (runtime.processMode === 'legacy') {
-        await runtime.stopProcessOnly();
-        runtime.loadedModelId = null;
-        runtime.loadedProjectorPath = null;
-        if (runtime.server) runtime.server.effectiveContext = null;
-        return { success: true, unloaded: true };
+        if (options.allowDuringActiveStream === true && typeof runtime.stopProcessForExternalWork === 'function') await runtime.stopProcessForExternalWork();
+        else await runtime.stopProcessOnly();
+        invalidateLoadedModelResidency(runtime); return { success: true, unloaded: true };
     }
     return { success: true, unloaded: false };
 }
@@ -6553,6 +7799,330 @@ module.exports = {
     unloadModel,
 };
 // <DARKSTAR_SOURCE_END path="backend/runtime/model-lifecycle.js">
+});
+// MODULE :: backend/runtime/external-work-lifecycle.js
+__darkstarDefineModule("backend/runtime/external-work-lifecycle.js", function darkstarModule(module, exports, require, __filename, __dirname) {
+// <DARKSTAR_SOURCE_BEGIN path="backend/runtime/external-work-lifecycle.js">
+'use strict';
+const fs = require('node:fs');
+const os = require('node:os');
+const { LOAD_TIMEOUT_MS } = require('./constants');
+const { readGgufMemoryMetadata } = require('./gguf-metadata');
+const { loadModel, unloadModel } = require('./model-lifecycle');
+const { delay, killProcessTree } = require('./process-utils');
+const { normalizeKvCacheType } = require('./server-config');
+const { detectProjectorForModel, validateProjectorPath } = require('../vision/projector-service');
+
+const MIB = 1024 * 1024;
+const MODEL_MEMORY_OVERHEAD_RATIO = 0.05;
+const MODEL_MEMORY_MIN_OVERHEAD_BYTES = 128 * MIB;
+const KV_TYPE_BYTES = Object.freeze({
+    f32: 4,
+    f16: 2,
+    bf16: 2,
+    q8_0: 34 / 32,
+    q4_0: 18 / 32,
+    q4_1: 20 / 32,
+    iq4_nl: 18 / 32,
+    q5_0: 22 / 32,
+    q5_1: 24 / 32,
+});
+
+function applyRamParkingLaunchArgs(runtime, args, capabilities) {
+    const output = Array.isArray(args) ? args.slice() : [];
+    if (!runtime?.ramParkingMode) return output;
+    if (capabilities?.noMmap !== true) throw new Error('This llama-server build cannot guarantee RAM parking because --no-mmap is unavailable.');
+    if (!output.includes('--no-mmap')) output.push('--no-mmap');
+    return output;
+}
+
+function assertExternalWorkAvailable(runtime) {
+    if (!runtime?.externalWorkLease) return;
+    const error = new Error('The language model is temporarily unavailable while image generation is using Dynamic VRAM.');
+    error.code = 'MODEL_TEMPORARILY_UNAVAILABLE';
+    throw error;
+}
+
+async function stopProcessForExternalWork(runtime) {
+    const processHandle = runtime.process;
+    runtime.process = null;
+    if (processHandle) await killProcessTree(processHandle);
+}
+
+function finitePositiveBytes(value) {
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? Math.ceil(number) : 0;
+}
+
+function safeFileSize(filePath) {
+    if (!filePath) return 0;
+    try {
+        const stat = fs.statSync(filePath);
+        return stat.isFile() ? finitePositiveBytes(stat.size) : 0;
+    } catch (_) { return 0; }
+}
+
+function memoryUnitBytes(value, unit) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) return 0;
+    const normalized = String(unit || '').toLowerCase();
+    if (normalized === 'gib') return number * 1024 * MIB;
+    if (normalized === 'mib') return number * MIB;
+    if (normalized === 'kib') return number * 1024;
+    return number;
+}
+
+function recentLoggedKvCacheBytes(logLines) {
+    const lines = Array.isArray(logLines) ? logLines : [];
+    const buffers = new Map();
+    for (let index = lines.length - 1; index >= Math.max(0, lines.length - 240); index -= 1) {
+        const line = String(lines[index] || '');
+        const total = line.match(/KV\s+(?:self\s+)?size\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(KiB|MiB|GiB)/iu);
+        if (total) return finitePositiveBytes(memoryUnitBytes(total[1], total[2]));
+        const buffer = line.match(/(?:(CPU|CUDA\d+|Vulkan\d+|VULKAN\d+|[A-Za-z][A-Za-z0-9._:-]{0,31})\s+)?KV\s+buffer\s+size\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(KiB|MiB|GiB)/iu);
+        if (!buffer) continue;
+        const key = String(buffer[1] || '__single__').toLowerCase();
+        if (buffers.has(key)) break; // the previous load of the same buffer owner has been reached
+        buffers.set(key, finitePositiveBytes(memoryUnitBytes(buffer[2], buffer[3])));
+    }
+    if (!buffers.size) return 0;
+    return [...buffers.values()].reduce((sum, value) => sum + value, 0);
+}
+
+function estimatedKvCacheBytes(modelPath, config = {}) {
+    const metadata = readGgufMemoryMetadata(modelPath);
+    if (!metadata?.layerCount || !metadata.embeddingLength || !metadata.headCount) return 0;
+    const headCountKv = metadata.headCountKv || metadata.headCount;
+    const defaultHeadLength = metadata.embeddingLength / metadata.headCount;
+    const keyLength = metadata.keyLength || defaultHeadLength;
+    const valueLength = metadata.valueLength || defaultHeadLength;
+    const contextSize = Number(config.contextSize);
+    if (![headCountKv, keyLength, valueLength, contextSize].every((value) => Number.isFinite(value) && value > 0)) return 0;
+    const cacheTypeK = normalizeKvCacheType(config.cacheTypeK);
+    const cacheTypeV = normalizeKvCacheType(config.cacheTypeV);
+    const bytesK = KV_TYPE_BYTES[cacheTypeK];
+    const bytesV = KV_TYPE_BYTES[cacheTypeV];
+    if (!bytesK || !bytesV) return 0;
+    const perTokenPerLayer = headCountKv * ((keyLength * bytesK) + (valueLength * bytesV));
+    return finitePositiveBytes(metadata.layerCount * contextSize * perTokenPerLayer);
+}
+
+function estimateLanguageModelMemory(runtime) {
+    const modelId = runtime?.loadedModelId;
+    if (!modelId || !runtime?.server) return { reliable: false, reason: 'no-loaded-model', modelBytes: 0, kvCacheBytes: 0, totalBytes: 0 };
+    let selection;
+    try { selection = runtime.resolveModelSelection(modelId); } catch (_) { selection = null; }
+    const modelPath = selection?.local?.path || (fs.existsSync(String(modelId)) ? String(modelId) : '');
+    const rawModelBytes = safeFileSize(modelPath) + safeFileSize(runtime.loadedProjectorPath);
+    if (!modelPath || rawModelBytes <= 0) return { reliable: false, reason: 'model-size-unavailable', modelBytes: 0, kvCacheBytes: 0, totalBytes: 0 };
+    const modelBytes = rawModelBytes + Math.max(MODEL_MEMORY_MIN_OVERHEAD_BYTES, Math.ceil(rawModelBytes * MODEL_MEMORY_OVERHEAD_RATIO));
+    const config = runtime.server.config || runtime.server.requestedConfig || {};
+    const loggedKvBytes = recentLoggedKvCacheBytes(runtime.logLines);
+    const formulaKvBytes = loggedKvBytes > 0 ? 0 : estimatedKvCacheBytes(modelPath, config);
+    const kvCacheBytes = loggedKvBytes || formulaKvBytes;
+    if (kvCacheBytes <= 0) {
+        return { reliable: false, reason: 'kv-cache-size-unavailable', modelBytes, kvCacheBytes: 0, totalBytes: modelBytes, modelPath };
+    }
+    if (config?.mtp?.enabled === true) {
+        return { reliable: false, reason: 'mtp-kv-cache-size-unavailable', modelBytes, kvCacheBytes, totalBytes: modelBytes + kvCacheBytes, modelPath };
+    }
+    return {
+        reliable: true,
+        reason: null,
+        modelBytes,
+        rawModelBytes,
+        kvCacheBytes,
+        kvSource: loggedKvBytes > 0 ? 'llama-runtime-log' : 'gguf-estimate',
+        totalBytes: modelBytes + kvCacheBytes,
+        modelPath,
+    };
+}
+
+function ramParkingPlan(runtime, options = {}) {
+    const language = estimateLanguageModelMemory(runtime);
+    const diffusionResidentBytes = finitePositiveBytes(options.diffusionResidentBytes);
+    const freeSystemRamBytes = finitePositiveBytes(options.freeSystemRamBytes === undefined ? os.freemem() : options.freeSystemRamBytes);
+    const requiredBytes = language.totalBytes + diffusionResidentBytes;
+    const backend = String(runtime?.server?.config?.backend || runtime?.server?.requestedConfig?.backend || runtime?.activeBackend || '').toLowerCase();
+    const canPark = options.preferRam === true
+        && backend !== 'cpu'
+        && language.reliable === true
+        && diffusionResidentBytes > 0
+        && freeSystemRamBytes > requiredBytes;
+    return {
+        canPark,
+        backend,
+        freeSystemRamBytes,
+        diffusionResidentBytes,
+        modelBytes: language.modelBytes,
+        kvCacheBytes: language.kvCacheBytes,
+        requiredBytes,
+        languageEstimateReliable: language.reliable === true,
+        reason: canPark ? null : (backend === 'cpu' ? 'language-model-already-on-cpu' : language.reason || (diffusionResidentBytes <= 0 ? 'diffusion-memory-unavailable' : 'insufficient-free-system-ram')),
+        kvSource: language.kvSource || null,
+    };
+}
+
+function assertExternalWorkRaceFree(runtime, options = {}) {
+    if (runtime.externalWorkLease) {
+        const error = new Error('The language model already has an active external-work lease.');
+        error.code = 'MODEL_EXTERNAL_WORK_BUSY';
+        throw error;
+    }
+    const activeCount = runtime.activeStreams instanceof Map ? runtime.activeStreams.size : 0;
+    const pendingCount = runtime.pendingStreams instanceof Map ? runtime.pendingStreams.size : 0;
+    if (pendingCount > 0 || activeCount > (options.allowDuringActiveStream === true ? 1 : 0)) {
+        throw new Error('Dynamic VRAM cannot move or unload the language model while another tab generation is active or queued.');
+    }
+}
+
+async function closeParkingRuntime(parking) {
+    if (!parking) return;
+    try {
+        if (typeof parking.stop === 'function') await parking.stop();
+        else if (typeof parking.stopServer === 'function') await parking.stopServer({ force: true });
+    } catch (_) { /* best effort; the primary model lifecycle still has to finish */ }
+}
+
+async function createDefaultRamParkingRuntime(primaryRuntime, snapshot, RuntimeClass) {
+    if (typeof RuntimeClass !== 'function') throw new Error('RAM parking runtime factory is unavailable.');
+    const parking = new RuntimeClass({
+        baseDir: primaryRuntime.baseDir, modelsDir: primaryRuntime.modelsDir, backend: 'cpu', ramParkingMode: true,
+        ...(primaryRuntime.fixedExecutable ? { executable: primaryRuntime.fixedExecutable } : {}),
+        log: (...args) => primaryRuntime.log?.('[dynamic-vram:ram]', ...args),
+    });
+    let ready = false;
+    try {
+        const sourceConfig = snapshot.requestedConfig || snapshot.config || {};
+        await parking.startServer({
+            ...sourceConfig, port: 0, backend: 'cpu', gpuLayers: '0', gpuMode: 'all', gpuDeviceIds: [],
+            multiGpuMode: 'sequential', kvCacheLocation: 'cpu', fit: false, modelId: snapshot.modelId,
+        });
+        await parking.loadModel({ modelId: snapshot.modelId, projectorPath: snapshot.projectorPath, autoDetectProjector: false });
+        ready = true;
+        return {
+            runtime: parking,
+            async stop() {
+                await parking.stopServer({ force: true }).catch(() => undefined);
+                parking.modelIdleUnload?.close?.();
+            },
+        };
+    } finally {
+        if (!ready) {
+            await parking.stopServer({ force: true }).catch(() => undefined);
+            parking.modelIdleUnload?.close?.();
+        }
+    }
+}
+
+function temporarilyReleaseVramForExternalWork(runtime, options = {}) {
+    assertExternalWorkRaceFree(runtime, options);
+    const leaseToken = Symbol('language-model-external-work');
+    runtime.externalWorkLease = leaseToken;
+    runtime.inputTokenCountCache = {};
+    runtime.modelIdleUnload?.modelActivityStarted();
+    const clearLease = () => { if (runtime.externalWorkLease === leaseToken) runtime.externalWorkLease = null; };
+    return runtime.enqueueLifecycle(async () => {
+        const snapshot = {
+            modelId: runtime.loadedModelId || null,
+            projectorPath: runtime.loadedProjectorPath || null,
+            config: runtime.server?.config ? structuredClone(runtime.server.config) : null,
+            requestedConfig: runtime.server?.requestedConfig ? structuredClone(runtime.server.requestedConfig) : null,
+        };
+        let parking = null;
+        let strategy = 'unload';
+        const memoryPlan = ramParkingPlan(runtime, options);
+        runtime.log?.(`Dynamic VRAM memory plan: free=${Math.round(memoryPlan.freeSystemRamBytes / MIB)} MiB, required=${Math.round(memoryPlan.requiredBytes / MIB)} MiB (model=${Math.round(memoryPlan.modelBytes / MIB)}, KV=${Math.round(memoryPlan.kvCacheBytes / MIB)}, diffusion=${Math.round(memoryPlan.diffusionResidentBytes / MIB)}), RAM parking=${memoryPlan.canPark ? 'eligible' : `fallback:${memoryPlan.reason}`}.`);
+        try {
+            const parkingFactory = typeof options.createRamParkingRuntime === 'function'
+                ? options.createRamParkingRuntime
+                : (typeof options.RuntimeClass === 'function' ? (state) => createDefaultRamParkingRuntime(runtime, state, options.RuntimeClass) : null);
+            if (snapshot.modelId && memoryPlan.canPark && parkingFactory) {
+                options.onStrategy?.({ strategy: 'ram', phase: 'parking', memoryPlan });
+                try {
+                    parking = await parkingFactory(snapshot, memoryPlan);
+                    if (!parking) throw new Error('RAM parking runtime did not start.');
+                    strategy = 'ram';
+                } catch (error) {
+                    runtime.log?.(`Dynamic VRAM RAM parking was unavailable; using normal unload fallback: ${error?.message || error}`);
+                    await closeParkingRuntime(parking);
+                    parking = null;
+                    options.onStrategy?.({ strategy: 'unload', phase: 'fallback', memoryPlan, reason: 'ram-parking-start-failed' });
+                }
+            } else {
+                options.onStrategy?.({ strategy: 'unload', phase: 'fallback', memoryPlan, reason: memoryPlan.reason });
+            }
+
+            let shouldRestore = false;
+            if (snapshot.modelId) {
+                const unloadResult = await unloadModel(runtime, snapshot.modelId, runtime.transport.requestJson, { allowDuringActiveStream: options.allowDuringActiveStream === true });
+                shouldRestore = unloadResult?.unloaded === true;
+                if (!runtime.loadedModelId) runtime.modelIdleUnload?.modelUnloaded(); else runtime.modelIdleUnload?.refresh();
+            }
+            if (parking && strategy === 'ram') {
+                const currentFree = finitePositiveBytes(typeof options.getFreeSystemRamBytes === 'function' ? options.getFreeSystemRamBytes() : os.freemem());
+                if (currentFree <= memoryPlan.diffusionResidentBytes) {
+                    runtime.log?.('Dynamic VRAM RAM parking no longer leaves enough free system RAM for the diffusion pipeline; dropping the RAM copy and using the normal unload fallback.');
+                    await closeParkingRuntime(parking);
+                    parking = null;
+                    strategy = 'unload';
+                    options.onStrategy?.({ strategy: 'unload', phase: 'fallback', memoryPlan, reason: 'post-parking-free-ram-insufficient' });
+                }
+            }
+            let restorePromise = null;
+            const finishLease = (restoreModel) => {
+                if (restorePromise) return restorePromise;
+                restorePromise = runtime.enqueueLifecycle(async () => {
+                    try {
+                        if (!restoreModel || !shouldRestore) return { success: true, restored: false, strategy, memoryPlan };
+                        runtime.inputTokenCountCache = {};
+                        runtime.modelIdleUnload?.modelActivityStarted();
+                        const result = await loadModel(runtime, { modelId: snapshot.modelId, projectorPath: snapshot.projectorPath, autoDetectProjector: false }, {
+                            delay, detectProjectorForModel, loadTimeoutMs: LOAD_TIMEOUT_MS, requestJson: runtime.transport.requestJson,
+                            validateProjectorPath, allowDuringActiveStream: true,
+                        });
+                        runtime.modelIdleUnload?.modelLoaded();
+                        return { success: true, restored: true, result, strategy, memoryPlan };
+                    } finally {
+                        await closeParkingRuntime(parking);
+                        clearLease();
+                    }
+                });
+                return restorePromise;
+            };
+            return {
+                active: true,
+                unloaded: shouldRestore,
+                parkedInRam: strategy === 'ram',
+                strategy,
+                memoryPlan,
+                modelId: snapshot.modelId,
+                projectorPath: snapshot.projectorPath,
+                restore: () => finishLease(true),
+                release: () => finishLease(false),
+            };
+        } catch (error) {
+            await closeParkingRuntime(parking);
+            clearLease();
+            throw error;
+        }
+    });
+}
+
+function temporarilyUnloadForExternalWork(runtime, options = {}) {
+    return temporarilyReleaseVramForExternalWork(runtime, { ...options, preferRam: false });
+}
+
+module.exports = {
+    applyRamParkingLaunchArgs,
+    assertExternalWorkAvailable,
+    estimateLanguageModelMemory,
+    ramParkingPlan,
+    stopProcessForExternalWork,
+    temporarilyReleaseVramForExternalWork,
+    temporarilyUnloadForExternalWork,
+};
+// <DARKSTAR_SOURCE_END path="backend/runtime/external-work-lifecycle.js">
 });
 // MODULE :: backend/runtime/model-idle-unload.js
 __darkstarDefineModule("backend/runtime/model-idle-unload.js", function darkstarModule(module, exports, require, __filename, __dirname) {
@@ -6664,6 +8234,20 @@ function canonicalExistingPath(filePath) {
         if (error && error.code === 'ENOENT') throw new Error(`The local path does not exist: ${requested}`);
         throw error;
     }
+}
+
+function nearestExistingBrowseDirectory(filePath) {
+    let current = path.dirname(path.resolve(String(filePath || '').trim()));
+    while (current) {
+        try {
+            const resolved = typeof fs.realpathSync.native === 'function' ? fs.realpathSync.native(current) : fs.realpathSync(current);
+            if (fs.statSync(resolved).isDirectory()) return resolved;
+        } catch (_) {}
+        const parent = path.dirname(current);
+        if (!parent || parent === current) break;
+        current = parent;
+    }
+    return '';
 }
 
 function hasGgufMagic(filePath) {
@@ -6787,12 +8371,12 @@ function selectableEntryType(entry, entryPath, kind) {
         try { return validateImageFilePath(entryPath) ? 'image' : ''; } catch (_) { return ''; }
     }
     if (path.extname(entry.name).toLowerCase() !== '.gguf' || isProjectorName(entry.name)) return '';
-    try { return hasGgufMagic(entryPath) ? 'model' : ''; } catch (_) { return ''; }
+    try { return hasGgufMagic(entryPath) ? (kind === 'diffusion' ? 'diffusion' : 'model') : ''; } catch (_) { return ''; }
 }
 
 function browseModelFiles(request = {}, options = {}) {
     const requestedKind = request && request.kind;
-    const kind = ['projector', 'tool', 'skill', 'image'].includes(requestedKind) ? requestedKind : 'model';
+    const kind = ['diffusion', 'projector', 'tool', 'skill', 'image'].includes(requestedKind) ? requestedKind : 'model';
     const validator = kind === 'projector' ? validateProjectorPath
         : kind === 'tool' ? validateToolFilePath
             : kind === 'skill' ? validateSkillFilePath
@@ -6807,7 +8391,14 @@ function browseModelFiles(request = {}, options = {}) {
     const supplied = request && Object.prototype.hasOwnProperty.call(request, 'path') ? String(request.path || '').trim() : '';
     const candidate = supplied || String(options.defaultPath || '').trim();
     if (!candidate) return browseModelFiles({ root: true, kind }, options);
-    let realPath = canonicalExistingPath(candidate);
+    let realPath;
+    try {
+        realPath = canonicalExistingPath(candidate);
+    } catch (error) {
+        const recoveryDirectory = request && request.parentOfFile === true ? nearestExistingBrowseDirectory(candidate) : '';
+        if (!recoveryDirectory) throw error;
+        realPath = recoveryDirectory;
+    }
     let selectedPath = '';
     let selectedFile = null;
     const targetStat = fs.statSync(realPath);
@@ -6849,11 +8440,10 @@ __darkstarDefineModule("backend/runtime/models.js", function darkstarModule(modu
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { Worker } = require('node:worker_threads');
 const { readGgufModelMetadata } = require('./gguf-metadata');
-
 // Model discovery and metadata cache.
 const metadataCache = new Map();
-
 function cachedModelMetadata(filePath, stat) {
     const signature = `${stat.size}:${stat.mtimeMs}`;
     const cached = metadataCache.get(filePath);
@@ -6862,7 +8452,6 @@ function cachedModelMetadata(filePath, stat) {
     metadataCache.set(filePath, { signature, metadata });
     return metadata;
 }
-
 const { isProjectorName, validateModelFilePath } = require('./model-filesystem');
 function modelRecord(filePath, id) {
     const stat = fs.statSync(filePath);
@@ -6881,14 +8470,12 @@ function modelRecord(filePath, id) {
         mtp: metadata.mtp || null,
     };
 }
-
 function walkModels(modelsDir) {
     if (!modelsDir || !fs.existsSync(modelsDir)) return [];
     const root = fs.realpathSync(modelsDir);
     const output = [];
     const topLevel = fs.readdirSync(root, { withFileTypes: true })
         .sort((left, right) => left.name.localeCompare(right.name));
-
     for (const entry of topLevel) {
         const absolute = path.join(root, entry.name);
         if (entry.isFile() && path.extname(entry.name).toLowerCase() === '.gguf' && !isProjectorName(entry.name)) {
@@ -6901,8 +8488,151 @@ function walkModels(modelsDir) {
             .sort((left, right) => left.name.localeCompare(right.name));
         if (candidates.length) output.push(modelRecord(path.join(absolute, candidates[0].name), entry.name));
     }
-
     return output.sort((left, right) => left.id.localeCompare(right.id));
+}
+function inspectModelSelection(modelsDir, modelId) {
+    const requested = String(modelId || '').trim();
+    if (!requested) throw new Error('No model is selected in the Invoke Language Model (GGUF) node.');
+    if (path.isAbsolute(requested)) {
+        const realPath = validateModelFilePath(requested);
+        return { ...modelRecord(realPath, realPath), displayName: path.basename(realPath) };
+    }
+    if (!modelsDir || !fs.existsSync(modelsDir)) return null;
+    const root = fs.realpathSync(modelsDir);
+    const entries = fs.readdirSync(root, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name));
+    const directories = [];
+    const canonical = [];
+    for (const entry of entries) {
+        const absolute = path.join(root, entry.name);
+        if (entry.isFile() && path.extname(entry.name).toLowerCase() === '.gguf' && !isProjectorName(entry.name)) {
+            canonical.push({ id: path.parse(entry.name).name, fileName: entry.name, path: absolute });
+            continue;
+        }
+        if (!entry.isDirectory()) continue;
+        const candidates = fs.readdirSync(absolute, { withFileTypes: true })
+            .filter((child) => child.isFile() && path.extname(child.name).toLowerCase() === '.gguf' && !isProjectorName(child.name))
+            .sort((left, right) => left.name.localeCompare(right.name));
+        if (candidates.length) directories.push({ id: entry.name, fileName: candidates[0].name, path: path.join(absolute, candidates[0].name) });
+    }
+    const candidates = canonical.concat(directories);
+    const selected = candidates.find((candidate) => candidate.id === requested)
+        || candidates.find((candidate) => candidate.fileName === requested || path.parse(candidate.fileName).name === requested)
+        || null;
+    return selected ? modelRecord(selected.path, selected.id) : null;
+}
+
+const MODEL_INVENTORY_WORKER_SOURCE = String.raw`'use strict';
+const { parentPort, workerData } = require('node:worker_threads');
+const core = require(workerData.corePath);
+const { inspectModelSelection, resolveModelSelection, walkModels } = core.requireModule('backend/runtime/models.js');
+const { listProjectorsForModel } = core.requireModule('backend/vision/projector-service.js');
+parentPort.on('message', (message) => {
+    const id = Number(message && message.id) || 0;
+    try {
+        const operation = String(message && message.operation || 'list');
+        if (operation === 'inspect') {
+            const records = [];
+            for (const supplied of Array.isArray(message && message.paths) ? message.paths : []) {
+                try { const local = resolveModelSelection(String(supplied || ''), [], []).local; if (local) records.push(local); } catch (_) {}
+            }
+            parentPort.postMessage({ id, success: true, records });
+            return;
+        }
+        if (operation === 'inspect-model') {
+            const record = inspectModelSelection(String(message && message.modelsDir || ''), String(message && message.modelId || ''));
+            parentPort.postMessage({ id, success: true, records: record ? [record] : [] });
+            return;
+        }
+        if (operation === 'list-projectors') { parentPort.postMessage({ id, success: true, records: listProjectorsForModel(String(message && message.modelPath || '')) }); return; }
+        parentPort.postMessage({ id, success: true, records: walkModels(String(message && message.modelsDir || '')) });
+    } catch (error) {
+        parentPort.postMessage({ id, success: false, error: String(error && error.message || error) });
+    }
+});`;
+
+class AsyncModelInventory {
+    constructor(options = {}) {
+        this.modelsDir = path.resolve(String(options.modelsDir || ''));
+        this.corePath = path.resolve(options.corePath || path.join(__dirname, '..', 'Darkstar_Core.js'));
+        this.Worker = options.Worker || Worker;
+        this.worker = null;
+        this.sequence = 0;
+        this.pending = new Map();
+        this.scanPromise = null;
+        this.closed = false;
+    }
+
+    _rejectPending(error) {
+        for (const pending of this.pending.values()) pending.reject(error);
+        this.pending.clear();
+    }
+
+    _worker() {
+        if (this.worker) return this.worker;
+        if (this.closed) throw new Error('Model inventory scanner is closed.');
+        const worker = new this.Worker(MODEL_INVENTORY_WORKER_SOURCE, {
+            eval: true,
+            workerData: { corePath: this.corePath },
+        });
+        worker.on('message', (message) => {
+            const pending = this.pending.get(Number(message && message.id) || 0);
+            if (!pending) return;
+            this.pending.delete(Number(message.id));
+            if (message.success === true) pending.resolve(Array.isArray(message.records) ? message.records : []);
+            else pending.reject(new Error(String(message.error || 'Model inventory scan failed.')));
+            if (!this.pending.size) worker.unref?.();
+        });
+        worker.on('error', (error) => {
+            if (this.worker === worker) this.worker = null;
+            this._rejectPending(error);
+        });
+        worker.on('exit', (code) => {
+            if (this.worker === worker) this.worker = null;
+            if (!this.closed && Number(code) !== 0) this._rejectPending(new Error(`Model inventory worker exited with code ${code}.`));
+        });
+        worker.unref?.();
+        this.worker = worker;
+        return worker;
+    }
+
+    _request(payload) {
+        return new Promise((resolve, reject) => {
+            const id = ++this.sequence; this.pending.set(id, { resolve, reject });
+            try { const worker = this._worker(); worker.ref?.(); worker.postMessage({ id, ...payload }); }
+            catch (error) { this.pending.delete(id); if (!this.pending.size) this.worker?.unref?.(); reject(error); }
+        });
+    }
+
+    list() {
+        if (this.scanPromise) return this.scanPromise;
+        const operation = this._request({ operation: 'list', modelsDir: this.modelsDir });
+        const wrapped = operation.finally(() => { if (this.scanPromise === wrapped) this.scanPromise = null; });
+        this.scanPromise = wrapped;
+        return wrapped;
+    }
+
+    inspect(paths = []) {
+        const normalized = (Array.isArray(paths) ? paths : []).map((value) => String(value || '').trim()).filter(Boolean);
+        return normalized.length ? this._request({ operation: 'inspect', paths: normalized }) : Promise.resolve([]);
+    }
+
+    listProjectors(modelPath) { const requested = String(modelPath || '').trim(); return requested ? this._request({ operation: 'list-projectors', modelPath: requested }) : Promise.resolve([]); }
+
+    async inspectModel(modelId) {
+        const requested = String(modelId || '').trim();
+        if (!requested) return null;
+        const records = await this._request({ operation: 'inspect-model', modelsDir: this.modelsDir, modelId: requested });
+        return records[0] || null;
+    }
+
+    async close() {
+        this.closed = true;
+        this.scanPromise = null;
+        this._rejectPending(new Error('Model inventory scanner was closed.'));
+        const worker = this.worker;
+        this.worker = null;
+        if (worker && typeof worker.terminate === 'function') await worker.terminate().catch(() => undefined);
+    }
 }
 
 function normalizeModelLoadRequest(request) {
@@ -6918,7 +8648,7 @@ function normalizeModelLoadRequest(request) {
 
 function resolveModelSelection(modelId, routerModels = [], localModels = []) {
     const requested = String(modelId || '').trim();
-    if (!requested) throw new Error('No model is selected in the Load Model (GGUF) node.');
+    if (!requested) throw new Error('No model is selected in the Invoke Language Model (GGUF) node.');
 
     if (path.isAbsolute(requested)) {
         const realPath = validateModelFilePath(requested);
@@ -6945,7 +8675,9 @@ function resolveModelSelection(modelId, routerModels = [], localModels = []) {
 const { ModelDirectoryMonitor, inventorySignature, normalizeInventory } = require('./model-directory-monitor');
 
 module.exports = {
+    AsyncModelInventory,
     ModelDirectoryMonitor,
+    inspectModelSelection,
     inventorySignature,
     isProjectorName,
     normalizeInventory,
@@ -6953,7 +8685,7 @@ module.exports = {
     resolveModelSelection,
     walkModels,
 };
-// <DARKSTAR_SOURCE_END path="backend/runtime/models.js">
+    // <DARKSTAR_SOURCE_END path="backend/runtime/models.js">
 });
 // MODULE :: backend/runtime/model-directory-monitor.js
 __darkstarDefineModule("backend/runtime/model-directory-monitor.js", function darkstarModule(module, exports, require, __filename, __dirname) {
@@ -7364,7 +9096,7 @@ function manualMtpPlan(request, options) {
         cacheTypeV: explicitValue(request, 'cacheTypeV'),
         backendSampling: explicitValue(request, 'backendSampling'),
         resourceClass: null,
-        rationale: 'MTP enabled with explicit Load Server settings; fields left on Auto are delegated to llama.cpp defaults.',
+        rationale: 'MTP enabled with explicit LlamaCPP Server settings; fields left on Auto are delegated to llama.cpp defaults.',
     };
 }
 
@@ -7389,7 +9121,7 @@ function disabledPlan(request, reason) {
 
 function resolveMtpConfig(request, options = {}) {
     const normalized = normalizeMtpRequest(request);
-    if (normalized.mode === 'off') return disabledPlan(normalized, 'MTP disabled by Load Server.');
+    if (normalized.mode === 'off') return disabledPlan(normalized, 'MTP disabled by LlamaCPP Server.');
 
     const modelCapability = usableMtpModelCapability(options.model);
     const runtimeCapability = options.capabilities?.mtp;
@@ -7969,6 +9701,1048 @@ module.exports = {
 };
 // <DARKSTAR_SOURCE_END path="backend/runtime/parallel-streams.js">
 });
+// MODULE :: backend/runtime/png-rgba.js
+__darkstarDefineModule("backend/runtime/png-rgba.js", function darkstarModule(module, exports, require, __filename, __dirname) {
+// <DARKSTAR_SOURCE_BEGIN path="backend/runtime/png-rgba.js">
+'use strict';
+
+const zlib = require('node:zlib');
+
+const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+const MAX_PIXELS = 64 * 1024 * 1024;
+let CRC_TABLE = null;
+
+function crcTable() {
+    if (CRC_TABLE) return CRC_TABLE;
+    CRC_TABLE = new Uint32Array(256);
+    for (let n = 0; n < 256; n += 1) {
+        let c = n;
+        for (let k = 0; k < 8; k += 1) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+        CRC_TABLE[n] = c >>> 0;
+    }
+    return CRC_TABLE;
+}
+function crc32(buffer) {
+    let c = 0xffffffff;
+    const table = crcTable();
+    for (let index = 0; index < buffer.length; index += 1) c = table[(c ^ buffer[index]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+}
+function paeth(a, b, c) {
+    const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+    return pa <= pb && pa <= pc ? a : (pb <= pc ? b : c);
+}
+function ensureDimension(width, height) {
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width * height > MAX_PIXELS) {
+        throw new Error('PNG dimensions are invalid or exceed Darkstar image-edit limits.');
+    }
+}
+function channelsForColorType(colorType) {
+    if (colorType === 0) return 1;
+    if (colorType === 2) return 3;
+    if (colorType === 3) return 1;
+    if (colorType === 4) return 2;
+    if (colorType === 6) return 4;
+    throw new Error(`Unsupported PNG color type ${colorType}.`);
+}
+function decodePngRgba(input) {
+    const buffer = Buffer.isBuffer(input) ? input : Buffer.from(input || []);
+    if (buffer.length < 33 || !buffer.subarray(0, 8).equals(PNG_SIGNATURE)) throw new Error('Image edit requires a valid PNG source.');
+    let offset = 8, width = 0, height = 0, bitDepth = 0, colorType = -1, interlace = 0;
+    const idat = []; let palette = null, transparency = null;
+    while (offset + 12 <= buffer.length) {
+        const length = buffer.readUInt32BE(offset); offset += 4;
+        if (length > buffer.length - offset - 8) throw new Error('PNG chunk length is invalid.');
+        const type = buffer.toString('ascii', offset, offset + 4); offset += 4;
+        const data = buffer.subarray(offset, offset + length); offset += length;
+        offset += 4; // CRC: input is already bounded and provenance-checked; decode is fail-closed on structure.
+        if (type === 'IHDR') {
+            width = data.readUInt32BE(0); height = data.readUInt32BE(4); bitDepth = data[8]; colorType = data[9]; interlace = data[12];
+            ensureDimension(width, height);
+            if (bitDepth !== 8 || interlace !== 0) throw new Error('Image edit supports non-interlaced 8-bit PNG images only.');
+        } else if (type === 'PLTE') palette = Buffer.from(data);
+        else if (type === 'tRNS') transparency = Buffer.from(data);
+        else if (type === 'IDAT') idat.push(Buffer.from(data));
+        else if (type === 'IEND') break;
+    }
+    if (!width || !height || !idat.length) throw new Error('PNG is missing required image data.');
+    const channels = channelsForColorType(colorType);
+    if (colorType === 3 && (!palette || palette.length < 3)) throw new Error('Indexed PNG is missing its palette.');
+    const stride = width * channels;
+    const inflated = zlib.inflateSync(Buffer.concat(idat));
+    const expected = (stride + 1) * height;
+    if (inflated.length !== expected) throw new Error('PNG scanline payload has an unexpected size.');
+    const raw = Buffer.allocUnsafe(stride * height);
+    for (let y = 0; y < height; y += 1) {
+        const sourceOffset = y * (stride + 1), filter = inflated[sourceOffset], rowOffset = y * stride;
+        for (let x = 0; x < stride; x += 1) {
+            const value = inflated[sourceOffset + 1 + x];
+            const left = x >= channels ? raw[rowOffset + x - channels] : 0;
+            const up = y > 0 ? raw[rowOffset - stride + x] : 0;
+            const upLeft = y > 0 && x >= channels ? raw[rowOffset - stride + x - channels] : 0;
+            let decoded;
+            if (filter === 0) decoded = value;
+            else if (filter === 1) decoded = value + left;
+            else if (filter === 2) decoded = value + up;
+            else if (filter === 3) decoded = value + Math.floor((left + up) / 2);
+            else if (filter === 4) decoded = value + paeth(left, up, upLeft);
+            else throw new Error(`Unsupported PNG filter ${filter}.`);
+            raw[rowOffset + x] = decoded & 0xff;
+        }
+    }
+    const rgba = Buffer.allocUnsafe(width * height * 4);
+    for (let pixel = 0, source = 0, target = 0; pixel < width * height; pixel += 1, target += 4) {
+        if (colorType === 6) {
+            rgba[target] = raw[source++]; rgba[target + 1] = raw[source++]; rgba[target + 2] = raw[source++]; rgba[target + 3] = raw[source++];
+        } else if (colorType === 2) {
+            rgba[target] = raw[source++]; rgba[target + 1] = raw[source++]; rgba[target + 2] = raw[source++]; rgba[target + 3] = 255;
+        } else if (colorType === 0) {
+            const gray = raw[source++]; rgba[target] = gray; rgba[target + 1] = gray; rgba[target + 2] = gray; rgba[target + 3] = 255;
+        } else if (colorType === 4) {
+            const gray = raw[source++], alpha = raw[source++]; rgba[target] = gray; rgba[target + 1] = gray; rgba[target + 2] = gray; rgba[target + 3] = alpha;
+        } else {
+            const index = raw[source++], paletteOffset = index * 3;
+            if (paletteOffset + 2 >= palette.length) throw new Error('Indexed PNG contains an invalid palette index.');
+            rgba[target] = palette[paletteOffset]; rgba[target + 1] = palette[paletteOffset + 1]; rgba[target + 2] = palette[paletteOffset + 2];
+            rgba[target + 3] = transparency && index < transparency.length ? transparency[index] : 255;
+        }
+    }
+    return { width, height, data: rgba };
+}
+function pngChunk(type, data) {
+    const typeBuffer = Buffer.from(type, 'ascii'), body = Buffer.from(data || []), output = Buffer.allocUnsafe(12 + body.length);
+    output.writeUInt32BE(body.length, 0); typeBuffer.copy(output, 4); body.copy(output, 8);
+    output.writeUInt32BE(crc32(Buffer.concat([typeBuffer, body])), 8 + body.length);
+    return output;
+}
+function encodePngRgba(image) {
+    const width = Number(image?.width), height = Number(image?.height), data = Buffer.from(image?.data || []);
+    ensureDimension(width, height);
+    if (data.length !== width * height * 4) throw new Error('RGBA image buffer length does not match its dimensions.');
+    const scanlines = Buffer.allocUnsafe((width * 4 + 1) * height);
+    for (let y = 0; y < height; y += 1) {
+        const row = y * (width * 4 + 1); scanlines[row] = 0;
+        data.copy(scanlines, row + 1, y * width * 4, (y + 1) * width * 4);
+    }
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(width, 0); ihdr.writeUInt32BE(height, 4); ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    return Buffer.concat([PNG_SIGNATURE, pngChunk('IHDR', ihdr), pngChunk('IDAT', zlib.deflateSync(scanlines, { level: 6 })), pngChunk('IEND', Buffer.alloc(0))]);
+}
+function normalizeRect(rect, image) {
+    const x = Math.floor(Number(rect?.x)), y = Math.floor(Number(rect?.y)), width = Math.floor(Number(rect?.width)), height = Math.floor(Number(rect?.height));
+    if (![x, y, width, height].every(Number.isFinite) || width < 1 || height < 1 || x < 0 || y < 0 || x + width > image.width || y + height > image.height) {
+        throw new Error('Image edit region is outside the source image.');
+    }
+    return { x, y, width, height };
+}
+function cropRgba(image, rectValue) {
+    const rect = normalizeRect(rectValue, image), output = Buffer.allocUnsafe(rect.width * rect.height * 4);
+    for (let y = 0; y < rect.height; y += 1) {
+        const sourceStart = ((rect.y + y) * image.width + rect.x) * 4;
+        image.data.copy(output, y * rect.width * 4, sourceStart, sourceStart + rect.width * 4);
+    }
+    return { width: rect.width, height: rect.height, data: output };
+}
+function resizeRgba(image, widthValue, heightValue, nearest = false) {
+    const width = Math.max(1, Math.floor(Number(widthValue))), height = Math.max(1, Math.floor(Number(heightValue)));
+    ensureDimension(width, height);
+    if (width === image.width && height === image.height) return { width, height, data: Buffer.from(image.data) };
+    const output = Buffer.allocUnsafe(width * height * 4);
+    if (nearest) {
+        for (let y = 0; y < height; y += 1) {
+            const sy = Math.min(image.height - 1, Math.floor((y + 0.5) * image.height / height));
+            for (let x = 0; x < width; x += 1) {
+                const sx = Math.min(image.width - 1, Math.floor((x + 0.5) * image.width / width));
+                const source = (sy * image.width + sx) * 4, target = (y * width + x) * 4;
+                image.data.copy(output, target, source, source + 4);
+            }
+        }
+        return { width, height, data: output };
+    }
+    for (let y = 0; y < height; y += 1) {
+        const sourceY = ((y + 0.5) * image.height / height) - 0.5;
+        const y0 = Math.max(0, Math.min(image.height - 1, Math.floor(sourceY))), y1 = Math.min(image.height - 1, y0 + 1), fy = Math.max(0, Math.min(1, sourceY - y0));
+        for (let x = 0; x < width; x += 1) {
+            const sourceX = ((x + 0.5) * image.width / width) - 0.5;
+            const x0 = Math.max(0, Math.min(image.width - 1, Math.floor(sourceX))), x1 = Math.min(image.width - 1, x0 + 1), fx = Math.max(0, Math.min(1, sourceX - x0));
+            const target = (y * width + x) * 4;
+            for (let channel = 0; channel < 4; channel += 1) {
+                const p00 = image.data[(y0 * image.width + x0) * 4 + channel], p10 = image.data[(y0 * image.width + x1) * 4 + channel];
+                const p01 = image.data[(y1 * image.width + x0) * 4 + channel], p11 = image.data[(y1 * image.width + x1) * 4 + channel];
+                const top = p00 + (p10 - p00) * fx, bottom = p01 + (p11 - p01) * fx;
+                output[target + channel] = Math.max(0, Math.min(255, Math.round(top + (bottom - top) * fy)));
+            }
+        }
+    }
+    return { width, height, data: output };
+}
+function solidMask(width, height, rect) {
+    ensureDimension(width, height);
+    const data = Buffer.alloc(width * height * 4, 0);
+    for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) {
+        const target = (y * width + x) * 4; const inside = x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height;
+        const value = inside ? 255 : 0; data[target] = value; data[target + 1] = value; data[target + 2] = value; data[target + 3] = 255;
+    }
+    return { width, height, data };
+}
+function compositeRectMasked(base, patch, destinationRect, allowedRect) {
+    const destination = normalizeRect(destinationRect, base), allowed = normalizeRect(allowedRect, base);
+    if (patch.width !== destination.width || patch.height !== destination.height) throw new Error('Inpaint patch size does not match its destination region.');
+    const output = { width: base.width, height: base.height, data: Buffer.from(base.data) };
+    const ix0 = Math.max(destination.x, allowed.x), iy0 = Math.max(destination.y, allowed.y);
+    const ix1 = Math.min(destination.x + destination.width, allowed.x + allowed.width), iy1 = Math.min(destination.y + destination.height, allowed.y + allowed.height);
+    for (let y = iy0; y < iy1; y += 1) for (let x = ix0; x < ix1; x += 1) {
+        const source = ((y - destination.y) * patch.width + (x - destination.x)) * 4, target = (y * base.width + x) * 4;
+        patch.data.copy(output.data, target, source, source + 4);
+    }
+    return output;
+}
+
+module.exports = { compositeRectMasked, cropRgba, decodePngRgba, encodePngRgba, resizeRgba, solidMask };
+// <DARKSTAR_SOURCE_END path="backend/runtime/png-rgba.js">
+});
+
+// MODULE :: backend/runtime/diffusion-runtime.js
+__darkstarDefineModule("backend/runtime/diffusion-runtime.js", function darkstarModule(module, exports, require, __filename, __dirname) {
+// <DARKSTAR_SOURCE_BEGIN path="backend/runtime/diffusion-runtime.js">
+'use strict';
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { spawn } = require('node:child_process');
+const { killProcessTree, runProcessCapture } = require('./process-utils');
+const { listCudaDevices } = require('./gpu-devices');
+const { compositeRectMasked, cropRgba, decodePngRgba, encodePngRgba, resizeRgba, solidMask } = require('./png-rgba');
+
+const PREVIEW_POLL_MS = 45;
+const MAX_PREVIEW_BYTES = 24 * 1024 * 1024;
+const MAX_OUTPUT_BYTES = 96 * 1024 * 1024;
+const MAX_LOG_TAIL_BYTES = 192 * 1024;
+const REQUIRED_HELP_FLAGS = Object.freeze([
+    '--diffusion-model', '--prompt', '--negative-prompt', '--output', '--steps', '--cfg-scale',
+    '--sampling-method', '--scheduler', '--preview', '--preview-path', '--preview-interval',
+]);
+const PATH_FLAGS = Object.freeze({
+    diffusionModelPath: '--diffusion-model',
+    highNoiseDiffusionModelPath: '--high-noise-diffusion-model',
+    uncondDiffusionModelPath: '--uncond-diffusion-model',
+    clipLPath: '--clip_l',
+    clipGPath: '--clip_g',
+    t5xxlPath: '--t5xxl',
+    llmPath: '--llm',
+    llmVisionPath: '--llm_vision',
+    clipVisionPath: '--clip_vision',
+    vaePath: '--vae',
+    embeddingsConnectorsPath: '--embeddings-connectors',
+    audioVaePath: '--audio-vae',
+});
+const DIFFUSION_MEMORY_OVERHEAD_RATIO = 0.10;
+const DIFFUSION_MEMORY_MIN_OVERHEAD_BYTES = 512 * 1024 * 1024;
+const MAX_IMAGE_EDIT_BASE64_CHARS = 128 * 1024 * 1024;
+
+function normalizeImageEditEnvelope(value) {
+    if (!value || typeof value !== 'object' || Number(value.version) !== 1) return null;
+    const mode = String(value.mode || '').trim().toLowerCase();
+    if (mode !== 'selection' && mode !== 'brush') throw new Error('Image edit mode must be selection or brush.');
+    const sourceBase64 = String(value.sourceBase64 || '').trim();
+    const guideBase64 = String(value.guideBase64 || '').trim();
+    if (!sourceBase64 || sourceBase64.length > MAX_IMAGE_EDIT_BASE64_CHARS) throw new Error('Image edit source is missing or too large.');
+    if (guideBase64.length > MAX_IMAGE_EDIT_BASE64_CHARS) throw new Error('Image edit guide is too large.');
+    const sourceWidth = Math.floor(Number(value.sourceWidth)), sourceHeight = Math.floor(Number(value.sourceHeight));
+    const region = {
+        x: Math.floor(Number(value.region?.x)), y: Math.floor(Number(value.region?.y)),
+        width: Math.floor(Number(value.region?.width)), height: Math.floor(Number(value.region?.height)),
+    };
+    if (![sourceWidth, sourceHeight, region.x, region.y, region.width, region.height].every(Number.isFinite)
+        || sourceWidth < 1 || sourceHeight < 1 || region.width < 1 || region.height < 1
+        || region.x < 0 || region.y < 0 || region.x + region.width > sourceWidth || region.y + region.height > sourceHeight) {
+        throw new Error('Image edit region is invalid.');
+    }
+    if (mode === 'brush' && region.width !== region.height) throw new Error('Brush image edits require a square edit region.');
+    return { version: 1, mode, sourceBase64, guideBase64, sourceWidth, sourceHeight, region };
+}
+function expandedEditContext(region, sourceWidth, sourceHeight) {
+    const span = Math.max(region.width, region.height);
+    const padding = Math.max(24, Math.min(256, Math.round(span * 0.24)));
+    let x0 = Math.max(0, region.x - padding), y0 = Math.max(0, region.y - padding);
+    let x1 = Math.min(sourceWidth, region.x + region.width + padding), y1 = Math.min(sourceHeight, region.y + region.height + padding);
+    if (x1 - x0 < 64) { const need = 64 - (x1 - x0), left = Math.min(x0, Math.floor(need / 2)), right = Math.min(sourceWidth - x1, need - left); x0 -= left; x1 += right; }
+    if (y1 - y0 < 64) { const need = 64 - (y1 - y0), top = Math.min(y0, Math.floor(need / 2)), bottom = Math.min(sourceHeight - y1, need - top); y0 -= top; y1 += bottom; }
+    return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+}
+function multipleOfEight(value) { return Math.max(64, Math.min(4096, Math.round(Number(value) / 8) * 8)); }
+function inpaintProcessingSize(contextRect) {
+    const longEdge = Math.max(contextRect.width, contextRect.height);
+    const targetLongEdge = Math.max(512, Math.min(1024, longEdge));
+    const scale = targetLongEdge / longEdge;
+    return {
+        width: multipleOfEight(contextRect.width * scale),
+        height: multipleOfEight(contextRect.height * scale),
+    };
+}
+function prepareImageEdit(value) {
+    const edit = normalizeImageEditEnvelope(value);
+    if (!edit) return null;
+    const source = decodePngRgba(Buffer.from(edit.sourceBase64, 'base64'));
+    if (source.width !== edit.sourceWidth || source.height !== edit.sourceHeight) throw new Error('Image edit source dimensions do not match the armed edit contract.');
+    let guide = source;
+    if (edit.mode === 'brush') {
+        if (!edit.guideBase64) throw new Error('Brush image edit is missing its visual guide.');
+        guide = decodePngRgba(Buffer.from(edit.guideBase64, 'base64'));
+        if (guide.width !== source.width || guide.height !== source.height) throw new Error('Brush guide dimensions do not match the source image.');
+    }
+    const contextRect = expandedEditContext(edit.region, source.width, source.height);
+    const processing = inpaintProcessingSize(contextRect);
+    const initCrop = cropRgba(guide, contextRect);
+    const relativeAllowed = {
+        x: edit.region.x - contextRect.x, y: edit.region.y - contextRect.y,
+        width: edit.region.width, height: edit.region.height,
+    };
+    const maskCrop = solidMask(contextRect.width, contextRect.height, relativeAllowed);
+    return {
+        edit,
+        source,
+        contextRect,
+        processing,
+        initPng: encodePngRgba(resizeRgba(initCrop, processing.width, processing.height, false)),
+        maskPng: encodePngRgba(resizeRgba(maskCrop, processing.width, processing.height, true)),
+    };
+}
+function finalizeImageEdit(nativeOutput, prepared) {
+    const generated = decodePngRgba(nativeOutput);
+    const patch = resizeRgba(generated, prepared.contextRect.width, prepared.contextRect.height, false);
+    const composited = compositeRectMasked(prepared.source, patch, prepared.contextRect, prepared.edit.region);
+    return encodePngRgba(composited);
+}
+
+function estimateDiffusionPipelineResidentBytes(config) {
+    const unique = new Set();
+    let weightBytes = 0;
+    for (const field of Object.keys(PATH_FLAGS)) {
+        const filePath = cleanPath(config?.paths?.[field]);
+        if (!filePath) continue;
+        let realPath = '';
+        try { realPath = fs.realpathSync(filePath); } catch (_) { realPath = path.resolve(filePath); }
+        const key = process.platform === 'win32' ? realPath.toLowerCase() : realPath;
+        if (unique.has(key)) continue;
+        unique.add(key);
+        try {
+            const stat = fs.statSync(realPath);
+            if (stat.isFile()) weightBytes += Math.max(0, Number(stat.size) || 0);
+        } catch (_) { /* validation reports missing paths separately */ }
+    }
+    if (weightBytes <= 0) return 0;
+    const overhead = Math.max(DIFFUSION_MEMORY_MIN_OVERHEAD_BYTES, Math.ceil(weightBytes * DIFFUSION_MEMORY_OVERHEAD_RATIO));
+    return Math.ceil(weightBytes + overhead);
+}
+
+const SAMPLER_ALIASES = Object.freeze({
+    dpmpp_2s_a: 'dpm++2s_a',
+    dpmpp_2m: 'dpm++2m',
+    dpmpp_2m_v2: 'dpm++2mv2',
+    dpmpp_2m_sde: 'dpm++2m_sde',
+    dpmpp_2m_sde_bt: 'dpm++2m_sde_bt',
+    euler_cfgpp: 'euler_cfg_pp',
+    euler_a_cfgpp: 'euler_a_cfg_pp',
+});
+
+function abortError(message = 'Image generation was cancelled.') {
+    const error = new Error(message);
+    error.name = 'AbortError';
+    return error;
+}
+
+function normalizeInteger(value, fallback, minimum, maximum) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+}
+function normalizeNumber(value, fallback, minimum, maximum) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+}
+function cleanPath(value) { return String(value || '').trim(); }
+
+const MAX_DIFFUSION_STEPS = 150;
+const MAX_DIFFUSION_CFG_SCALE = 30;
+const MIN_DIFFUSION_CFG_SCALE = 0.1;
+const MAX_DIFFUSION_PROMPT_CHARS = 12000;
+const DIFFUSION_SAMPLER_VALUES = Object.freeze(['euler', 'euler_a', 'heun', 'dpm2', 'dpmpp_2s_a', 'dpmpp_2m', 'dpmpp_2m_v2', 'dpmpp_2m_sde', 'dpmpp_2m_sde_bt', 'ipndm', 'ipndm_v', 'lcm', 'ddim_trailing', 'tcd', 'res_multistep', 'res_2s', 'er_sde', 'euler_cfgpp', 'euler_a_cfgpp', 'euler_ge']);
+const DIFFUSION_ATTENTION_VALUES = Object.freeze(['auto', 'standard', 'flash', 'flash_full']);
+
+function normalizeConfiguredDiffusionSteps(value, fallback = 0) {
+    return normalizeInteger(value, fallback, 0, MAX_DIFFUSION_STEPS);
+}
+
+function normalizeConfiguredDiffusionCfgScale(value, fallback = 7.0) {
+    return normalizeNumber(value, fallback, 0, MAX_DIFFUSION_CFG_SCALE);
+}
+
+function normalizeConfiguredDiffusionSampler(value, fallback = 'auto') {
+    const normalized = String(value || '').trim().toLowerCase() || fallback;
+    return normalized === 'auto' || DIFFUSION_SAMPLER_VALUES.includes(normalized) ? normalized : fallback;
+}
+
+function normalizeDiffusionAttentionMode(value, fallback = 'auto') {
+    const normalized = String(value || '').trim().toLowerCase() || fallback;
+    return DIFFUSION_ATTENTION_VALUES.includes(normalized) ? normalized : fallback;
+}
+
+function normalizeGenerationPrefix(value) { return String(value === undefined || value === null ? '' : value); }
+
+function normalizeDiffusionComputeDevice(value) {
+    const normalized = String(value || 'auto').trim();
+    if (!normalized) return 'auto';
+    if (normalized.toLowerCase() === 'auto') return 'auto';
+    if (normalized.toLowerCase() === 'cpu') return 'cpu';
+    return /^[A-Za-z][A-Za-z0-9._:-]{0,63}$/u.test(normalized) ? normalized : 'auto';
+}
+
+function prependGenerationPrefix(prefix, prompt) {
+    const head = normalizeGenerationPrefix(prefix).trim(), body = String(prompt || '').trim();
+    if (!head) return body;
+    const combined = `${head}${/[,:;]$/u.test(head) ? ' ' : ', '}${body}`;
+    if (combined.length > MAX_DIFFUSION_PROMPT_CHARS) throw new Error(`Generate Image prompt plus DM Sampler Generation Prefix must be at most ${MAX_DIFFUSION_PROMPT_CHARS} characters.`);
+    return combined;
+}
+
+function normalizeRequestedDiffusionSteps(value) {
+    if (value === undefined || value === null || value === '') return null;
+    const number = Number(value);
+    if (!Number.isInteger(number) || number < 1 || number > MAX_DIFFUSION_STEPS) {
+        throw new Error(`Generate Image steps must be an integer between 1 and ${MAX_DIFFUSION_STEPS}.`);
+    }
+    return number;
+}
+
+function normalizeRequestedDiffusionCfgScale(value) {
+    if (value === undefined || value === null || value === '') return null;
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < MIN_DIFFUSION_CFG_SCALE || number > MAX_DIFFUSION_CFG_SCALE) {
+        throw new Error(`Generate Image cfg_scale must be a number between ${MIN_DIFFUSION_CFG_SCALE} and ${MAX_DIFFUSION_CFG_SCALE}.`);
+    }
+    return Math.round(number * 1000) / 1000;
+}
+
+function normalizeRequestedDiffusionSampler(value) {
+    if (value === undefined || value === null || value === '') return null;
+    const normalized = String(value).trim().toLowerCase();
+    if (!DIFFUSION_SAMPLER_VALUES.includes(normalized)) {
+        throw new Error(`Generate Image sampler must be one of: ${DIFFUSION_SAMPLER_VALUES.join(', ')}.`);
+    }
+    return normalized;
+}
+
+function resolveEffectiveDiffusionSteps(config, request) {
+    const configured = normalizeConfiguredDiffusionSteps(config?.steps, 0);
+    const requested = normalizeRequestedDiffusionSteps(request?.steps);
+    if (config?.stepsAuto !== true && configured > 0) return configured;
+    if (requested === null) {
+        throw new Error(`DM Sampler Steps is Auto, so Generate Image must choose steps between 1 and ${MAX_DIFFUSION_STEPS}. More complex or higher-fidelity prompts generally benefit from more steps.`);
+    }
+    return requested;
+}
+
+function resolveEffectiveDiffusionCfgScale(config, request) {
+    const configured = normalizeConfiguredDiffusionCfgScale(config?.cfgScale, 0);
+    const requested = normalizeRequestedDiffusionCfgScale(request?.cfg_scale);
+    if (config?.cfgScaleAuto !== true && configured > 0) return configured;
+    if (requested === null) {
+        throw new Error(`DM Sampler CFG is Auto, so Generate Image must choose cfg_scale between ${MIN_DIFFUSION_CFG_SCALE} and ${MAX_DIFFUSION_CFG_SCALE}. Higher CFG generally follows the prompt more strongly, while lower CFG can be looser or more natural.`);
+    }
+    return requested;
+}
+
+function resolveEffectiveDiffusionSampler(config, request) {
+    const configured = normalizeConfiguredDiffusionSampler(config?.sampler, 'auto');
+    const requested = normalizeRequestedDiffusionSampler(request?.sampler);
+    if (configured !== 'auto') return configured;
+    if (requested === null) {
+        throw new Error('DM Sampler Sampler is Auto, so Generate Image must choose a sampler for this request.');
+    }
+    return requested;
+}
+
+function normalizeDiffusionConfiguration(value) {
+    if (!value || typeof value !== 'object') return null;
+    if (value.kind === 'darkstar-diffusion-runtime-config') {
+        const selected = value.paths && typeof value.paths === 'object' ? value.paths : {};
+        const paths = {};
+        Object.keys(PATH_FLAGS).forEach((key) => { paths[key] = cleanPath(selected[key]); });
+        if (!paths.diffusionModelPath) return null;
+        const requirements = Array.isArray(value.requirements) ? value.requirements.map((item) => ({
+            role: String(item?.role || ''), field: String(item?.field || ''), required: item?.required !== false, embedded: item?.embedded === true,
+        })) : [];
+        return {
+            schemaVersion: 1, kind: 'darkstar-diffusion-runtime-config', paths, requirements,
+            family: String(value.family || 'Unknown'), variant: String(value.variant || ''), architecture: String(value.architecture || ''),
+            seed: normalizeInteger(value.seed, -1, -1, Number.MAX_SAFE_INTEGER), steps: normalizeConfiguredDiffusionSteps(value.steps, 0), stepsAuto: value.stepsAuto === true || normalizeConfiguredDiffusionSteps(value.steps, 0) === 0,
+            cfgScale: normalizeConfiguredDiffusionCfgScale(value.cfgScale, 7.0), cfgScaleAuto: value.cfgScaleAuto === true || normalizeConfiguredDiffusionCfgScale(value.cfgScale, 0) === 0, sampler: normalizeConfiguredDiffusionSampler(value.sampler, 'auto'),
+            scheduler: String(value.scheduler || 'auto').trim().toLowerCase() || 'auto', attentionMode: normalizeDiffusionAttentionMode(value.attentionMode), denoise: normalizeNumber(value.denoise, 1, 0, 1), computeDevice: normalizeDiffusionComputeDevice(value.computeDevice), generationPrefix: normalizeGenerationPrefix(value.generationPrefix),
+        };
+    }
+    if (value.kind !== 'darkstar-dm-sampler') return null;
+    const model = value.diffusionModel;
+    if (!model || typeof model !== 'object' || model.kind !== 'darkstar-diffusion-model') return null;
+    const selected = model.selectedPaths && typeof model.selectedPaths === 'object' ? model.selectedPaths : {};
+    const paths = {};
+    Object.keys(PATH_FLAGS).forEach((key) => { paths[key] = cleanPath(selected[key] || (key === 'diffusionModelPath' ? model.path : '')); });
+    if (!paths.diffusionModelPath) return null;
+    const requirements = Array.isArray(model.analysis?.requirements) ? model.analysis.requirements.map((item) => ({
+        role: String(item?.role || ''), field: String(item?.field || ''), required: item?.required !== false, embedded: item?.embedded === true,
+    })) : [];
+    return {
+        schemaVersion: 1,
+        kind: 'darkstar-diffusion-runtime-config',
+        paths,
+        requirements,
+        family: String(model.analysis?.family || 'Unknown'),
+        variant: String(model.analysis?.variant || ''),
+        architecture: String(model.analysis?.architecture || ''),
+        seed: normalizeInteger(value.seed, -1, -1, Number.MAX_SAFE_INTEGER),
+        steps: normalizeConfiguredDiffusionSteps(value.steps, 0),
+        stepsAuto: value.stepsAuto === true || normalizeConfiguredDiffusionSteps(value.steps, 0) === 0,
+        cfgScale: normalizeConfiguredDiffusionCfgScale(value.cfgScale, 7.0),
+        cfgScaleAuto: value.cfgScaleAuto === true || normalizeConfiguredDiffusionCfgScale(value.cfgScale, 0) === 0,
+        sampler: normalizeConfiguredDiffusionSampler(value.sampler, 'auto'),
+        scheduler: String(value.scheduler || 'auto').trim().toLowerCase() || 'auto',
+        attentionMode: normalizeDiffusionAttentionMode(value.attentionMode),
+        denoise: normalizeNumber(value.denoise, 1, 0, 1),
+        computeDevice: normalizeDiffusionComputeDevice(value.computeDevice),
+        generationPrefix: normalizeGenerationPrefix(value.generationPrefix),
+    };
+}
+
+function isPng(buffer) {
+    return Buffer.isBuffer(buffer) && buffer.length >= 20
+        && buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+        && buffer.lastIndexOf(Buffer.from('IEND', 'ascii')) >= buffer.length - 16;
+}
+
+function boundedTail(current, chunk) {
+    const next = Buffer.concat([current, Buffer.from(chunk)]);
+    return next.length <= MAX_LOG_TAIL_BYTES ? next : next.subarray(next.length - MAX_LOG_TAIL_BYTES);
+}
+
+class DiffusionRuntime {
+    constructor(options = {}) {
+        this.baseDir = path.resolve(options.baseDir || path.join(__dirname, '..', '..'));
+        this.log = typeof options.log === 'function' ? options.log : () => undefined;
+        this.executable = cleanPath(options.executable || process.env.DARKSTAR_SD_CLI);
+        this.preferredBackend = String(options.backend || process.env.DARKSTAR_SD_BACKEND || '').trim().toLowerCase();
+        this.spawn = options.spawn || spawn;
+        this.listCudaDevices = options.listCudaDevices || listCudaDevices;
+        this.freeSystemMemory = typeof options.freeSystemMemory === 'function' ? options.freeSystemMemory : () => os.freemem();
+        this.helpCache = new Map();
+        this.deviceCache = null;
+        this.deviceCacheAt = 0;
+        this.active = null;
+        this.waiters = [];
+        this.closed = false;
+        this.languageModelRuntime = options.languageModelRuntime || null;
+    }
+
+    setLanguageModelRuntime(runtime) {
+        this.languageModelRuntime = runtime || null;
+        return this;
+    }
+
+    async _hasNvidia() {
+        if (process.platform !== 'win32') return false;
+        try {
+            const result = await runProcessCapture('nvidia-smi.exe', ['-L'], { timeoutMs: 1500, maxOutputBytes: 64 * 1024 });
+            return result.status === 0 && /GPU\s+\d+:/u.test(result.stdout || '');
+        } catch (_) { return false; }
+    }
+
+    async _resolveExecutable() {
+        if (this.executable) {
+            const resolved = path.resolve(this.executable);
+            if (!fs.existsSync(resolved)) throw new Error(`Configured stable-diffusion.cpp executable does not exist: ${resolved}`);
+            return { executable: resolved, backend: 'custom' };
+        }
+        const root = path.join(this.baseDir, 'backend', 'bin', 'diffusion');
+        const forced = ['cuda', 'vulkan', 'cpu'].includes(this.preferredBackend) ? this.preferredBackend : '';
+        let order;
+        if (forced) order = [forced, ...['cuda', 'vulkan', 'cpu'].filter((name) => name !== forced)];
+        else order = (await this._hasNvidia()) ? ['cuda', 'vulkan', 'cpu'] : ['vulkan', 'cpu', 'cuda'];
+        for (const backend of order) {
+            const candidate = path.join(root, backend, process.platform === 'win32' ? 'sd-cli.exe' : 'sd-cli');
+            if (fs.existsSync(candidate)) return { executable: candidate, backend };
+        }
+        throw new Error('Generate Image requires the pinned stable-diffusion.cpp runtime under backend/bin/diffusion/{vulkan,cuda,cpu}/. Run Darkstar setup again or set DARKSTAR_SD_CLI to a compatible sd-cli executable.');
+    }
+
+    _bundledExecutable(backend) {
+        return path.join(this.baseDir, 'backend', 'bin', 'diffusion', backend, process.platform === 'win32' ? 'sd-cli.exe' : 'sd-cli');
+    }
+
+    async _deviceDiscoveryExecutable() {
+        if (this.executable) {
+            const resolved = path.resolve(this.executable);
+            if (!fs.existsSync(resolved)) throw new Error(`Configured stable-diffusion.cpp executable does not exist: ${resolved}`);
+            return { executable: resolved, backend: 'custom' };
+        }
+        for (const backend of ['vulkan', 'cuda']) {
+            const candidate = this._bundledExecutable(backend);
+            if (fs.existsSync(candidate)) return { executable: candidate, backend };
+        }
+        return null;
+    }
+
+    _parseDeviceList(output, resolved) {
+        const seen = new Set();
+        const devices = [];
+        for (const rawLine of String(output || '').split(/\r?\n/u)) {
+            const line = rawLine.trim();
+            if (!line) continue;
+            const tab = line.indexOf('\t');
+            const match = tab >= 0 ? [line.slice(0, tab), line.slice(tab + 1)] : line.match(/^(\S+)\s{2,}(.+)$/u)?.slice(1);
+            if (!match) continue;
+            const id = String(match[0] || '').trim();
+            const description = String(match[1] || '').trim();
+            if (!id || !description || /^(cpu|none)$/iu.test(id) || /\bcpu\b/iu.test(description)) continue;
+            const key = id.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            devices.push({ id, name: description, description, backend: resolved.backend, executable: resolved.executable, ordinal: devices.length });
+        }
+        return devices;
+    }
+
+    async _rankDiffusionDevices(devices) {
+        if (!Array.isArray(devices) || devices.length < 2) return devices || [];
+        const cuda = await this.listCudaDevices({ timeoutMs: 2500 }).catch(() => ({ available: false, devices: [] }));
+        const cudaDevices = Array.isArray(cuda.devices) ? cuda.devices : [];
+        const integratedPattern = /\b(integrated|uhd|iris|vega\s*\d*\s*graphics|radeon\s+graphics)\b/iu;
+        const normalized = (value) => String(value || '').toLowerCase().replace(/[^a-z0-9]+/gu, ' ').trim();
+        const score = (device) => {
+            const label = normalized(device.description || device.name);
+            const matchedCuda = cudaDevices.find((candidate) => {
+                const candidateName = normalized(candidate.name);
+                return candidateName && (label.includes(candidateName) || candidateName.includes(label));
+            });
+            const discrete = integratedPattern.test(device.description || '') ? 0 : 1;
+            const knownVram = matchedCuda ? Number(matchedCuda.memoryTotalMiB || 0) : 0;
+            return { discrete, knownVram, ordinal: Number(device.ordinal || 0) };
+        };
+        return devices.slice().sort((left, right) => {
+            const a = score(left), b = score(right);
+            if (a.discrete !== b.discrete) return b.discrete - a.discrete;
+            if (a.knownVram !== b.knownVram) return b.knownVram - a.knownVram;
+            return a.ordinal - b.ordinal;
+        });
+    }
+
+    async _discoverDevices(options = {}) {
+        const now = Date.now();
+        if (options.refresh !== true && this.deviceCache && now - this.deviceCacheAt < 15_000) return this.deviceCache;
+        const resolved = await this._deviceDiscoveryExecutable();
+        if (!resolved) {
+            const empty = { available: false, devices: [], autoDeviceId: '', autoDeviceLabel: '', error: 'No GPU-capable stable-diffusion.cpp runtime is installed.' };
+            this.deviceCache = empty; this.deviceCacheAt = now; return empty;
+        }
+        try {
+            const help = await this._probe(resolved.executable);
+            if (!help.includes('--list-devices') || !help.includes('--backend')) {
+                const unsupported = { available: false, devices: [], autoDeviceId: '', autoDeviceLabel: '', error: 'The installed stable-diffusion.cpp runtime does not support individual device selection.' };
+                this.deviceCache = unsupported; this.deviceCacheAt = now; return unsupported;
+            }
+            const result = await runProcessCapture(resolved.executable, ['--list-devices'], { timeoutMs: 10_000, maxOutputBytes: 512 * 1024 });
+            if (result.status !== 0) throw new Error(String(result.stderr || result.stdout || `Device discovery exited with code ${result.status}.`).trim());
+            const ranked = await this._rankDiffusionDevices(this._parseDeviceList(`${result.stdout || ''}\n${result.stderr || ''}`, resolved));
+            const first = ranked[0] || null;
+            const inventory = {
+                available: ranked.length > 0,
+                devices: ranked,
+                autoDeviceId: first?.id || '',
+                autoDeviceLabel: first?.description || '',
+                error: ranked.length ? null : 'No GPU devices were reported by stable-diffusion.cpp.',
+            };
+            this.deviceCache = inventory; this.deviceCacheAt = now; return inventory;
+        } catch (error) {
+            const failed = { available: false, devices: [], autoDeviceId: '', autoDeviceLabel: '', error: error?.message || String(error) };
+            this.deviceCache = failed; this.deviceCacheAt = now; return failed;
+        }
+    }
+
+    async listDevices(options = {}) {
+        const inventory = await this._discoverDevices(options);
+        return {
+            available: inventory.available === true,
+            devices: (inventory.devices || []).map((device) => ({ id: device.id, name: device.name, description: device.description })),
+            autoDeviceId: String(inventory.autoDeviceId || ''),
+            autoDeviceLabel: String(inventory.autoDeviceLabel || ''),
+            error: inventory.error || null,
+        };
+    }
+
+    async _resolveComputeTarget(selection) {
+        const requested = normalizeDiffusionComputeDevice(selection);
+        if (requested === 'cpu') {
+            if (!this.executable) {
+                const cpu = this._bundledExecutable('cpu');
+                if (fs.existsSync(cpu)) return { executable: cpu, backend: 'cpu', deviceId: 'cpu', deviceLabel: 'CPU' };
+            }
+            const resolved = await this._resolveExecutable();
+            return { ...resolved, deviceId: 'cpu', deviceLabel: 'CPU' };
+        }
+        const inventory = await this._discoverDevices();
+        if (requested === 'auto') {
+            const selected = inventory.devices?.find((device) => device.id === inventory.autoDeviceId) || inventory.devices?.[0] || null;
+            if (selected) return { executable: selected.executable, backend: selected.backend, deviceId: selected.id, deviceLabel: selected.description || selected.name || selected.id };
+            const resolved = await this._resolveExecutable();
+            return { ...resolved, deviceId: '', deviceLabel: 'Auto' };
+        }
+        const selected = inventory.devices?.find((device) => String(device.id).toLowerCase() === requested.toLowerCase()) || null;
+        if (!selected) {
+            const available = (inventory.devices || []).map((device) => device.id).join(', ');
+            throw new Error(`The selected diffusion GPU "${requested}" is not available${available ? `. Available devices: ${available}` : ''}.`);
+        }
+        return { executable: selected.executable, backend: selected.backend, deviceId: selected.id, deviceLabel: selected.description || selected.name || selected.id };
+    }
+
+    async _probe(executable) {
+        if (this.helpCache.has(executable)) return this.helpCache.get(executable);
+        const result = await runProcessCapture(executable, ['--help'], { timeoutMs: 10_000, maxOutputBytes: 2 * 1024 * 1024 });
+        const help = `${result.stdout || ''}\n${result.stderr || ''}`;
+        if (result.status !== 0 || !/stable-diffusion\.cpp|sd-cli/u.test(help)) throw new Error(`The configured diffusion executable is not a compatible stable-diffusion.cpp sd-cli: ${executable}`);
+        const missing = REQUIRED_HELP_FLAGS.filter((flag) => !help.includes(flag));
+        if (missing.length) throw new Error(`The bundled stable-diffusion.cpp runtime is too old for Generate Image. Missing CLI options: ${missing.join(', ')}`);
+        this.helpCache.set(executable, help);
+        return help;
+    }
+
+    _validateConfiguration(config) {
+        if (!config) throw new Error('Generate Image is unavailable because Diffusion Backend GGUF → DM Sampler → Orchestrator is not fully connected.');
+        for (const [field, value] of Object.entries(config.paths)) {
+            if (!value) continue;
+            let stat;
+            try { stat = fs.statSync(value); } catch (_) { throw new Error(`The configured diffusion path no longer exists (${field}): ${value}`); }
+            if (!stat.isFile()) throw new Error(`The configured diffusion path is not a file (${field}): ${value}`);
+        }
+        for (const requirement of config.requirements) {
+            if (!requirement.required || requirement.embedded || !requirement.field) continue;
+            if (!cleanPath(config.paths[requirement.field])) {
+                throw new Error(`The selected ${config.family || 'diffusion'} model still requires the ${requirement.role || requirement.field} companion model. Resolve it in Diffusion Backend GGUF before generating.`);
+            }
+        }
+    }
+
+    async _acquire(signal, onProgress) {
+        if (this.closed) throw new Error('Diffusion runtime is shutting down.');
+        if (!this.active) { this.active = Symbol('diffusion'); return this.active; }
+        onProgress?.({ phase: 'queued', step: 0, progress: 0, statusText: 'Waiting for the diffusion runtime…' });
+        return new Promise((resolve, reject) => {
+            const waiter = { resolve, reject, signal, onAbort: null };
+            waiter.onAbort = () => { this.waiters = this.waiters.filter((entry) => entry !== waiter); reject(abortError()); };
+            if (signal?.aborted) return waiter.onAbort();
+            signal?.addEventListener?.('abort', waiter.onAbort, { once: true });
+            this.waiters.push(waiter);
+        });
+    }
+
+    _release(token) {
+        if (this.active === token) this.active = null;
+        while (!this.active && this.waiters.length) {
+            const waiter = this.waiters.shift();
+            waiter.signal?.removeEventListener?.('abort', waiter.onAbort);
+            if (waiter.signal?.aborted) continue;
+            const next = Symbol('diffusion');
+            this.active = next;
+            waiter.resolve(next);
+        }
+    }
+
+    _arguments(config, request, files, seed, help, effectiveSteps, effectiveCfgScale, effectiveSampler, computeTarget = null) {
+        const args = ['-M', 'img_gen'];
+        for (const [field, flag] of Object.entries(PATH_FLAGS)) {
+            const value = cleanPath(config.paths[field]);
+            if (value) args.push(flag, value);
+        }
+        args.push('-p', request.prompt);
+        if (request.negative_prompt) args.push('-n', request.negative_prompt);
+        args.push('-W', String(request.width), '-H', String(request.height));
+        args.push('--steps', String(effectiveSteps), '--cfg-scale', String(effectiveCfgScale), '-s', String(seed));
+        if (effectiveSampler !== 'auto') {
+            const sampler = SAMPLER_ALIASES[effectiveSampler] || effectiveSampler;
+            if (!help.includes(sampler)) throw new Error(`The ${config.sampler === 'auto' ? 'requested' : 'configured'} sampler "${effectiveSampler}" is not supported by the bundled stable-diffusion.cpp runtime.`);
+            args.push('--sampling-method', sampler);
+        }
+        if (config.scheduler !== 'auto') {
+            if (!help.includes(config.scheduler)) throw new Error(`The configured scheduler "${config.scheduler}" is not supported by the bundled stable-diffusion.cpp runtime.`);
+            args.push('--scheduler', config.scheduler);
+        }
+        const attentionMode = normalizeDiffusionAttentionMode(config.attentionMode);
+        if (attentionMode === 'flash' || attentionMode === 'flash_full') {
+            const attentionFlag = attentionMode === 'flash' ? '--diffusion-fa' : '--fa';
+            if (!help.includes(attentionFlag)) {
+                const label = attentionMode === 'flash' ? 'Flash Attention (Diffusion)' : 'Flash Attention (All supported modules)';
+                throw new Error(`The configured attention mode "${label}" requires ${attentionFlag}, which is not supported by the installed stable-diffusion.cpp runtime.`);
+            }
+            args.push(attentionFlag);
+        }
+        if (computeTarget?.deviceId) {
+            if (!help.includes('--backend')) throw new Error('The installed stable-diffusion.cpp runtime does not support selecting a compute device.');
+            args.push('--backend', computeTarget.deviceId);
+        } else if (help.includes('--auto-fit')) args.push('--auto-fit');
+        if (files.init || files.mask) {
+            if (!files.init || !files.mask || !help.includes('--init-img') || !help.includes('--mask')) {
+                throw new Error('The installed stable-diffusion.cpp runtime does not support the required --init-img + --mask inpainting contract.');
+            }
+            args.push('--init-img', files.init, '--mask', files.mask);
+            if (help.includes('--strength')) args.push('--strength', String(config.denoise));
+        }
+        args.push('-o', files.output, '--preview', 'proj', '--preview-path', files.preview, '--preview-interval', '1');
+        return args;
+    }
+
+    async _readPreview(previewPath, state, request, config, onProgress) {
+        let stat;
+        try { stat = await fs.promises.stat(previewPath); } catch (_) { return; }
+        if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_PREVIEW_BYTES) return;
+        const fingerprint = `${stat.size}:${stat.mtimeMs}`;
+        if (fingerprint === state.fingerprint) return;
+        let buffer;
+        try { buffer = await fs.promises.readFile(previewPath); } catch (_) { return; }
+        if (buffer.length > MAX_PREVIEW_BYTES || !isPng(buffer)) return;
+        const digest = crypto.createHash('sha1').update(buffer).digest('hex');
+        if (digest === state.digest) { state.fingerprint = fingerprint; return; }
+        state.fingerprint = fingerprint;
+        state.digest = digest;
+        state.sequence += 1;
+        const inferredStep = Math.max(state.step, Math.min(config.steps, state.sequence));
+        state.step = inferredStep;
+        onProgress?.({
+            phase: 'denoising', step: inferredStep, steps: config.steps, progress: inferredStep / config.steps,
+            width: request.width, height: request.height, mimeType: 'image/png', base64: buffer.toString('base64'),
+            previewSequence: state.sequence, statusText: `Denoising · step ${inferredStep} of ${config.steps}`,
+        });
+    }
+
+    async _readFinalOutput(outputPath, state, request, config, seed, backend, onProgress, publish = true) {
+        let stat;
+        try { stat = await fs.promises.stat(outputPath); } catch (_) { return state.buffer || null; }
+        if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_OUTPUT_BYTES) return state.buffer || null;
+        const fingerprint = `${stat.size}:${stat.mtimeMs}`;
+        if (fingerprint === state.fingerprint && state.buffer) return state.buffer;
+        let buffer;
+        try { buffer = await fs.promises.readFile(outputPath); } catch (_) { return state.buffer || null; }
+        if (buffer.length <= 0 || buffer.length > MAX_OUTPUT_BYTES || !isPng(buffer)) return state.buffer || null;
+        const digest = crypto.createHash('sha1').update(buffer).digest('hex');
+        state.fingerprint = fingerprint;
+        state.digest = digest;
+        state.buffer = buffer;
+        if (!state.published && publish === true) {
+            state.published = true;
+            onProgress?.({
+                phase: 'image-ready', finalImage: true, step: config.steps, steps: config.steps, progress: 1,
+                width: request.width, height: request.height, mimeType: 'image/png', base64: buffer.toString('base64'),
+                imageName: `generated-${seed}.png`, previewSequence: Number.MAX_SAFE_INTEGER,
+                statusText: 'Image ready', backend,
+            });
+        }
+        return buffer;
+    }
+
+    async _temporarilyUnloadLanguageModel(config, options = {}, onProgress = null) {
+        if (options.dynamicVramEnabled !== true) return null;
+        if (!this.languageModelRuntime) {
+            throw new Error('Dynamic VRAM is enabled, but the language model runtime is unavailable.');
+        }
+        const adaptive = typeof this.languageModelRuntime.temporarilyReleaseVramForExternalWork === 'function';
+        const fallback = typeof this.languageModelRuntime.temporarilyUnloadForExternalWork === 'function';
+        if (!adaptive && !fallback) throw new Error('Dynamic VRAM is enabled, but the language model runtime cannot release VRAM.');
+        const diffusionResidentBytes = estimateDiffusionPipelineResidentBytes(config);
+        const common = { allowDuringActiveStream: true, reason: 'diffusion-generation' };
+        let lease;
+        if (adaptive) {
+            lease = await this.languageModelRuntime.temporarilyReleaseVramForExternalWork({
+                ...common,
+                preferRam: true,
+                freeSystemRamBytes: Math.max(0, Number(this.freeSystemMemory()) || 0),
+                getFreeSystemRamBytes: () => Math.max(0, Number(this.freeSystemMemory()) || 0),
+                diffusionResidentBytes,
+                onStrategy: (event) => {
+                    const statusText = event?.strategy === 'ram'
+                        ? 'Moving language model to system RAM…'
+                        : 'Unloading language model…';
+                    onProgress?.({ phase: 'preparing-runtime', step: 0, progress: 0, previewSequence: 0, statusText });
+                },
+            });
+        } else {
+            onProgress?.({ phase: 'preparing-runtime', step: 0, progress: 0, previewSequence: 0, statusText: 'Unloading language model…' });
+            lease = await this.languageModelRuntime.temporarilyUnloadForExternalWork(common);
+        }
+        if (lease?.unloaded === true) {
+            onProgress?.({
+                phase: 'preparing-runtime', step: 0, progress: 0, previewSequence: 0,
+                statusText: lease.parkedInRam === true
+                    ? 'Language model parked in system RAM. Preparing diffusion…'
+                    : 'Language model unloaded. Preparing diffusion…',
+            });
+        }
+        return lease;
+    }
+
+    async generate(configuration, request = {}, options = {}) {
+        const config = normalizeDiffusionConfiguration(configuration);
+        this._validateConfiguration(config);
+        const signal = options.signal;
+        if (signal?.aborted) throw abortError();
+        const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+        const prompt = String(request.prompt || '').trim();
+        if (!prompt) throw new Error('Generate Image requires a non-empty prompt.');
+        const effectivePrompt = prependGenerationPrefix(config.generationPrefix, prompt);
+        const preparedEdit = prepareImageEdit(options.imageEdit);
+        const width = preparedEdit ? preparedEdit.processing.width : normalizeInteger(request.width, 1024, 64, 4096);
+        const height = preparedEdit ? preparedEdit.processing.height : normalizeInteger(request.height, 1024, 64, 4096);
+        if (width % 8 || height % 8) throw new Error('Generate Image width and height must be divisible by 8.');
+        const requestedSteps = normalizeRequestedDiffusionSteps(request.steps);
+        const requestedCfgScale = normalizeRequestedDiffusionCfgScale(request.cfg_scale);
+        const requestedSampler = normalizeRequestedDiffusionSampler(request.sampler);
+        const effectiveSteps = resolveEffectiveDiffusionSteps(config, { steps: requestedSteps });
+        const effectiveCfgScale = resolveEffectiveDiffusionCfgScale(config, { cfg_scale: requestedCfgScale });
+        const effectiveSampler = resolveEffectiveDiffusionSampler(config, { sampler: requestedSampler });
+        const normalizedRequest = { prompt: effectivePrompt, negative_prompt: String(request.negative_prompt || '').trim(), width, height, steps: requestedSteps, cfg_scale: requestedCfgScale, sampler: requestedSampler };
+        const token = await this._acquire(signal, onProgress);
+        let tempDir = '';
+        let lease = null;
+        let result = null;
+        let pendingError = null;
+        let restoreError = null;
+        try {
+            lease = await this._temporarilyUnloadLanguageModel(config, options, onProgress);
+            if (signal?.aborted) throw abortError();
+            const resolved = await this._resolveComputeTarget(config.computeDevice);
+            const help = await this._probe(resolved.executable);
+            const seed = config.seed < 0 ? crypto.randomInt(0, 0x7fffffff) : config.seed;
+            tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'darkstar-image-'));
+            const files = { output: path.join(tempDir, 'output.png'), preview: path.join(tempDir, 'preview.png'),
+                ...(preparedEdit ? { init: path.join(tempDir, 'inpaint-init.png'), mask: path.join(tempDir, 'inpaint-mask.png') } : {}) };
+            if (preparedEdit) {
+                await fs.promises.writeFile(files.init, preparedEdit.initPng);
+                await fs.promises.writeFile(files.mask, preparedEdit.maskPng);
+            }
+            const args = this._arguments(config, normalizedRequest, files, seed, help, effectiveSteps, effectiveCfgScale, effectiveSampler, resolved);
+            onProgress?.({ phase: 'loading', step: 0, steps: effectiveSteps, progress: 0, width, height, previewSequence: 0, statusText: `Loading ${config.family || 'diffusion'} model…`, backend: resolved.backend, computeDevice: resolved.deviceId || 'auto', computeDeviceLabel: resolved.deviceLabel || 'Auto' });
+            let stdoutTail = Buffer.alloc(0), stderrTail = Buffer.alloc(0);
+            const previewState = { fingerprint: '', digest: '', sequence: 0, step: 0 };
+            const outputState = { fingerprint: '', digest: '', buffer: null, published: false };
+            const isJavaScriptExecutable = path.extname(resolved.executable).toLowerCase() === '.js';
+            const command = isJavaScriptExecutable ? process.execPath : resolved.executable;
+            const commandArgs = isJavaScriptExecutable ? [resolved.executable, ...args] : args;
+            const child = this.spawn(command, commandArgs, { cwd: tempDir, env: process.env, windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+            this.activeChild = child;
+            const parseProgress = (chunk) => {
+                const text = Buffer.from(chunk).toString('utf8');
+                const regex = /(\d{1,5})\s*\/\s*(\d{1,5})/gu;
+                let match;
+                while ((match = regex.exec(text))) {
+                    const current = Number.parseInt(match[1], 10), total = Number.parseInt(match[2], 10);
+                    if (total === effectiveSteps && current >= 0 && current <= total) previewState.step = Math.max(previewState.step, current);
+                }
+            };
+            child.stdout?.on?.('data', (chunk) => { stdoutTail = boundedTail(stdoutTail, chunk); parseProgress(chunk); });
+            child.stderr?.on?.('data', (chunk) => { stderrTail = boundedTail(stderrTail, chunk); parseProgress(chunk); });
+            const previewTimer = setInterval(() => {
+                this._readPreview(files.preview, previewState, normalizedRequest, Object.assign({}, config, { steps: effectiveSteps }), onProgress).catch(() => undefined);
+                this._readFinalOutput(files.output, outputState, normalizedRequest, config, seed, resolved.backend, onProgress, !preparedEdit).catch(() => undefined);
+            }, PREVIEW_POLL_MS);
+            previewTimer.unref?.();
+            let abortListener = null;
+            const closeResult = await new Promise((resolve, reject) => {
+                let finished = false;
+                const finishResolve = (value) => { if (!finished) { finished = true; resolve(value); } };
+                const finishReject = (error) => { if (!finished) { finished = true; reject(error); } };
+                abortListener = () => {
+                    if (finished) return;
+                    finished = true;
+                    killProcessTree(child).finally(() => reject(abortError()));
+                };
+                signal?.addEventListener?.('abort', abortListener, { once: true });
+                child.once('error', finishReject);
+                child.once('close', (status, closeSignal) => finishResolve({ status, signal: closeSignal }));
+            }).finally(() => {
+                clearInterval(previewTimer);
+                signal?.removeEventListener?.('abort', abortListener);
+            });
+            await this._readPreview(files.preview, previewState, normalizedRequest, Object.assign({}, config, { steps: effectiveSteps }), onProgress).catch(() => undefined);
+            let output = await this._readFinalOutput(files.output, outputState, normalizedRequest, Object.assign({}, config, { steps: effectiveSteps }), seed, resolved.backend, onProgress, !preparedEdit);
+            if (output && preparedEdit) output = finalizeImageEdit(output, preparedEdit);
+            if (signal?.aborted) throw abortError();
+            const logText = `${stderrTail.toString('utf8')}
+${stdoutTail.toString('utf8')}`.trim().slice(-12_000);
+            if (!output) {
+                if (closeResult.status !== 0) {
+                    const oom = /ErrorOutOfDeviceMemory|Device memory allocation[^\n]*failed|failed to allocate Vulkan\d+ buffer/iu.test(logText);
+                    const error = new Error(`${oom ? 'stable-diffusion.cpp ran out of VRAM' : 'stable-diffusion.cpp image generation failed'} with exit code ${closeResult.status}${logText ? `:
+${logText}` : '.'}`);
+                    if (oom) { error.code = 'DIFFUSION_VRAM_OOM'; error.retryable = true; }
+                    throw error;
+                }
+                throw new Error('stable-diffusion.cpp completed without producing a valid PNG output.');
+            }
+            const recovered = closeResult.status !== 0;
+            const outputWidth = preparedEdit ? preparedEdit.source.width : width, outputHeight = preparedEdit ? preparedEdit.source.height : height;
+            onProgress?.({ phase: 'finalizing', finalImage: true, step: effectiveSteps, steps: effectiveSteps, progress: 1, width: outputWidth, height: outputHeight, mimeType: 'image/png', base64: output.toString('base64'), imageName: `generated-${seed}.png`, previewSequence: Number.MAX_SAFE_INTEGER, statusText: preparedEdit ? 'Inpaint ready · protected pixels preserved' : (recovered ? 'Image recovered after native backend exit' : 'Image ready'), backend: resolved.backend });
+            result = {
+                __darkstarMultimodal: true,
+                __darkstarDisplayWithoutVision: true,
+                text: recovered
+                    ? `Generated a ${outputWidth}×${outputHeight} image with seed ${seed}. The image was recovered even though stable-diffusion.cpp exited with code ${closeResult.status} after writing it.`
+                    : (preparedEdit ? `Inpainted only the user-approved region of the ${outputWidth}×${outputHeight} source image with seed ${seed}; pixels outside that region were restored from the pristine source.` : `Generated a ${outputWidth}×${outputHeight} image with seed ${seed}. The finished image is available in the chat.`),
+                images: [{ mimeType: 'image/png', name: `generated-${seed}.png`, base64: output.toString('base64') }],
+                metadata: {
+                    kind: preparedEdit ? 'darkstar-inpainted-image' : 'darkstar-generated-image', width: outputWidth, height: outputHeight, seed, steps: effectiveSteps, cfgScale: effectiveCfgScale,
+                    sampler: effectiveSampler, scheduler: config.scheduler, attentionMode: config.attentionMode, family: config.family, variant: config.variant,
+                    backend: resolved.backend, computeDevice: resolved.deviceId || 'auto', computeDeviceLabel: resolved.deviceLabel || 'Auto', nativeExitCode: closeResult.status, recoveredFromNativeExit: recovered,
+                    ...(preparedEdit ? { inpaint: { mode: preparedEdit.edit.mode, region: { ...preparedEdit.edit.region }, contextRect: { ...preparedEdit.contextRect }, processing: { ...preparedEdit.processing }, hardPreserveOutsideRegion: true } } : {}),
+                },
+            };
+        } catch (error) {
+            pendingError = error;
+        } finally {
+            this.activeChild = null;
+            if (lease && typeof lease.restore === 'function') {
+                try {
+                    if (this.closed && typeof lease.release === 'function') {
+                        await lease.release();
+                    } else {
+                        onProgress?.({ phase: 'restoring-language-model', finalImage: Boolean(result), step: result ? effectiveSteps : 0, steps: result ? effectiveSteps : 0, progress: 1, previewSequence: 0, statusText: result ? 'Image ready · restoring language model…' : 'Restoring language model after diffusion failure…' });
+                        await lease.restore();
+                    }
+                } catch (error) {
+                    restoreError = error;
+                }
+            }
+            if (tempDir) await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+            this._release(token);
+        }
+        if (restoreError) {
+            if (pendingError) {
+                pendingError.message += `
+Additionally, restoring the language model after image generation failed: ${restoreError.message}`;
+                throw pendingError;
+            }
+            throw new Error(`Image generation completed, but restoring the language model failed: ${restoreError.message}`);
+        }
+        if (pendingError) throw pendingError;
+        return result;
+    }
+
+    async shutdown() {
+        this.closed = true;
+        const waiters = this.waiters.splice(0);
+        waiters.forEach((waiter) => { waiter.signal?.removeEventListener?.('abort', waiter.onAbort); waiter.reject(new Error('Diffusion runtime is shutting down.')); });
+        if (this.activeChild) await killProcessTree(this.activeChild).catch(() => undefined);
+    }
+}
+
+module.exports = { DiffusionRuntime, estimateDiffusionPipelineResidentBytes, normalizeDiffusionConfiguration, normalizeImageEditEnvelope, prepareImageEdit, finalizeImageEdit };
+// <DARKSTAR_SOURCE_END path="backend/runtime/diffusion-runtime.js">
+});
 // MODULE :: backend/runtime/process-utils.js
 __darkstarDefineModule("backend/runtime/process-utils.js", function darkstarModule(module, exports, require, __filename, __dirname) {
 // <DARKSTAR_SOURCE_BEGIN path="backend/runtime/process-utils.js">
@@ -8333,7 +11107,7 @@ function buildSharedArgs(config, capabilities, defaultHost) {
         if (!tensorSplit) {
             throw new Error(
                 'Parallel multi-GPU loading requires a VRAM-aware tensor split plan. '
-                + 'Restart Load Server so Darkstar can measure the selected GPUs before launching llama.cpp.',
+                + 'Restart LlamaCPP Server so Darkstar can measure the selected GPUs before launching llama.cpp.',
             );
         }
         args.push('--split-mode', 'tensor', '--tensor-split', tensorSplit);
@@ -8367,7 +11141,7 @@ function buildSharedArgs(config, capabilities, defaultHost) {
     }
     // llama.cpp b10645 defaults Flash Attention to Auto. Omitting the flag when
     // the UI says Off therefore does not disable it. Always pass the effective
-    // state explicitly so backend correctness policy and the Load Server setting
+    // state explicitly so backend correctness policy and the LlamaCPP Server setting
     // are faithfully represented at the native process boundary.
     args.push('--flash-attn', config.flashAttention ? (multiGpuMode === 'parallel' ? 'on' : 'auto') : 'off');
     // Darkstar does not perform implicit context shifting. Oversized requests are
@@ -8617,7 +11391,7 @@ async function detectCapabilities(runtime, dependencies) {
         noAutoload: text.includes('--no-models-autoload'),
         noCachePrompt: text.includes('--no-cache-prompt'),
         noCacheIdleSlots: text.includes('--no-cache-idle-slots'),
-        noContextShift: text.includes('--no-context-shift'), slots: text.includes('--slots'),
+        noContextShift: text.includes('--no-context-shift'), slots: text.includes('--slots'), noMmap: text.includes('--no-mmap'),
         gpuLayersAuto: /n-gpu-layers[\s\S]{0,200}(auto|all)/iu.test(text),
         splitMode: /--split-mode\b/u.test(text),
         splitModeTensor: /--split-mode[^\r\n]*\btensor\b/iu.test(text),
@@ -8645,7 +11419,7 @@ async function startServer(runtime, config, dependencies) {
 
     if (runtime.process && !runtime.process.killed && runtime.server) {
         // A model-load OOM recovery may run the process with safer effective
-        // batch/GPU settings while retaining the user's requested Load Server
+        // batch/GPU settings while retaining the user's requested LlamaCPP Server
         // configuration. Compare against that requested configuration so every
         // graph execution does not tear down the recovered server and retry the
         // known-bad launch parameters.
@@ -8653,7 +11427,7 @@ async function startServer(runtime, config, dependencies) {
         const sameConfig = JSON.stringify(runningRequest) === JSON.stringify(normalized);
         if (sameConfig) return { ...runtime.getStatus(), reused: true };
         if (inFlightStreamCount(runtime) > 0) {
-            throw new Error('Load Server settings cannot change while tab generations are active. Stop them first.');
+            throw new Error('LlamaCPP Server settings cannot change while tab generations are active. Stop them first.');
         }
         await runtime.stopServerInternal();
     }
@@ -8661,7 +11435,7 @@ async function startServer(runtime, config, dependencies) {
     const gpuSelection = await prepareBackendLaunch(runtime, normalized, dependencies);
     const capabilities = await runtime.detectCapabilities();
     validateMultiGpuConfig(normalized, capabilities);
-    const modelSelection = normalized.modelId ? runtime.resolveModelSelection(normalized.modelId) : null;
+    const modelSelection = normalized.modelId ? await runtime.resolveModelSelectionAsync(normalized.modelId) : null;
     const mtp = resolveMtpConfig(normalized.mtp, {
         model: modelSelection?.local || null,
         capabilities,
@@ -9073,7 +11847,7 @@ async function consumeChatCompletionStream(response, handlers = {}) {
                 : (Array.isArray(choice.tool_calls) ? choice.tool_calls : []));
         mergeToolCallDelta(toolCalls, deltas);
         if (deltas.length && typeof handlers.onToolCallDelta === 'function') {
-            handlers.onToolCallDelta({ calls: snapshotToolCalls(toolCalls) });
+            handlers.onToolCallDelta({ calls: toolCalls });
         }
         if (choice.finish_reason !== undefined && choice.finish_reason !== null) finishReason = String(choice.finish_reason);
         const exactStop = completionStopDetails(json);
@@ -9760,7 +12534,8 @@ function createPreparationTracker(round, handlers) {
     }
 
     function update(payload) {
-        const calls = Array.isArray(payload?.calls) ? payload.calls : [];
+        const source = payload?.calls;
+        const calls = source instanceof Map ? source.values() : (Array.isArray(source) ? source : []);
         const now = Date.now();
         for (const call of calls) {
             const index = Number.isInteger(Number(call?.index)) ? Number(call.index) : 0;
@@ -10243,6 +13018,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { isWithinRoot } = require('../filesystem/path-utils');
+const { isInternalProjectPath } = require('../project/project-storage');
 
 const FILESYSTEM_ACCESS_LEVELS = Object.freeze([
     Object.freeze({ id: '1', label: 'Level 1 · Full Filesystem', description: 'No filesystem boundary. Tools may access any path permitted to the Darkstar OS account.' }),
@@ -10377,6 +13153,9 @@ class FilesystemAccessPolicyService {
         const workspace = path.resolve(workingDirectory);
         const lexical = path.resolve(path.isAbsolute(supplied) ? supplied : path.join(workspace, supplied));
         const level = normalizeFilesystemAccessLevel(options.level || this.level);
+        if (level !== '1' && isInternalProjectPath(lexical, workspace)) {
+            throw new Error('Darkstar project metadata is reserved and cannot be accessed by scoped filesystem tools.');
+        }
         const boundary = this.boundaryRoot(workspace, level);
         if (boundary && !isWithinRoot(boundary, lexical)) {
             throw new Error(`Path is outside the Filesystem Access Level ${level} boundary.`);
@@ -12303,7 +15082,7 @@ function collectProcess(executable, args, options = {}) {
         child.stdout.on('data', (chunk) => { stdout += chunk; });
         child.stderr.on('data', (chunk) => { stderr += chunk; });
         child.once('error', finish);
-        child.once('exit', (code, signal) => finish(null, { code, signal, stdout, stderr }));
+        child.once('close', (code, signal) => finish(null, { code, signal, stdout, stderr }));
     });
 }
 
@@ -13158,6 +15937,150 @@ module.exports = {
 // --------------------------------------------------------------------------
 // [4400] TOOL CORE :: runtime, schema and ToolService ownership
 // --------------------------------------------------------------------------
+// MODULE :: backend/agent/image-generation-action.js
+__darkstarDefineModule("backend/agent/image-generation-action.js", function darkstarModule(module, exports, require, __filename, __dirname) {
+// <DARKSTAR_SOURCE_BEGIN path="backend/agent/image-generation-action.js">
+'use strict';
+
+const GENERATE_IMAGE_ACTION = 'generate_image';
+const MIN_GENERATE_IMAGE_COUNT = 1;
+const MAX_GENERATE_IMAGE_COUNT = 50;
+
+function normalizeGenerateImageCount(value, label) {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < MIN_GENERATE_IMAGE_COUNT || parsed > MAX_GENERATE_IMAGE_COUNT) {
+        throw new Error(`${label || 'image_count'} must be an integer between ${MIN_GENERATE_IMAGE_COUNT} and ${MAX_GENERATE_IMAGE_COUNT}.`);
+    }
+    return parsed;
+}
+
+function normalizeGenerateImageCountOverride(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return 0;
+    return Math.max(0, Math.min(MAX_GENERATE_IMAGE_COUNT, Math.round(parsed)));
+}
+
+function sequenceDiffusionConfiguration(configuration, imageIndex) {
+    if (!configuration || imageIndex <= 0) return configuration;
+    const baseSeed = Number(configuration.seed);
+    if (!Number.isSafeInteger(baseSeed) || baseSeed < 0) return configuration;
+    const nextSeed = baseSeed <= Number.MAX_SAFE_INTEGER - imageIndex ? baseSeed + imageIndex : imageIndex - 1;
+    return { ...configuration, seed: nextSeed };
+}
+
+function sequenceProgressHandler(options, imageIndex, imageCount) {
+    if (imageCount === 1) return options.onToolProgress;
+    return (event) => {
+        if (typeof options.onToolProgress !== 'function') return;
+        const payload = event && typeof event === 'object' ? { ...event } : {};
+        payload.imageIndex = imageIndex + 1;
+        payload.imageCount = imageCount;
+        payload.finalImage = event?.finalImage === true;
+        if (!Object.prototype.hasOwnProperty.call(event || {}, 'base64')) payload.base64 = '';
+        if (!Object.prototype.hasOwnProperty.call(event || {}, 'mimeType')) payload.mimeType = '';
+        const statusText = String(event?.statusText || '').trim();
+        payload.statusText = `Image ${imageIndex + 1}/${imageCount}${statusText ? ` · ${statusText}` : ''}`;
+        options.onToolProgress(payload);
+    };
+}
+
+function aggregateImageSequence(results, imageCount, fixedCount) {
+    if (imageCount === 1) return results[0];
+    const images = results.flatMap((entry) => Array.isArray(entry?.images) ? entry.images : []);
+    if (images.length !== imageCount) {
+        throw new Error(`Generate Image requested ${imageCount} sequential images but the diffusion runtime returned ${images.length}.`);
+    }
+    return {
+        __darkstarMultimodal: true,
+        __darkstarDisplayWithoutVision: true,
+        text: `Generated ${imageCount} images sequentially. All finished images are available in the chat.`,
+        images,
+        metadata: {
+            kind: 'darkstar-generated-image-sequence',
+            imageCount,
+            countSource: fixedCount > 0 ? 'settings' : 'model',
+            images: results.map((entry, index) => ({ index: index + 1, ...(entry?.metadata && typeof entry.metadata === 'object' ? entry.metadata : {}) })),
+        },
+    };
+}
+
+async function resolveGenerateImageAction(result, options = {}) {
+    if (String(options.toolName || '') !== GENERATE_IMAGE_ACTION) throw new Error('Only the generate_image Python Tool may request an image-generation action.');
+    if (!options.diffusionRuntime || typeof options.diffusionRuntime.generate !== 'function') throw new Error('Generate Image is unavailable because the diffusion runtime is not initialized.');
+    if (!options.diffusion) throw new Error('Generate Image requires Diffusion Backend GGUF → DM Sampler → Orchestrator to be connected.');
+    const request = { ...result };
+    if (options.negativePromptEnabled === true) {
+        if (!String(request.negative_prompt || '').trim()) throw new Error('Negative Prompt is enabled, so Generate Image must provide a non-empty negative_prompt.');
+        request.negative_prompt = String(request.negative_prompt).trim();
+    } else request.negative_prompt = '';
+
+    const fixedCount = normalizeGenerateImageCountOverride(options.imageCountOverride);
+    const imageCount = fixedCount > 0 ? fixedCount : normalizeGenerateImageCount(request.image_count, 'image_count');
+    delete request.image_count;
+    const generatedResults = [];
+    for (let imageIndex = 0; imageIndex < imageCount; imageIndex += 1) {
+        if (options.signal?.aborted) { const error = new Error('Image generation was cancelled.'); error.name = 'AbortError'; throw error; }
+        generatedResults.push(await options.diffusionRuntime.generate(sequenceDiffusionConfiguration(options.diffusion, imageIndex), request, {
+            signal: options.signal,
+            onProgress: sequenceProgressHandler(options, imageIndex, imageCount),
+            dynamicVramEnabled: options.dynamicVramEnabled === true,
+            imageEdit: options.imageEdit && typeof options.imageEdit === 'object' ? structuredClone(options.imageEdit) : null,
+        }));
+    }
+    return aggregateImageSequence(generatedResults, imageCount, fixedCount);
+}
+
+module.exports = {
+    MAX_GENERATE_IMAGE_COUNT,
+    MIN_GENERATE_IMAGE_COUNT,
+    aggregateImageSequence,
+    normalizeGenerateImageCount,
+    normalizeGenerateImageCountOverride,
+    resolveGenerateImageAction,
+    sequenceDiffusionConfiguration,
+    sequenceProgressHandler,
+};
+// <DARKSTAR_SOURCE_END path="backend/agent/image-generation-action.js">
+});
+// MODULE :: backend/agent/presentation-image-action.js
+__darkstarDefineModule("backend/agent/presentation-image-action.js", function darkstarModule(module, exports, require, __filename, __dirname) {
+// <DARKSTAR_SOURCE_BEGIN path="backend/agent/presentation-image-action.js">
+'use strict';
+
+const SHOW_IMAGE_ACTION = 'show_image';
+const PRESENT_IMAGE_MARKER = '__darkstarPresentImage';
+
+function toolImageId(taskId, call, imageIndex) {
+    return `${String(taskId || 'task')}:${String(call?.id || call?.function?.name || 'tool')}:${imageIndex}`;
+}
+
+function registerToolImages(registry, call, images, taskId) {
+    const source = Array.isArray(images) ? images : [];
+    return source.map((image, imageIndex) => {
+        const id = toolImageId(taskId, call, imageIndex);
+        const record = {
+            id,
+            mimeType: String(image?.mimeType || '').toLowerCase(),
+            name: String(image?.name || ''),
+            base64: String(image?.base64 || ''),
+        };
+        if (registry instanceof Map) registry.set(id, record);
+        return record;
+    });
+}
+
+function resolveShowImageAction(result, options = {}) {
+    if (String(options.toolName || '') !== SHOW_IMAGE_ACTION) throw new Error('Only the show_image Python Tool may request image presentation.');
+    if (!(options.imageRegistry instanceof Map)) throw new Error('Show Image is unavailable because this agent interaction has no image registry.');
+    const imageId = String(result.image_id || '').trim();
+    if (!imageId) throw new Error('show_image requires image_id.');
+    if (!options.imageRegistry.has(imageId)) throw new Error(`Unknown image_id: ${imageId}. Use an exact image_id returned by a previous image-producing tool call in this response.`);
+    return { [PRESENT_IMAGE_MARKER]: true, imageId, text: 'Image added to the assistant response.' };
+}
+
+module.exports = { PRESENT_IMAGE_MARKER, SHOW_IMAGE_ACTION, registerToolImages, resolveShowImageAction, toolImageId };
+// <DARKSTAR_SOURCE_END path="backend/agent/presentation-image-action.js">
+});
 // MODULE :: backend/agent/tool-runtime.js
 __darkstarDefineModule("backend/agent/tool-runtime.js", function darkstarModule(module, exports, require, __filename, __dirname) {
 // <DARKSTAR_SOURCE_BEGIN path="backend/agent/tool-runtime.js">
@@ -13169,6 +16092,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { parseArguments } = require('./tool-schema');
 const { ASK_USER_YES_NO_TOOL_NAME, resolveAttentionRequestAction, resolveUserQuestionAction } = require('./attention-actions');
+const { resolveGenerateImageAction } = require('./image-generation-action');
+const { SHOW_IMAGE_ACTION, resolveShowImageAction } = require('./presentation-image-action');
 
 // Tool-call timeout policy.
 const TIMEOUT_TOOL_NAME = 'timeout';
@@ -13228,7 +16153,7 @@ function formatToolInvocation(name, rawArguments, parsedArguments) {
 }
 
 // Internal tool-result action dispatch.
-const SCREENSHOT_ACTION = 'screenshot_html';
+const SCREENSHOT_ACTION = 'screenshot_html', GENERATE_IMAGE_ACTION = 'generate_image';
 const BROWSER_CONTROL_ACTION = 'browser_control';
 const OPEN_SIDE_BROWSER_ACTION = 'open_side_browser';
 const ATTENTION_REQUEST_ACTION = 'request_attention';
@@ -13275,7 +16200,7 @@ async function resolveOpenSideBrowserAction(result, options = {}) {
         throw new Error('Only the open_side_browser Python Tool may request the side-browser visibility action.');
     }
     if (!options.offlineBrowser || typeof options.offlineBrowser.setVisible !== 'function') {
-        throw new Error('The side Browser is unavailable because the internal browser service is not initialized.');
+        throw new Error('The Workshop browser workspace is unavailable because the internal browser service is not initialized.');
     }
     const status = options.offlineBrowser.setVisible(true, { browserId: options.browserId === undefined || options.browserId === null ? '0' : String(options.browserId) });
     return {
@@ -13289,6 +16214,8 @@ async function resolveOpenSideBrowserAction(result, options = {}) {
 async function resolveToolResultAction(result, options = {}) {
     if (!result || typeof result !== 'object') return result;
     if (result.__darkstarAction === SCREENSHOT_ACTION) return resolveScreenshotAction(result, options);
+    if (result.__darkstarAction === GENERATE_IMAGE_ACTION) return resolveGenerateImageAction(result, options);
+    if (result.__darkstarAction === SHOW_IMAGE_ACTION) return resolveShowImageAction(result, options);
     if (result.__darkstarAction === BROWSER_CONTROL_ACTION) return resolveBrowserControlAction(result, options);
     if (result.__darkstarAction === OPEN_SIDE_BROWSER_ACTION) return resolveOpenSideBrowserAction(result, options);
     if (result.__darkstarAction === ATTENTION_REQUEST_ACTION) return resolveAttentionRequestAction(result, options);
@@ -13362,6 +16289,7 @@ async function executeToolHandler(handler, name, args, context, options = {}) {
 module.exports = {
     ATTENTION_REQUEST_ACTION,
     BROWSER_CONTROL_ACTION,
+    GENERATE_IMAGE_ACTION,
     COMMAND_TOOL_GRACE_MS,
     COMMAND_TOOL_MAX_SECONDS,
     COMMAND_TOOL_NAMES,
@@ -13369,6 +16297,7 @@ module.exports = {
     OPEN_SIDE_BROWSER_ACTION,
     REPLACE_FILE_INLINE_TRANSFER_CHARS,
     SCREENSHOT_ACTION,
+    SHOW_IMAGE_ACTION,
     TIMEOUT_TOOL_GRACE_MS,
     TIMEOUT_TOOL_MAX_SECONDS,
     TRANSFER_DIRECTORY_PREFIX,
@@ -13376,6 +16305,7 @@ module.exports = {
     executeToolHandler,
     formatToolInvocation,
     resolveAttentionRequestAction,
+    resolveGenerateImageAction,
     resolveToolResultAction,
     serializeToolResult,
     shellQuote,
@@ -13556,8 +16486,79 @@ function projectVisionDefinition(definition, visionEnabled) {
     } else if (name === 'UIP_Chromium_Interface_Element' && properties) delete properties.annotation_mode;
     return projected;
 }
-function runtimeProviderTools(tools, visionEnabled) {
-    return (Array.isArray(tools) ? tools : []).map((definition) => projectVisionDefinition(modelToolDefinition(definition), visionEnabled)).filter(Boolean);
+function projectDiffusionDefinition(definition, diffusion, negativePromptEnabled = false, imageCountOverride = 0, imageEdit = null) {
+    if (String(definition?.function?.name || '') !== 'generate_image') return definition;
+    const projected = structuredClone(definition);
+    const parameters = projected.function?.parameters;
+    const properties = parameters?.properties;
+    if (!parameters || !properties) return projected;
+    const required = new Set(Array.isArray(parameters.required) ? parameters.required : []);
+    const autoSteps = diffusion?.stepsAuto === true || Number(diffusion?.steps) === 0;
+    const autoCfgScale = diffusion?.cfgScaleAuto === true || Number(diffusion?.cfgScale) === 0;
+    const autoSampler = String(diffusion?.sampler || 'auto').trim().toLowerCase() === 'auto';
+    const fixedImageCount = Math.max(0, Math.min(50, Math.round(Number(imageCountOverride) || 0)));
+    if (String(diffusion?.generationPrefix || '').trim()) projected.function.description = `${String(projected.function.description || '').trim()} Darkstar automatically prepends the configured DM Sampler Generation Prefix to the positive prompt; do not repeat it.`.trim();
+    if (imageEdit && typeof imageEdit === 'object') {
+        for (const key of ['width', 'height']) { delete properties[key]; required.delete(key); }
+        projected.function.description = `${String(projected.function.description || '').trim()} A user-authored inpainting edit is armed for this request. Describe only what should appear inside the approved edit region. Darkstar supplies the pristine source image and authoritative mask, chooses the inpaint processing geometry, and hard-preserves every pixel outside the user-approved region. Do not attempt to choose a mask, crop, width, or height.`.trim();
+    }
+    if (properties.image_count) {
+        if (fixedImageCount === 0) {
+            required.add('image_count');
+            properties.image_count.description = 'Required because Settings image count is 0 (model-controlled). Choose an integer from 1 to 50. Darkstar generates that many images sequentially, one complete image at a time.';
+            projected.function.description = `${String(projected.function.description || '').trim()} Settings leaves image count under model control: you MUST choose image_count from 1 to 50. Darkstar will generate the requested images sequentially, not as a native batch.`.trim();
+        } else {
+            delete properties.image_count;
+            required.delete('image_count');
+            projected.function.description = `${String(projected.function.description || '').trim()} Settings fixes image count at ${fixedImageCount}; Darkstar will generate exactly ${fixedImageCount} image${fixedImageCount === 1 ? '' : 's'} sequentially and the model must not choose a count.`.trim();
+        }
+    }
+    if (properties.negative_prompt) {
+        if (negativePromptEnabled === true) { required.add('negative_prompt'); properties.negative_prompt.minLength = 1; properties.negative_prompt.description = 'Required because Negative Prompt is enabled. Provide a non-empty negative prompt for this image generation.'; }
+        else { delete properties.negative_prompt; required.delete('negative_prompt'); }
+    }
+    if (properties.steps) {
+        if (autoSteps) {
+            required.add('steps');
+            projected.function.description = `${String(projected.function.description || '').trim()} DM Sampler Steps is Auto for this run: you MUST choose steps between 1 and 150. More complex or higher-fidelity prompts generally benefit from more steps.`.trim();
+            properties.steps.description = 'Required because DM Sampler Steps is Auto. Choose 1-150 steps for this request. More complex or higher-fidelity prompts generally benefit from more steps; simpler prompts can use fewer steps.';
+        } else {
+            delete properties.steps;
+            required.delete('steps');
+            projected.function.description = `${String(projected.function.description || '').trim()} DM Sampler Steps is fixed at ${Number(diffusion?.steps) || 1}; Darkstar will enforce that value.`.trim();
+        }
+    }
+    if (properties.cfg_scale) {
+        if (autoCfgScale) {
+            required.add('cfg_scale');
+            projected.function.description = `${String(projected.function.description || '').trim()} DM Sampler CFG is Auto for this run: you MUST choose cfg_scale between 0.1 and 30. Higher CFG generally follows the prompt more strongly, while lower CFG can be looser or more natural.`.trim();
+            properties.cfg_scale.description = 'Required because DM Sampler CFG is Auto. Choose a cfg_scale between 0.1 and 30 for this request. Higher CFG generally follows the prompt more strongly, while lower CFG can be looser or more natural.';
+        } else {
+            delete properties.cfg_scale;
+            required.delete('cfg_scale');
+            projected.function.description = `${String(projected.function.description || '').trim()} DM Sampler CFG is fixed at ${Number(diffusion?.cfgScale) || 0}; Darkstar will enforce that value.`.trim();
+        }
+    }
+    if (properties.sampler) {
+        if (autoSampler) {
+            required.add('sampler');
+            projected.function.description = `${String(projected.function.description || '').trim()} DM Sampler Sampler is Auto for this run: you MUST choose the sampler.`.trim();
+            properties.sampler.description = 'Required because DM Sampler Sampler is Auto. Choose the diffusion sampler for this request.';
+        } else {
+            delete properties.sampler;
+            required.delete('sampler');
+            projected.function.description = `${String(projected.function.description || '').trim()} DM Sampler sampler is fixed at ${String(diffusion?.sampler || '').trim() || 'auto'}; Darkstar will enforce that value.`.trim();
+        }
+    }
+    parameters.required = Array.from(required);
+    return projected;
+}
+function runtimeProviderTools(tools, options = {}) {
+    const { visionEnabled = false, diffusion = null, negativePromptEnabled = false, imageCountOverride = 0, imageEdit = null } = options;
+    return (Array.isArray(tools) ? tools : []).map((definition) => {
+        const visionProjected = projectVisionDefinition(modelToolDefinition(definition), visionEnabled);
+        return visionProjected ? projectDiffusionDefinition(visionProjected, diffusion, negativePromptEnabled, imageCountOverride, imageEdit) : null;
+    }).filter(Boolean);
 }
 function publicProvider(provider) {
     return {
@@ -13567,7 +16568,7 @@ function publicProvider(provider) {
     };
 }
 
-module.exports = { modelToolDefinition, projectVisionDefinition, publicProvider, runtimeProviderTools };
+module.exports = { modelToolDefinition, projectDiffusionDefinition, projectVisionDefinition, publicProvider, runtimeProviderTools };
 // <DARKSTAR_SOURCE_END path="backend/agent/tool-capabilities.js">
 });
 // MODULE :: backend/agent/tool-service.js
@@ -13583,8 +16584,8 @@ const { createTerminalToolProvider } = require('./builtin/terminal-tools');
 const { hasApplicationInterfaceTargets, registerApplicationInterfaceHarness, stripLegacyApplicationInterfaceProviders } = require('./application-interface-harness');
 const { filterEnabledTools } = require('./python-provider');
 const { parseArguments, validateToolArguments } = require('./tool-schema');
-const { executeToolHandler, formatToolInvocation, resolveToolResultAction, serializeToolResult, timeoutToolCallTimeoutMs } = require('./tool-runtime'); const { gateToolCall } = require('./permission-policy');
-const { modelToolDefinition, projectVisionDefinition, publicProvider, runtimeProviderTools } = require('./tool-capabilities');
+const { executeToolHandler, formatToolInvocation, resolveToolResultAction, serializeToolResult, timeoutToolCallTimeoutMs } = require('./tool-runtime'); const { normalizeGenerateImageCountOverride } = require('./image-generation-action'); const { PRESENT_IMAGE_MARKER, registerToolImages } = require('./presentation-image-action'); const { gateToolCall } = require('./permission-policy');
+const { modelToolDefinition, projectDiffusionDefinition, projectVisionDefinition, publicProvider, runtimeProviderTools } = require('./tool-capabilities'); const { normalizeDiffusionConfiguration } = require('../runtime/diffusion-runtime');
 function normalizeMaxRounds(value) { const parsed = Number.parseInt(value, 10); return value === undefined || value === null || value === '' || String(value).toLowerCase() === 'auto' || !Number.isFinite(parsed) || parsed < 1 ? null : Math.min(32, parsed); }
 function providerKind(reference) { return String(reference?.kind || 'python').toLowerCase(); }
 class ToolService {
@@ -13601,6 +16602,7 @@ class ToolService {
         this.inspections = this.pythonRegistry.inspections;
         this.hosts = this.pythonRegistry.hosts;
         this.providerCleanups = new Set();
+        this.diffusionRuntime = options.diffusionRuntime || null;
         this.offlineBrowser = options.offlineBrowser || null; this.uipService = options.uipService || null; this.attentionService = options.attentionService || null; this.permissionPolicy = options.permissionPolicy || null; this.filesystemAccess = options.filesystemAccess || null;
     }
     async finishInteraction(interactionId, browserId = '0') { return this.offlineBrowser?.finishAgentInteraction?.(String(interactionId || ''), { browserId: String(browserId === undefined || browserId === null ? '0' : browserId) }); }
@@ -13652,20 +16654,20 @@ class ToolService {
         if (!value && workspace) value = workspace.rootPath || workspace.root || workspace.currentRoot || workspace.workspaceRoot;
         return value ? path.resolve(String(value)) : null;
     }
-    _hostFor(reference) {
-        return this.pythonRegistry.hostFor(reference);
-    }
-    _registerHandler(definitions, handlers, definition, handler, visionEnabled) {
+    _hostFor(reference) { return this.pythonRegistry.hostFor(reference); }
+    _registerHandler(definitions, handlers, definition, handler, visionEnabled, diffusionEnabled = true, diffusion = null, negativePromptEnabled = false, imageCountOverride = 0, imageEdit = null) {
         const name = definition.function.name;
+        if (name === 'generate_image' && diffusionEnabled !== true) return false;
         const permission = definition.function['x-darkstar-permission'];
-        const runtimeDefinition = projectVisionDefinition(modelToolDefinition(definition), visionEnabled);
+        const visionDefinition = projectVisionDefinition(modelToolDefinition(definition), visionEnabled); const runtimeDefinition = visionDefinition ? projectDiffusionDefinition(visionDefinition, diffusion, negativePromptEnabled, imageCountOverride, imageEdit) : null;
         if (!runtimeDefinition) return false;
         if (handlers.has(name)) throw new Error(`Duplicate tool name across loaded providers: ${name}`);
         definitions.push(runtimeDefinition); handlers.set(name, { definition: runtimeDefinition, permission, ...handler });
         return true;
     }
     async buildRuntime(toolConfiguration = {}, skillConfiguration = {}) {
-        const visionEnabled = toolConfiguration.visionEnabled === true;
+        const visionEnabled = toolConfiguration.visionEnabled === true, diffusion = normalizeDiffusionConfiguration(toolConfiguration.diffusion), diffusionEnabled = Boolean(diffusion), negativePromptEnabled = toolConfiguration.negativePromptEnabled === true, imageCountOverride = normalizeGenerateImageCountOverride(toolConfiguration.imageCountOverride);
+        const imageEdit = toolConfiguration.imageEdit && typeof toolConfiguration.imageEdit === 'object' ? structuredClone(toolConfiguration.imageEdit) : null;
         const workspaceId = String(toolConfiguration.workspaceId || 'default');
         const uipScopeId = String(toolConfiguration.uipScopeId || workspaceId);
         const runtimeWorkspace = this._workspaceFor(toolConfiguration);
@@ -13682,7 +16684,7 @@ class ToolService {
         const providerSummaries = [];
         const providerKeys = new Set();
         const applicationInterfaceActive = registerApplicationInterfaceHarness(this.uipService, uipScopeId, (definition, execute, reference) => {
-            this._registerHandler(definitions, handlers, definition, { execute, provider: null, reference }, visionEnabled);
+            this._registerHandler(definitions, handlers, definition, { execute, provider: null, reference }, visionEnabled, diffusionEnabled, diffusion, negativePromptEnabled, imageCountOverride, imageEdit);
         });
         for (const reference of providerReferences) {
             const kind = providerKind(reference);
@@ -13691,22 +16693,21 @@ class ToolService {
                 const key = `${kind}:${summary.path || summary.id}`.toLowerCase();
                 if (providerKeys.has(key)) { this.log(`Ignoring duplicate tool provider reference: ${summary.name} (${summary.path || summary.id})`); continue; }
                 providerKeys.add(key);
-                const runtimeTools = runtimeProviderTools(summary.tools, visionEnabled);
+                const runtimeTools = runtimeProviderTools(summary.tools, { visionEnabled, diffusion, negativePromptEnabled, imageCountOverride, imageEdit }).filter((definition) => definition.function.name !== 'generate_image' || diffusionEnabled);
                 if (runtimeTools.length) {
                     const runtimeSummary = { ...summary, tools: runtimeTools };
                     providerSummaries.push(runtimeSummary);
                     const host = await this._hostFor(reference);
-                    for (const definition of summary.tools) this._registerHandler(definitions, handlers, definition, { host, provider: runtimeSummary, reference }, visionEnabled);
+                    for (const definition of summary.tools) this._registerHandler(definitions, handlers, definition, { host, provider: runtimeSummary, reference }, visionEnabled, diffusionEnabled, diffusion, negativePromptEnabled, imageCountOverride, imageEdit);
                 }
                 continue;
             }
-
             const resolved = await this._providerRecord(reference, runtimeWorkspace, { uipScopeId, workspaceId });
             const summary = publicProvider(resolved.provider);
             const key = `${resolved.kind}:${summary.path || summary.id}`.toLowerCase();
             if (providerKeys.has(key)) { this.log(`Ignoring duplicate tool provider reference: ${summary.name} (${summary.path || summary.id})`); continue; }
             providerKeys.add(key);
-            const runtimeTools = runtimeProviderTools(summary.tools, visionEnabled);
+            const runtimeTools = runtimeProviderTools(summary.tools, { visionEnabled, diffusion, negativePromptEnabled, imageCountOverride, imageEdit }).filter((definition) => definition.function.name !== 'generate_image' || diffusionEnabled);
             if (!runtimeTools.length) continue;
             const runtimeSummary = { ...summary, tools: runtimeTools };
             providerSummaries.push(runtimeSummary);
@@ -13718,24 +16719,23 @@ class ToolService {
                 const execute = resolved.kind === 'module'
                     ? (args, context) => entry.execute(context, args)
                     : (args, context, options) => entry.execute(args, context, options);
-                this._registerHandler(definitions, handlers, definition, { execute, provider: runtimeSummary, reference }, visionEnabled);
+                this._registerHandler(definitions, handlers, definition, { execute, provider: runtimeSummary, reference }, visionEnabled, diffusionEnabled, diffusion, negativePromptEnabled, imageCountOverride, imageEdit);
             }
         }
-
         for (const definition of skillRuntime.definitions) {
             const name = definition.function.name;
-            const runtimeDefinition = projectVisionDefinition(definition, visionEnabled);
-            if (!runtimeDefinition) continue;
+            const visionDefinition = projectVisionDefinition(definition, visionEnabled);
+            const runtimeDefinition = visionDefinition ? projectDiffusionDefinition(visionDefinition, diffusion, negativePromptEnabled, imageCountOverride, imageEdit) : null;
+            if (!runtimeDefinition || (name === 'generate_image' && !diffusionEnabled)) continue;
             if (handlers.has(name)) throw new Error(`Loaded tools cannot use the reserved Darkstar skill function name: ${name}`);
             definitions.push(runtimeDefinition);
             handlers.set(name, { ...skillRuntime.handlers.get(name), definition: runtimeDefinition });
         }
-
         const workspaceRoot = await this._workspaceRoot(runtimeWorkspace);
         const configuredSkillsRoot = skillConfiguration.skillsRoot || skillConfiguration.root;
         return {
-            definitions,
-            handlers,
+            definitions, handlers, diffusion, diffusionEnabled, negativePromptEnabled, imageCountOverride, imageEdit,
+            dynamicVramEnabled: toolConfiguration.dynamicVramEnabled === true,
             executionDisabled: toolConfiguration.executionDisabled === true,
             providers: providerSummaries,
             skills: skillRuntime.skills,
@@ -13790,7 +16790,12 @@ class ToolService {
         const executionOptions = timeoutMs === null ? options : { ...options, timeoutMs };
         let result = await executeToolHandler(handler, name, args, context, executionOptions);
         result = await resolveToolResultAction(result, {
-            offlineBrowser: this.offlineBrowser,
+            offlineBrowser: this.offlineBrowser, diffusionRuntime: this.diffusionRuntime, diffusion: runtime.diffusion,
+            dynamicVramEnabled: runtime.dynamicVramEnabled === true,
+            negativePromptEnabled: runtime.negativePromptEnabled === true,
+            imageCountOverride: normalizeGenerateImageCountOverride(runtime.imageCountOverride),
+            imageEdit: runtime.imageEdit && typeof runtime.imageEdit === 'object' ? structuredClone(runtime.imageEdit) : null,
+            onToolProgress: options.onToolProgress,
             signal: options.signal,
             visionEnabled: options.visionEnabled,
             toolName: name,
@@ -13798,47 +16803,42 @@ class ToolService {
             workspaceRoot: runtime.workspaceRoot,
             attentionService: this.attentionService,
             browserId: runtime.browserId,
-            interactionId: String(options.interactionId || ''),
+            interactionId: String(options.interactionId || ''), imageRegistry: options.imageRegistry,
         });
-        let contextMessages = [], displayResult = result;
+        let contextMessages = [], presentedImageIds = [], displayResult = result;
         if (result && result.__darkstarMultimodal === true) {
-            if (options.visionEnabled !== true) {
-                throw new Error('This tool action requires a multimodal projector so its image can be attached to model context.');
-            }
-            const images = Array.isArray(result.images) ? result.images : [];
-            const imageParts = images.map((image, imageIndex) => {
-                const mimeType = String(image?.mimeType || '').toLowerCase();
-                const base64 = String(image?.base64 || '');
+            const images = registerToolImages(options.imageRegistry, call, Array.isArray(result.images) ? result.images : [], options.taskId);
+            const imageParts = images.map((image) => {
+                const mimeType = image.mimeType;
+                const base64 = image.base64;
                 if (!/^image\/[a-z0-9.+-]+$/u.test(mimeType) || !base64) {
                     throw new Error('The tool returned an invalid image attachment.');
                 }
                 return {
                     type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}` },
-                    _darkstarImageSource: { kind: 'agent-tool-image', id: `${String(options.taskId || 'task')}:${String(call.id || name)}:${imageIndex}` },
+                    _darkstarImageSource: { kind: 'agent-tool-image', id: image.id },
                 };
             });
             if (!imageParts.length) throw new Error('The tool returned no image attachment.');
+            if (options.visionEnabled !== true && result.__darkstarDisplayWithoutVision !== true) throw new Error('This tool action requires a multimodal projector so its image can be attached to model context.');
             const text = String(result.text || 'A tool-generated image is attached for visual inspection.');
-            contextMessages = [{
-                role: 'user',
-                content: [{ type: 'text', text }, ...imageParts],
-            }];
+            const presentationHint = options.showImageAvailable === true ? ' To place an image cleanly in your final response, call show_image with its image_id.' : '';
+            if (options.visionEnabled === true) contextMessages = [{ role: 'user', content: [{ type: 'text', text }, ...imageParts] }];
             displayResult = {
-                text,
-                images: images.map((image) => ({
-                    mimeType: String(image?.mimeType || ''),
-                    name: String(image?.name || ''),
-                    bytes: Math.floor(String(image?.base64 || '').length * 0.75),
-                })),
+                text: text + presentationHint,
+                images: images.map((image) => ({ image_id: image.id, mimeType: image.mimeType, bytes: Math.floor(image.base64.length * 0.75) })),
                 metadata: result.metadata || null,
             };
+        } else if (result && result[PRESENT_IMAGE_MARKER] === true) {
+            presentedImageIds = [String(result.imageId || '')].filter(Boolean);
+            displayResult = { success: true, image_id: presentedImageIds[0], message: String(result.text || 'Image added to the assistant response.') };
         }
         return {
             id: call.id || null,
             name,
             result: serializeToolResult(displayResult),
             rawResult: result,
-            contextMessages,
+            contextMessages, presentedImageIds,
             durationMs: Math.max(0, Date.now() - startedAt),
             displayCommand: formatToolInvocation(name, call.function.arguments, args),
         };
@@ -14625,6 +17625,7 @@ class HybridBrowserService {
         this.visible = false;
         this.overlayBlocked = false;
         this.bounds = { x: 0, y: 0, width: 0, height: 0 };
+        this.internetAccessEnabled = options.internetAccessEnabled !== false;
         this.mainWindow = null;
         this.onlineStatus = {
             mode: 'online', visible: false, loading: false,
@@ -14645,6 +17646,28 @@ class HybridBrowserService {
             window.webContents?.send?.(CHANNELS.OFFLINE_BROWSER_FRAME, { ...frame, browserId: this.browserId });
         });
         this.online.on?.('error-safe', () => undefined);
+    }
+
+    _assertInternetAccess() {
+        if (this.internetAccessEnabled) return;
+        const error = new Error('Internet Access is off. This browser is restricted to local/offline content.');
+        error.code = 'INTERNET_ACCESS_DISABLED';
+        throw error;
+    }
+
+    async setInternetAccess(enabled) {
+        const next = enabled === true;
+        if (this.internetAccessEnabled === next) return this._snapshot();
+        this.internetAccessEnabled = next;
+        if (!next) {
+            this.mode = 'offline';
+            this.activeOnlineWorkspaceId = '';
+            this.onlineStatus = { ...this.onlineStatus, loading: false, error: '' };
+            await this.online.destroy();
+            this._syncVisibility();
+            this._emitStatus();
+        }
+        return this._snapshot();
     }
 
     attachWindow(window) {
@@ -14724,6 +17747,7 @@ class HybridBrowserService {
 
     async openTarget(value, options = {}) {
         if (looksOnline(value)) {
+            this._assertInternetAccess();
             const url = normalizeOnlineUrl(value);
             this.mode = 'online';
             this.activeOnlineWorkspaceId = String(options.workspaceId || 'default');
@@ -14790,6 +17814,13 @@ class HybridBrowserService {
     }
 
     async reset() {
+        if (!this.internetAccessEnabled) {
+            this.mode = 'offline';
+            this.activeOnlineWorkspaceId = '';
+            this._syncVisibility();
+            this._emitStatus();
+            return this._snapshot();
+        }
         this.mode = 'online';
         this.activeOnlineWorkspaceId = '';
         this.onlineStatus = { ...this.onlineStatus, loading: true, error: '' };
@@ -14821,6 +17852,13 @@ class HybridBrowserService {
         const run = async () => {
             const action = String(args.action || '').trim().toLowerCase();
             if (action === 'reset') {
+                if (!this.internetAccessEnabled) {
+                    this.mode = 'offline';
+                    this.activeOnlineWorkspaceId = '';
+                    this._syncVisibility();
+                    this._emitStatus();
+                    return { action: 'reset', status: this._snapshot() };
+                }
                 this.mode = 'online';
                 this.activeOnlineWorkspaceId = String(options.workspaceId || 'default');
                 this._syncVisibility();
@@ -14832,6 +17870,7 @@ class HybridBrowserService {
             }
             const onlineOpen = action === 'open' && Boolean(args.url || looksOnline(args.path));
             if (onlineOpen) {
+                this._assertInternetAccess();
                 const url = normalizeOnlineUrl(args.url || args.path);
                 this.mode = 'online';
                 this.activeOnlineWorkspaceId = String(options.workspaceId || 'default');
@@ -18277,12 +21316,14 @@ class TabbedBrowserService {
                 offlineBrowser: offline,
                 onlineBrowser: online,
                 browserId,
+                internetAccessEnabled: this.internetAccessEnabled,
             });
         this.sessions = new Map();
         this.activeBrowserId = '0';
         this.mainWindow = null;
         this.overlayBlocked = false;
         this.bounds = { x: 0, y: 0, width: 0, height: 0 };
+        this.internetAccessEnabled = options.internetAccessEnabled !== false;
     }
 
     _syncRecord(record) {
@@ -18318,6 +21359,16 @@ class TabbedBrowserService {
             visible: Boolean(record.desiredVisible),
             overlayBlocked: Boolean(this.overlayBlocked),
         };
+    }
+
+    internetAccessSnapshot() {
+        return { enabled: this.internetAccessEnabled === true };
+    }
+
+    async setInternetAccess(enabled) {
+        this.internetAccessEnabled = enabled === true;
+        await Promise.all(Array.from(this.sessions.values(), (record) => record.service.setInternetAccess(this.internetAccessEnabled)));
+        return this.internetAccessSnapshot();
     }
 
     attachWindow(window) {
@@ -21500,11 +24551,14 @@ function registerAppIpc(options = {}) {
     const attention = options.attention || null;
     const permissionPolicy = options.permissionPolicy || null;
     const filesystemAccess = options.filesystemAccess || null;
+    const internetAccess = options.internetAccess || null;
     const Notification = options.Notification || null;
     const platform = String(options.platform || process.platform);
     const getWindow = typeof options.getWindow === 'function' ? options.getWindow : () => null;
     const baseDir = path.resolve(options.baseDir || path.join(__dirname, '..', '..'));
+    const projectBaseDir = path.resolve(options.projectBaseDir || baseDir);
     const workspace = options.workspace || new WorkspaceRegistry();
+    const chatSessionStore = options.chatSessionStore || null;
     if (!ipcMain?.handle) throw new Error('ipcMain is required.');
     if (!dialog?.showOpenDialog) throw new Error('dialog is required.');
 
@@ -21536,6 +24590,10 @@ function registerAppIpc(options = {}) {
     if (filesystemAccess) {
         registerHandledIpc(ipcMain, CHANNELS.FILESYSTEM_ACCESS_GET, async () => ({ success: true, ...filesystemAccess.snapshot() }));
         registerHandledIpc(ipcMain, CHANNELS.FILESYSTEM_ACCESS_SET, async (_event, payload = {}) => ({ success: true, ...filesystemAccess.setLevel(payload.level) }));
+    }
+    if (internetAccess) {
+        registerHandledIpc(ipcMain, CHANNELS.INTERNET_ACCESS_GET, async () => ({ success: true, ...internetAccess.internetAccessSnapshot() }));
+        registerHandledIpc(ipcMain, CHANNELS.INTERNET_ACCESS_SET, async (_event, payload = {}) => ({ success: true, ...(await internetAccess.setInternetAccess(payload.enabled === true)) }));
     }
 
     if (attention) {
@@ -21583,11 +24641,12 @@ function registerAppIpc(options = {}) {
         const entries = workspace.forSession
             ? await workspace.listDirectory(workspaceId, '')
             : await workspace.listDirectory('');
+        chatSessionStore?.rememberProjectRoot?.(root?.path);
         return { success: true, workspaceId, root, entries };
     }, (error) => ({ success: false, error: errorMessage(error), entries: [] }));
 
     registerHandledIpc(ipcMain, CHANNELS.WORKSPACE_LIST_PROJECTS, async () => {
-        const projectsRoot = path.join(baseDir, 'projects');
+        const projectsRoot = path.join(projectBaseDir, 'projects');
         await fs.promises.mkdir(projectsRoot, { recursive: true });
         let entries = await fs.promises.readdir(projectsRoot, { withFileTypes: true });
         let directories = entries.filter((entry) => entry.isDirectory());
@@ -21614,7 +24673,7 @@ function registerAppIpc(options = {}) {
         const workspaceId = normalizeWorkspaceId(payload && payload.workspaceId);
         const requestedName = String(payload && payload.name || 'New Project').trim() || 'New Project';
         const safeBaseName = requestedName.replace(/[<>:"\/\\|?*\u0000-\u001F]/gu, '').replace(/[. ]+$/u, '').trim() || 'New Project';
-        const projectsRoot = path.join(baseDir, 'projects');
+        const projectsRoot = path.join(projectBaseDir, 'projects');
         await fs.promises.mkdir(projectsRoot, { recursive: true });
         const defaultMatch = /^New Project(?: (\d+))?$/u.exec(safeBaseName);
         const defaultOrdinal = defaultMatch ? Math.max(1, Number(defaultMatch[1]) || 1) : 0;
@@ -21643,6 +24702,7 @@ function registerAppIpc(options = {}) {
             const entries = workspace.forSession
                 ? await workspace.listDirectory(workspaceId, '')
                 : await workspace.listDirectory('');
+            chatSessionStore?.rememberProjectRoot?.(root?.path);
             return { success: true, workspaceId, root, entries };
         } catch (error) {
             await fs.promises.rm(projectPath, { recursive: true, force: true }).catch(() => {});
@@ -21655,7 +24715,7 @@ function registerAppIpc(options = {}) {
         const root = workspace.forSession ? workspace.describeRoot(workspaceId) : workspace.describeRoot();
         const requestedRootPath = String(payload && payload.rootPath || '').trim();
         const rootPath = root && root.path ? path.resolve(String(root.path)) : (requestedRootPath ? path.resolve(requestedRootPath) : '');
-        const projectsRoot = path.resolve(baseDir, 'projects');
+        const projectsRoot = path.resolve(projectBaseDir, 'projects');
         const canonicalProjectsRoot = await fs.promises.realpath(projectsRoot).catch((error) => error && error.code === 'ENOENT' ? projectsRoot : Promise.reject(error));
         const canonicalRootPath = rootPath
             ? await fs.promises.realpath(rootPath).catch((error) => error && error.code === 'ENOENT' ? rootPath : Promise.reject(error))
@@ -21671,6 +24731,7 @@ function registerAppIpc(options = {}) {
             managed = Boolean(stat && stat.isDirectory() && !stat.isSymbolicLink());
         }
         if (typeof workspace.release === 'function') workspace.release(workspaceId);
+        chatSessionStore?.forgetProjectRoot?.(canonicalRootPath);
         if (managed) await fs.promises.rm(canonicalRootPath, { recursive: true, force: true });
         return { success: true, workspaceId, managed, deletedDirectory: managed, detachedExternal: Boolean(canonicalRootPath && !managed) };
     }, (error) => ({ success: false, error: errorMessage(error) }));
@@ -21689,6 +24750,7 @@ function registerAppIpc(options = {}) {
         const entries = workspace.forSession
             ? await workspace.listDirectory(workspaceId, '')
             : await workspace.listDirectory('');
+        chatSessionStore?.rememberProjectRoot?.(root?.path);
         return { success: true, canceled: false, workspaceId, root, entries };
     }, (error) => ({ success: false, canceled: false, error: errorMessage(error) }));
 
@@ -21839,6 +24901,7 @@ const CHANNELS = require('../protocol/channels');
 const { completionStopDiagnostics, finiteDiagnosticNumber } = require('../runtime/generation-diagnostics');
 const { listCudaDevices } = require('../runtime/gpu-devices');
 const { ModelDirectoryMonitor } = require('../runtime/models');
+const { validateModelFilePath } = require('../runtime/model-filesystem');
 const { DIALOG_LOCATION_KEYS } = require('../preferences/dialog-location-store');
 const { LOCAL_MODEL_HISTORY_KEYS } = require('../preferences/local-model-history-store');
 const { registerHandledIpc } = require('./error-response');
@@ -21945,6 +25008,12 @@ function publicProjectorRecord(record) {
     return { path: projectorPath, fileName: String(record.fileName || path.basename(projectorPath)) };
 }
 
+function publicDiffusionModelRecord(filePath) {
+    const normalizedPath = String(filePath || '').trim();
+    if (!normalizedPath) return null;
+    return { path: normalizedPath, fileName: path.basename(normalizedPath) };
+}
+
 function publicRuntimeResult(value) {
     const source = value && typeof value === 'object' ? value : {};
     const result = { ...source };
@@ -21979,24 +25048,29 @@ function registerLlamaIpc(options = {}) {
         const relative = path.relative(path.resolve(runtime.modelsDir), path.resolve(String(filePath || '')));
         return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
     };
-    const rememberedModels = () => (localHistory?.list(LOCAL_MODEL_HISTORY_KEYS.MODELS) || []).flatMap((filePath) => {
-        if (isInsideModelsDirectory(filePath)) return [];
-        try { const model = runtime.inspectModel(filePath); return [{ ...model, id: model.path, displayName: `${path.basename(model.path)}  ·  Local file` }]; }
-        catch (_error) { return []; }
-    });
+    const rememberedModelPaths = () => (localHistory?.list(LOCAL_MODEL_HISTORY_KEYS.MODELS) || [])
+        .filter((filePath) => !isInsideModelsDirectory(filePath));
+    const rememberedModels = async () => (await runtime.inspectModelFilesAsync(rememberedModelPaths()))
+        .map((model) => ({ ...model, id: model.path, displayName: `${path.basename(model.path)}  ·  Local file` }));
     const rememberedProjectors = () => (localHistory?.list(LOCAL_MODEL_HISTORY_KEYS.PROJECTORS) || []).flatMap((filePath) => {
         try { const projector = runtime.inspectProjector(filePath); return projector?.path ? [projector] : []; }
         catch (_error) { return []; }
     });
+    const rememberedDiffusionModels = () => (localHistory?.list(LOCAL_MODEL_HISTORY_KEYS.DIFFUSION_MODELS) || []).flatMap((filePath) => {
+        try { return [publicDiffusionModelRecord(validateModelFilePath(filePath))]; }
+        catch (_error) { return []; }
+    });
     const pruneHistory = () => {
-        localHistory?.prune(LOCAL_MODEL_HISTORY_KEYS.MODELS, (filePath) => runtime.inspectModel(filePath).path);
+        localHistory?.prune(LOCAL_MODEL_HISTORY_KEYS.MODELS, validateModelFilePath);
+        localHistory?.prune(LOCAL_MODEL_HISTORY_KEYS.DIFFUSION_MODELS, validateModelFilePath);
         localHistory?.prune(LOCAL_MODEL_HISTORY_KEYS.PROJECTORS, (filePath) => runtime.inspectProjector(filePath).path);
     };
-    const allModels = () => [...runtime.listLocalModels(), ...rememberedModels()];
+    const allModels = async () => [...await runtime.listLocalModelsAsync(), ...await rememberedModels()];
     const modelWatchPaths = () => [runtime.modelsDir, ...(localHistory?.list(LOCAL_MODEL_HISTORY_KEYS.MODELS) || []).map((filePath) => path.dirname(filePath))];
     const projectorWatchPaths = () => (localHistory?.list(LOCAL_MODEL_HISTORY_KEYS.PROJECTORS) || []).map((filePath) => path.dirname(filePath));
-    const publishInventory = () => send(getWindow, CHANNELS.MODELS_CHANGED, {
-        models: allModels().map(publicModelRecord).filter(Boolean),
+    const publishInventory = async () => send(getWindow, CHANNELS.MODELS_CHANGED, {
+        models: (await allModels()).map(publicModelRecord).filter(Boolean),
+        diffusionModels: rememberedDiffusionModels(),
         projectors: rememberedProjectors().map(publicProjectorRecord).filter(Boolean),
     });
     let modelDirectoryMonitor;
@@ -22006,12 +25080,16 @@ function registerLlamaIpc(options = {}) {
         projectorDirectoryMonitor?.setWatchPaths(projectorWatchPaths());
     };
     const settleMonitor = async (monitor) => { await monitor?.scanOnce(); await monitor?.scanOnce(); };
-    const rememberModel = async (modelPath) => {
-        if (!localHistory) return;
-        const model = runtime.inspectModel(modelPath);
+    const rememberInspectedModel = async (model) => {
+        if (!localHistory || !model || !model.path) return;
         if (!isInsideModelsDirectory(model.path)) localHistory.remember(LOCAL_MODEL_HISTORY_KEYS.MODELS, model.path);
         refreshMonitorPaths();
         await settleMonitor(modelDirectoryMonitor);
+    };
+    const rememberModel = async (modelPath) => {
+        const model = await runtime.inspectModelAsync(modelPath);
+        await rememberInspectedModel(model);
+        return model;
     };
     const rememberProjector = async (projectorPath) => {
         if (!localHistory || !projectorPath) return;
@@ -22021,18 +25099,25 @@ function registerLlamaIpc(options = {}) {
         refreshMonitorPaths();
         await settleMonitor(projectorDirectoryMonitor);
     };
+    const rememberDiffusionModel = (filePath) => {
+        if (!localHistory || !filePath) return '';
+        const selectedPath = validateModelFilePath(filePath);
+        const remembered = localHistory.remember(LOCAL_MODEL_HISTORY_KEYS.DIFFUSION_MODELS, selectedPath);
+        void publishInventory();
+        return remembered;
+    };
     modelDirectoryMonitor = new ModelDirectoryMonitor({
         watchPaths: modelWatchPaths(),
         ...(options.modelMonitorOptions || {}),
         listModels: allModels,
-        onChange() { pruneHistory(); refreshMonitorPaths(); publishInventory(); },
+        async onChange() { pruneHistory(); refreshMonitorPaths(); await publishInventory(); },
         log: typeof runtime.log === 'function' ? runtime.log : undefined,
     }).start();
     projectorDirectoryMonitor = new ModelDirectoryMonitor({
         watchPaths: projectorWatchPaths(),
         ...(options.modelMonitorOptions || {}),
         listModels: () => rememberedProjectors().map((projector) => ({ ...projector, id: projector.path })),
-        onChange() { pruneHistory(); refreshMonitorPaths(); publishInventory(); },
+        async onChange() { pruneHistory(); refreshMonitorPaths(); await publishInventory(); },
         log: typeof runtime.log === 'function' ? runtime.log : undefined,
     });
     if (projectorWatchPaths().length) projectorDirectoryMonitor.start();
@@ -22047,14 +25132,15 @@ function registerLlamaIpc(options = {}) {
         refreshMonitorPaths();
         return {
             success: true,
-            models: allModels().map(publicModelRecord).filter(Boolean),
+            models: (await allModels()).map(publicModelRecord).filter(Boolean),
+            diffusionModels: rememberedDiffusionModels(),
             projectors: rememberedProjectors().map(publicProjectorRecord).filter(Boolean),
         };
     }, (error) => ({ success: false, models: [], projectors: [], ...errorPayload(error) }));
     registerHandledIpc(ipcMain, CHANNELS.MODEL_FILES_BROWSE, async (_event, request = {}) => {
-        const kind = ['projector', 'tool', 'skill', 'image'].includes(request.kind) ? request.kind : 'model';
+        const kind = ['diffusion', 'projector', 'tool', 'skill', 'image'].includes(request.kind) ? request.kind : 'model';
         const locationKey = {
-            model: DIALOG_LOCATION_KEYS.MODELS, projector: DIALOG_LOCATION_KEYS.PROJECTORS,
+            model: DIALOG_LOCATION_KEYS.MODELS, diffusion: DIALOG_LOCATION_KEYS.DIFFUSION_MODELS, projector: DIALOG_LOCATION_KEYS.PROJECTORS,
             tool: DIALOG_LOCATION_KEYS.TOOLS, skill: DIALOG_LOCATION_KEYS.SKILLS, image: DIALOG_LOCATION_KEYS.IMAGES,
         }[kind];
         const defaults = options.localFileBrowserDefaults || {};
@@ -22062,17 +25148,28 @@ function registerLlamaIpc(options = {}) {
         const defaultPath = options.dialogLocations?.getDirectory(locationKey, fallback) || fallback;
         const result = runtime.browseModelFiles({ ...request, kind }, { specialPaths: options.modelFileBrowserPaths || {}, defaultPath });
         if (result.currentPath) options.dialogLocations?.rememberDirectory(locationKey, result.currentPath);
+        if (kind === 'diffusion' && result.selectedPath) rememberDiffusionModel(result.selectedPath);
         if (kind === 'projector' && result.selectedPath) await rememberProjector(result.selectedPath);
         return { success: true, ...result };
     }, (error) => ({ success: false, currentPath: '', displayPath: '', parentPath: null, sidebar: [], entries: [], ...errorPayload(error) }));
     registerHandledIpc(ipcMain, CHANNELS.MODEL_INSPECT, async (_event, modelId) => {
-        const model = runtime.inspectModel(modelId);
-        await rememberModel(model.path);
-        return { success: true, model: publicModelRecord({ ...model, id: model.path, displayName: `${path.basename(model.path)}  ·  Local file` }) };
+        const requested = String(modelId || '').trim();
+        const model = await runtime.inspectModelAsync(requested);
+        if (!model) throw new Error('Selected GGUF model is unavailable.');
+        await rememberInspectedModel(model);
+        const directFile = path.isAbsolute(requested);
+        return { success: true, model: publicModelRecord({
+            ...model,
+            id: directFile ? model.path : requested,
+            displayName: directFile ? `${path.basename(model.path)}  ·  Local file` : (model.displayName || requested),
+        }) };
     }, (error) => ({ success: false, model: null, ...errorPayload(error) }));
     registerHandledIpc(ipcMain, CHANNELS.LIST_GPUS, async () => ({
         success: true, ...(await listCudaDevices()),
     }), (error) => ({ success: false, available: false, devices: [], ...errorPayload(error) }));
+    registerHandledIpc(ipcMain, CHANNELS.LIST_DIFFUSION_DEVICES, async () => ({
+        success: true, ...(await options.diffusionRuntime?.listDevices?.() || { available: false, devices: [], autoDeviceId: '', autoDeviceLabel: '', error: 'Diffusion runtime is unavailable.' }),
+    }), (error) => ({ success: false, available: false, devices: [], autoDeviceId: '', autoDeviceLabel: '', ...errorPayload(error) }));
     registerHandledIpc(ipcMain, CHANNELS.START_SERVER, async (_event, config) => ({
         success: true, ...publicRuntimeResult(await runtime.startServer(config || {})),
     }), (error) => ({ success: false, ...errorPayload(error) }));
@@ -22343,6 +25440,7 @@ const CHANNELS = Object.freeze({
     WORKFLOW_LIST: PROTOCOL.WORKFLOW_LIST,
     WORKFLOW_SESSION_LOAD: PROTOCOL.WORKFLOW_SESSION_LOAD,
     WORKFLOW_SESSION_SAVE: PROTOCOL.WORKFLOW_SESSION_SAVE,
+    WORKFLOW_SESSION_PATCH: PROTOCOL.WORKFLOW_SESSION_PATCH,
     WORKFLOW_SESSION_SAVE_SYNC: PROTOCOL.WORKFLOW_SESSION_SAVE_SYNC,
     APP_SET_THEME: PROTOCOL.APP_SET_THEME,
     PROJECTOR_DETECT: PROTOCOL.PROJECTOR_DETECT,
@@ -22352,7 +25450,7 @@ const CHANNELS = Object.freeze({
     COUNT_AGENT_INPUT_TOKENS: PROTOCOL.COUNT_AGENT_INPUT_TOKENS,
 });
 
-function registerUiIpc({ ipcMain, dialog, getWindow, runtime, dialogLocations = null, workflowDirectory = '', workflowSessionStore = null }) {
+function registerUiIpc({ ipcMain, dialog, getWindow, runtime, dialogLocations = null, workflowDirectory = '', workflowSessionStore = null, themePreferenceStore = null }) {
     const canceledFailure = (error) => ({ success: false, canceled: false, error: errorMessage(error) });
     registerHandledIpc(ipcMain, CHANNELS.WORKFLOW_LIST, async () => ({
         success: true,
@@ -22360,8 +25458,11 @@ function registerUiIpc({ ipcMain, dialog, getWindow, runtime, dialogLocations = 
     }), (error) => ({ success: false, files: [], error: errorMessage(error) }));
     registerHandledIpc(ipcMain, CHANNELS.WORKFLOW_SAVE, async (_event, payload = {}) =>
         saveWorkflow({ payload, defaultDirectory: workflowDirectory }), canceledFailure);
-    registerHandledIpc(ipcMain, CHANNELS.WORKFLOW_LOAD, async (_event, payload = {}) =>
-        loadWorkflow({ payload, defaultDirectory: workflowDirectory }), canceledFailure);
+    registerHandledIpc(ipcMain, CHANNELS.WORKFLOW_LOAD, async (_event, payload = {}) => {
+        const result = await loadWorkflow({ payload, defaultDirectory: workflowDirectory });
+        if (result?.success === true && result.snapshot && workflowSessionStore?.adoptSnapshot) workflowSessionStore.adoptSnapshot(result.snapshot);
+        return result;
+    }, canceledFailure);
 
     registerHandledIpc(ipcMain, CHANNELS.WORKFLOW_SESSION_LOAD, async () => {
         if (!workflowSessionStore) return { success: true, found: false };
@@ -22371,8 +25472,14 @@ function registerUiIpc({ ipcMain, dialog, getWindow, runtime, dialogLocations = 
 
     registerHandledIpc(ipcMain, CHANNELS.WORKFLOW_SESSION_SAVE, async (_event, payload = {}) => {
         if (!workflowSessionStore) throw new Error('Workflow session persistence is unavailable in this build.');
-        const result = workflowSessionStore.save(payload.snapshot);
+        const result = await workflowSessionStore.saveAsync(payload.snapshot);
         return { success: true, bytes: result.bytes };
+    });
+
+    registerHandledIpc(ipcMain, CHANNELS.WORKFLOW_SESSION_PATCH, async (_event, payload = {}) => {
+        if (!workflowSessionStore) throw new Error('Workflow session persistence is unavailable in this build.');
+        const result = await workflowSessionStore.patchNodesAsync(payload.nodes);
+        return { success: true, bytes: result.bytes, needsSnapshot: result.needsSnapshot === true };
     });
 
     ipcMain.on(CHANNELS.WORKFLOW_SESSION_SAVE_SYNC, (event, payload = {}) => {
@@ -22403,15 +25510,15 @@ function registerUiIpc({ ipcMain, dialog, getWindow, runtime, dialogLocations = 
 
     registerHandledIpc(ipcMain, CHANNELS.PROJECTOR_DETECT, async (_event, modelId) => {
         if (!runtime || typeof runtime.detectProjector !== 'function') throw new Error('Projector detection is unavailable in this build.');
-        return { success: true, ...runtime.detectProjector(modelId) };
+        return { success: true, ...await runtime.detectProjector(modelId) };
     }, (error) => ({ success: false, error: errorMessage(error), projectorPath: null, projectors: [], detected: false }));
 
-    // Compatibility endpoint for older preload builds. The current Load Model (GGUF)
+    // Compatibility endpoint for older preload builds. The current Invoke Language Model (GGUF)
     // node uses Darkstar's renderer-side filesystem browser instead of this native picker.
     registerHandledIpc(ipcMain, CHANNELS.PROJECTOR_CHOOSE, async (_event, payload = {}) => {
         let defaultPath = payload.defaultPath ? String(payload.defaultPath) : '';
         if (!defaultPath && payload.modelId && runtime?.detectProjector) {
-            const detection = runtime.detectProjector(payload.modelId);
+            const detection = await runtime.detectProjector(payload.modelId);
             if (detection?.modelPath) defaultPath = path.dirname(detection.modelPath);
         }
         const result = await dialog.showOpenDialog(getWindow(), {
@@ -22429,10 +25536,11 @@ function registerUiIpc({ ipcMain, dialog, getWindow, runtime, dialogLocations = 
         return { success: true, canceled: false, projector: runtime.inspectProjector(filePath) };
     }, canceledFailure);
 
-    ipcMain.handle(CHANNELS.APP_SET_THEME, async (_event, theme) => ({
-        success: true,
-        theme: applyWindowTheme(getWindow(), theme),
-    }));
+    ipcMain.handle(CHANNELS.APP_SET_THEME, async (_event, theme) => {
+        const normalized = applyWindowTheme(getWindow(), theme);
+        const persistedTheme = themePreferenceStore?.save ? themePreferenceStore.save(normalized) : normalized;
+        return { success: true, theme: persistedTheme };
+    });
 
     return CHANNELS;
 }
@@ -23449,7 +26557,7 @@ async function streamOpenAi(response, handlers) {
         }
         if (Array.isArray(delta.tool_calls)) {
             mergeToolCallDelta(toolCalls, delta.tool_calls);
-            handlers.onToolCallDelta?.({ calls: snapshotToolCalls(toolCalls) });
+            handlers.onToolCallDelta?.({ calls: toolCalls });
         }
         if (choice.finish_reason) finishReason = cleanText(choice.finish_reason);
     }, { missingBodyMessage: 'The API response did not provide a readable streaming body.' });
@@ -23485,7 +26593,7 @@ async function streamAnthropic(response, handlers) {
             if (block.type === 'tool_use') {
                 const initialArguments = block.input && plainObject(block.input) && Object.keys(block.input).length ? JSON.stringify(block.input) : '';
                 mergeToolCallDelta(toolCalls, [{ index, id: cleanText(block.id), type: 'function', function: { name: cleanText(block.name), arguments: initialArguments } }]);
-                if (initialArguments) handlers.onToolCallDelta?.({ calls: snapshotToolCalls(toolCalls) });
+                if (initialArguments) handlers.onToolCallDelta?.({ calls: toolCalls });
             }
             if (block.type === 'text' && block.text) {
                 text += String(block.text);
@@ -23511,7 +26619,7 @@ async function streamAnthropic(response, handlers) {
             }
             if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
                 mergeToolCallDelta(toolCalls, [{ index, function: { arguments: delta.partial_json } }]);
-                handlers.onToolCallDelta?.({ calls: snapshotToolCalls(toolCalls) });
+                handlers.onToolCallDelta?.({ calls: toolCalls });
             }
             blocks.set(index, block);
         }
@@ -23598,7 +26706,7 @@ async function generate(context, payload = {}) {
     const requestId = cleanText(payload.requestId);
     if (!requestId) throw new Error('API generation requires a requestId.');
     const descriptor = plainObject(payload.model) ? structuredClone(payload.model) : descriptorFor(payload.config || {});
-    if (descriptor.apiPlugin !== 'com.darkstar.api-model' || descriptor.remote !== true) throw new Error('Autoregressive Sampler (API) requires a Load Model (API) descriptor.');
+    if (descriptor.apiPlugin !== 'com.darkstar.api-model' || descriptor.remote !== true) throw new Error('Autoregressive Sampler (API) requires an Invoke Language Model (API) descriptor.');
     const config = plainObject(payload.config) ? payload.config : {};
     const sampler = plainObject(payload.sampler) ? payload.sampler : {};
     const controller = new AbortController();
@@ -23721,6 +26829,8 @@ const destination = path.join(root, 'dist', 'Darkstar-win32-x64');
 const appDestination = path.join(destination, 'resources', 'app');
 const llamaBackendRoot = path.join(root, 'backend', 'bin', 'backends');
 const llamaServers = ['cpu', 'vulkan', 'cuda'].map((backend) => ({ backend, path: path.join(llamaBackendRoot, backend, 'llama-server.exe') }));
+const diffusionRuntimeRoot = path.join(root, 'backend', 'bin', 'diffusion');
+const diffusionEngines = ['cpu', 'vulkan'].map((backend) => ({ backend, path: path.join(diffusionRuntimeRoot, backend, 'sd-cli.exe') }));
 const sourcePackagePath = shellFile(root, 'package.json');
 
 function copyEntry(source, target) {
@@ -23764,7 +26874,7 @@ function validateBundledDependencies() {
     for (const entry of llamaServers) {
         try {
             const stat = fs.statSync(entry.path);
-            if (!stat.isFile() || stat.size < 1024 * 1024) throw new Error('invalid executable');
+            if (!stat.isFile() || stat.size <= 0) throw new Error('invalid executable');
         } catch (_error) {
             throw new Error(
                 `Bundled llama.cpp ${entry.backend} server is missing or incomplete at ${entry.path}. `
@@ -23772,7 +26882,18 @@ function validateBundledDependencies() {
             );
         }
     }
-    return auditRuntimeLicenses({ root, requireLlama: true });
+    for (const entry of diffusionEngines) {
+        try {
+            const stat = fs.statSync(entry.path);
+            if (!stat.isFile() || stat.size <= 0) throw new Error('invalid executable');
+        } catch (_error) {
+            throw new Error(
+                `Bundled stable-diffusion.cpp ${entry.backend} engine is missing or incomplete at ${entry.path}. `
+                + 'The offline builder will not download or install it. Materialize the complete pinned CPU/Vulkan bundle under backend/bin/diffusion/.',
+            );
+        }
+    }
+    return auditRuntimeLicenses({ root, requireLlama: true, requireDiffusion: true });
 }
 
 function writeReleaseLegalFiles(runtimeLicenseManifest) {
@@ -23781,7 +26902,7 @@ function writeReleaseLegalFiles(runtimeLicenseManifest) {
         path.join(destination, 'THIRD_PARTY_RUNTIME_MANIFEST.json'),
         path.join(appDestination, 'THIRD_PARTY_RUNTIME_MANIFEST.json'),
     ]) fs.writeFileSync(target, manifestText, 'utf8');
-    for (const file of ['LICENSE']) {
+    for (const file of ['LICENSE.md']) {
         copyEntry(path.join(root, file), path.join(destination, file));
     }
     const runtimeNotices = path.join(root, 'backend', 'bin', 'licenses');
@@ -23841,6 +26962,7 @@ const lineBudgets = new Map([
     ['backend/renderer/workspace.js', 990],
     ['backend/renderer/commands.js', 820],
     ['backend/renderer/chat-session.js', 700],
+    ['backend/renderer/chat-session-snapshot.js', 170],
     ['backend/renderer/offline-browser.js', 690],
     ['backend/renderer/workflow.js', 670],
     ['backend/renderer/projects.js', 580],
@@ -23849,6 +26971,7 @@ const lineBudgets = new Map([
     ['backend/renderer/message-markup.js', 140],
     ['backend/renderer/core-utils.js', 80],
     ['backend/renderer/image-data.js', 90],
+    ['backend/renderer/generation-stream-surface.js', 150],
     ['backend/renderer/generation-ui.js', 340],
     ['backend/browser/offline-browser-service.js', 1820],
     ['backend/browser/online-browser-host.js', 800],
@@ -24320,7 +27443,6 @@ console.log(`Wrote ${records.length} entries to ${path.basename(outputPath)}.`);
 __darkstarDefineModule("backend/release/runtime-license-audit.js", function darkstarModule(module, exports, require, __filename, __dirname) {
 // <DARKSTAR_SOURCE_BEGIN path="backend/release/runtime-license-audit.js">
 'use strict';
-
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -24425,7 +27547,7 @@ function cudaMajorFromFilename(relativePath) {
 
 function auditRuntimeLicenses(options = {}) {
     const root = path.resolve(options.root || DEFAULT_ROOT);
-    const requireLlama = options.requireLlama === true;
+    const requireLlama = options.requireLlama === true, requireDiffusion = options.requireDiffusion === true;
     const { policy, policyPath } = readPolicy(root);
     const failures = [];
     const manifest = {
@@ -24504,6 +27626,12 @@ function auditRuntimeLicenses(options = {}) {
         failures.push(`Release build requires a llama-server executable under ${runtimeRoot}.`);
     }
     if (llama && !hasLlamaServer) failures.push('llama.cpp runtime files are present but no llama-server.exe is present.');
+
+    const diffusion = grouped.get('stable-diffusion.cpp'), hasDiffusionCli = runtimeFiles.some((file) => /(?:^|\/)sd-cli\.exe$/iu.test(normalized(file)));
+    const diffusionBackends = policy.backendBin?.diffusionBootstrap?.bundleVersion === 1 ? ['cpu', 'vulkan'] : [];
+    if (requireDiffusion && diffusionBackends.length) for (const backend of diffusionBackends) {
+        const expected = `diffusion/${backend}/sd-cli.exe`; if (!runtimeFiles.some((file) => normalized(file).toLowerCase() === expected)) failures.push(`Release build requires ${runtimeRoot}/${expected}.`);
+    } else if (requireDiffusion && !hasDiffusionCli) failures.push(`Release build requires an sd-cli executable under ${runtimeRoot}/diffusion/.`); if (diffusion && !hasDiffusionCli) failures.push('stable-diffusion.cpp runtime files are present but no sd-cli.exe is present.');
 
     for (const [id, group] of Array.from(grouped.entries()).sort(([left], [right]) => left.localeCompare(right))) {
         const component = group.component;
@@ -24626,6 +27754,23 @@ const expectedLlamaPin = {
         },
     ],
 };
+const expectedDiffusionPin = {
+    bundleVersion: 1,
+    releaseTag: 'master-830-50d6405',
+    commit: '50d6405',
+    backends: {
+        cpu: [{
+            asset: 'sd-master-50d6405-bin-win-cpu-x64.zip',
+            url: 'https://github.com/leejet/stable-diffusion.cpp/releases/download/master-830-50d6405/sd-master-50d6405-bin-win-cpu-x64.zip',
+            sha256: 'a51eaf6b5e779142ef58a0a983fd629589d6a8e76ce2779ed12721c9686b26ce',
+        }],
+        vulkan: [{
+            asset: 'sd-master-50d6405-bin-win-vulkan-x64.zip',
+            url: 'https://github.com/leejet/stable-diffusion.cpp/releases/download/master-830-50d6405/sd-master-50d6405-bin-win-vulkan-x64.zip',
+            sha256: '633771a830ad3e7e6ca5b602acc4d57fe44fc13a09a5f79bfeb38e7f58af98f9',
+        }],
+    },
+};
 
 function fail(message) { failures.push(message); }
 
@@ -24636,9 +27781,9 @@ for (const [name, command] of Object.entries(packageJson.scripts || {})) {
     if (/\bnpx\b|\bnpm\s+(?:i|install|ci)\b/iu.test(command)) fail(`Script ${name} may install dependencies: ${command}`);
 }
 
-if (!/bootstrap-python\.ps1/iu.test(batchLauncher)) fail('Launch_Darkstar.bat must invoke the pinned Python bootstrap when Python 3.11 x64 is absent.');
-if (!/bootstrap-electron\.ps1/iu.test(batchLauncher)) fail('Launch_Darkstar.bat must invoke the pinned Electron bootstrap when the runtime is absent.');
-if (!/bootstrap-llamacpp\.ps1/iu.test(batchLauncher)) fail('Launch_Darkstar.bat must invoke the pinned llama.cpp bootstrap when the runtime is absent.');
+for (const marker of ['bootstrap-python.ps1', 'bootstrap-electron.ps1', 'bootstrap-llamacpp.ps1', 'backend\\vendor\\electron\\win32-x64\\electron.exe', 'backend\\shell']) {
+    if (!batchLauncher.includes(marker)) fail(`Launch_Darkstar.bat is missing required direct-launch marker: ${marker}`);
+}
 if (!String(packageJson.scripts?.start || '').includes('npm run bootstrap-python')) fail('npm start must verify the Python 3.11 prerequisite.');
 if (!String(packageJson.scripts?.build || '').includes('npm run bootstrap-python')) fail('npm run build must verify the Python 3.11 prerequisite.');
 if (!String(packageJson.scripts?.start || '').includes('npm run bootstrap-llamacpp')) fail('npm start must bootstrap the pinned llama.cpp runtime.');
@@ -24715,6 +27860,32 @@ for (const marker of ['backend/runtime-component-policy.json', 'Get-FileHash', '
 if (/http:\/\//iu.test(llamaBootstrap) || /MIRROR|LATEST|releases\/latest/iu.test(llamaBootstrap)) fail('llama.cpp bootstrap must not use plaintext HTTP, mirrors, or latest-version discovery.');
 if (/autoupdater|checkforupdates|electron-updater/iu.test(llamaBootstrap)) fail('llama.cpp bootstrap must never become an application update checker.');
 
+const diffusionPin = runtimePolicy.backendBin?.diffusionBootstrap || {};
+for (const key of ['bundleVersion', 'releaseTag', 'commit']) {
+    if (String(diffusionPin[key] ?? '') !== String(expectedDiffusionPin[key])) fail(`stable-diffusion.cpp bootstrap ${key} pin is missing or incorrect.`);
+}
+for (const backendName of ['cpu', 'vulkan']) {
+    const actual = Array.isArray(diffusionPin.backends?.[backendName]?.archives) ? diffusionPin.backends[backendName].archives : [];
+    const expected = expectedDiffusionPin.backends[backendName];
+    if (actual.length !== expected.length) {
+        fail(`stable-diffusion.cpp bootstrap ${backendName} backend must contain exactly ${expected.length} pinned release archive(s).`);
+        continue;
+    }
+    expected.forEach((entry, index) => {
+        for (const key of ['asset', 'url', 'sha256']) {
+            if (String(actual[index]?.[key] || '').toLowerCase() !== String(entry[key]).toLowerCase()) {
+                fail(`stable-diffusion.cpp bootstrap ${backendName}[${index}].${key} pin is missing or incorrect.`);
+            }
+        }
+        if (!String(actual[index]?.url || '').startsWith('https://github.com/leejet/stable-diffusion.cpp/releases/download/')) {
+            fail(`stable-diffusion.cpp bootstrap ${backendName}[${index}] must use the pinned upstream GitHub release host.`);
+        }
+    });
+}
+for (const marker of ['DiffusionBootstrap', 'Get-DiffusionBackendValidationIssues', 'Test-DiffusionBackend', 'Test-DiffusionRuntime', 'Ensure-DiffusionRuntime', 'stable-diffusion.cpp-LICENSE', 'stable-diffusion.cpp-ggml-LICENSE']) {
+    if (!llamaBootstrap.includes(marker)) fail(`stable-diffusion.cpp bootstrap is missing required integrity/validation marker: ${marker}`);
+}
+
 const productionFiles = [];
 function walk(directory) {
     for (const entry of sourceFs.readdirSync(directory, { withFileTypes: true })) {
@@ -24738,7 +27909,7 @@ if (failures.length) {
     for (const failure of failures) console.error(`NETWORK BOUNDARY ERROR: ${failure}`);
     process.exit(1);
 }
-console.log('Network boundary audit passed: source-checkout provisioning is limited to the pinned Python 3.11.9 x64 installer, Electron 43.2.0, and llama.cpp b10645 CPU/Vulkan/CUDA 12.4 assets; runtime/update paths remain offline.');
+console.log('Network boundary audit passed: source-checkout provisioning is limited to pinned Python 3.11.9 x64, Electron 43.2.0, llama.cpp b10645 CPU/Vulkan/CUDA 12.4, and stable-diffusion.cpp master-830-50d6405 CPU/Vulkan assets; runtime/update paths remain offline.');
 // <DARKSTAR_SOURCE_END path="backend/scripts/offline-audit.js">
 });
 // MODULE :: backend/scripts/privacy-audit.js
@@ -24802,7 +27973,7 @@ function inspectString(value, location) {
         const emailPattern = /\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/gu;
         for (const match of text.matchAll(emailPattern)) {
             const domain = String(match[1] || '').toLowerCase();
-            if (!(match[0].toLowerCase() === ['smsterling', 'protonmail.com'].join('@') && /^README\.md$/u.test(location)) && !['example.com', 'example.org', 'example.net'].includes(domain)) {
+            if (!(match[0].toLowerCase() === ['smsterling', 'protonmail.com'].join('@') && /^(?:README|LICENSE)\.md$/u.test(location)) && !['example.com', 'example.org', 'example.net'].includes(domain)) {
                 fail(`${location} contains an email address (${match[0]}).`);
             }
         }
@@ -25512,19 +28683,21 @@ function verifyRelativeRequires() {
 
 
 function verifyRendererAssets() {
-    const htmlPath = shellFile(root, 'index.html');
-    const html = sourceFs.readFileSync(htmlPath, 'utf8');
     const referencePattern = /\b(?:src|href)=["']([^"']+)["']/gu;
-    for (const match of html.matchAll(referencePattern)) {
-        const reference = String(match[1] || '').trim();
-        if (!reference || reference.startsWith('#') || /^(?:data:|https?:|file:|mailto:)/iu.test(reference)) continue;
-        const cleanReference = reference.split(/[?#]/u, 1)[0];
-        const assetPath = path.resolve(path.dirname(htmlPath), cleanReference);
-        const relativeAsset = path.relative(root, assetPath);
-        if (relativeAsset.startsWith('..') || path.isAbsolute(relativeAsset)) {
-            fail(`index.html references an asset outside the application root: ${reference}`);
-        } else if (!sourceFs.existsSync(assetPath) || !sourceFs.statSync(assetPath).isFile()) {
-            fail(`index.html references a missing local asset: ${reference}`);
+    for (const shellName of ['index.html']) {
+        const htmlPath = shellFile(root, shellName);
+        const html = sourceFs.readFileSync(htmlPath, 'utf8');
+        for (const match of html.matchAll(referencePattern)) {
+            const reference = String(match[1] || '').trim();
+            if (!reference || reference.startsWith('#') || /^(?:data:|https?:|file:|mailto:)/iu.test(reference)) continue;
+            const cleanReference = reference.split(/[?#]/u, 1)[0];
+            const assetPath = path.resolve(path.dirname(htmlPath), cleanReference);
+            const relativeAsset = path.relative(root, assetPath);
+            if (relativeAsset.startsWith('..') || path.isAbsolute(relativeAsset)) {
+                fail(`${shellName} references an asset outside the application root: ${reference}`);
+            } else if (!sourceFs.existsSync(assetPath) || !sourceFs.statSync(assetPath).isFile()) {
+                fail(`${shellName} references a missing local asset: ${reference}`);
+            }
         }
     }
 }

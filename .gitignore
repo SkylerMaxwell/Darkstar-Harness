@@ -180,3 +180,10 @@ $RECYCLE.BIN/
 .zsh_history
 .python_history
 .node_repl_history
+
+# Compiled-core release staging
+/.darkstar-build/
+/binary/
+
+# Portable single-EXE release output
+/portable-release/

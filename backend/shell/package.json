@@ -34,7 +34,7 @@
       "agent_assets/",
       "workflows/",
       "README.md",
-      "LICENSE"
+      "LICENSE.md"
     ],
     "asarUnpack": [
       "agent_assets/tools/**",

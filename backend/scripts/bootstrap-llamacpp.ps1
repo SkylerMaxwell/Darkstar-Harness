@@ -27,6 +27,27 @@ $BackendPins = $Bootstrap.backends
 $NoticeDownloads = @($Bootstrap.noticeDownloads)
 $BackendOrder = @('cpu', 'vulkan', 'cuda')
 
+$DiffusionBootstrap = $Policy.backendBin.diffusionBootstrap
+if ($null -eq $DiffusionBootstrap) { throw 'backend/runtime-component-policy.json does not define backendBin.diffusionBootstrap.' }
+$DiffusionBundleVersion = [int]$DiffusionBootstrap.bundleVersion
+$DiffusionReleaseTag = [string]$DiffusionBootstrap.releaseTag
+$DiffusionCommit = [string]$DiffusionBootstrap.commit
+$DiffusionBackendPins = $DiffusionBootstrap.backends
+$DiffusionBackendOrder = @('cpu', 'vulkan')
+$DiffusionDestination = Join-Path $Destination 'diffusion'
+$DiffusionReceiptPath = Join-Path $Destination '.darkstar-diffusion-bootstrap.json'
+$DiffusionCacheDirectory = Join-Path $Root ('.darkstar-runtime\diffusion-cache\{0}' -f $DiffusionReleaseTag)
+$DiffusionStagingParent = Join-Path $Root '.darkstar-runtime\diffusion-staging'
+
+if ($DiffusionBundleVersion -ne 1) { throw 'The stable-diffusion.cpp bootstrap bundle schema must be version 1.' }
+if ([string]::IsNullOrWhiteSpace($DiffusionReleaseTag) -or [string]::IsNullOrWhiteSpace($DiffusionCommit)) {
+    throw 'The stable-diffusion.cpp bootstrap pin is incomplete.'
+}
+foreach ($BackendName in $DiffusionBackendOrder) {
+    if ($null -eq $DiffusionBackendPins.$BackendName) { throw "The stable-diffusion.cpp bootstrap is missing the $BackendName backend pin." }
+    if (@($DiffusionBackendPins.$BackendName.archives).Count -ne 1) { throw "The stable-diffusion.cpp $BackendName backend must define exactly one pinned release archive." }
+}
+
 if ($BundleVersion -ne 2) { throw 'The llama.cpp bootstrap bundle schema must be version 2.' }
 if ([string]::IsNullOrWhiteSpace($LlamaBuild) -or [string]::IsNullOrWhiteSpace($LlamaCommit) -or [string]::IsNullOrWhiteSpace($CudaRelease)) {
     throw 'The llama.cpp bootstrap pin is incomplete.'
@@ -109,7 +130,7 @@ function Get-VerifiedDownload($Asset, [string[]]$AllowedHosts) {
     $Url = [string]$Asset.url
     $ExpectedSha256 = ([string]$Asset.sha256).ToLowerInvariant()
     if ([string]::IsNullOrWhiteSpace($Name) -or [string]::IsNullOrWhiteSpace($Url) -or $ExpectedSha256 -notmatch '^[a-f0-9]{64}$') {
-        throw 'A llama.cpp bootstrap asset has incomplete pin metadata.'
+        throw 'A native runtime bootstrap asset has incomplete pin metadata.'
     }
     Assert-PinnedHttpsUrl $Url $AllowedHosts
     New-Item -ItemType Directory -Force -Path $CacheDirectory | Out-Null
@@ -184,6 +205,158 @@ function Test-AllBackends([string]$BackendsRoot, [string]$NoticeRoot) {
     if (-not (Test-Path -LiteralPath (Join-Path $NoticeRoot 'NVIDIA-CUDA-12.4-EULA.pdf') -PathType Leaf)) { return $false }
     return $true
 }
+
+function Get-DiffusionBackendValidationIssues([string]$Directory, [string]$BackendName) {
+    $Issues = [System.Collections.Generic.List[string]]::new()
+    try {
+        foreach ($Relative in @('sd-cli.exe', 'stable-diffusion.dll')) {
+            $Path = Join-Path $Directory $Relative
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { $Issues.Add("missing $Relative"); continue }
+            if ((Get-Item -LiteralPath $Path).Length -le 0) { $Issues.Add("empty $Relative") }
+        }
+        $CpuBackend = Get-ChildItem -LiteralPath $Directory -Filter 'ggml-cpu*.dll' -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 0 } | Select-Object -First 1
+        if (-not $CpuBackend) { $Issues.Add('missing non-empty ggml-cpu*.dll') }
+        if ($BackendName -eq 'vulkan') {
+            $VulkanPath = Join-Path $Directory 'ggml-vulkan.dll'
+            if (-not (Test-Path -LiteralPath $VulkanPath -PathType Leaf)) { $Issues.Add('missing ggml-vulkan.dll') }
+            elseif ((Get-Item -LiteralPath $VulkanPath).Length -le 0) { $Issues.Add('empty ggml-vulkan.dll') }
+        }
+    } catch {
+        $Issues.Add("validation error: $($_.Exception.Message)")
+    }
+    return @($Issues)
+}
+
+function Test-DiffusionBackend([string]$Directory, [string]$BackendName) {
+    return @(Get-DiffusionBackendValidationIssues $Directory $BackendName).Count -eq 0
+}
+
+function Test-DiffusionRuntime([string]$RuntimeRoot, [string]$NoticeRoot) {
+    foreach ($BackendName in $DiffusionBackendOrder) {
+        if (-not (Test-DiffusionBackend (Join-Path $RuntimeRoot $BackendName) $BackendName)) { return $false }
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $NoticeRoot 'stable-diffusion.cpp-LICENSE') -PathType Leaf)) { return $false }
+    if (-not (Test-Path -LiteralPath (Join-Path $NoticeRoot 'stable-diffusion.cpp-ggml-LICENSE') -PathType Leaf)) { return $false }
+    return $true
+}
+
+function Test-MITNotice([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        $Text = Get-Content -LiteralPath $Path -Raw
+        return $Text.Contains('Permission is hereby granted, free of charge') -and $Text.Contains('THE SOFTWARE IS PROVIDED')
+    } catch { return $false }
+}
+
+function Ensure-DiffusionRuntime {
+    $NoticeRoot = Join-Path $Destination 'licenses'
+    if (Test-DiffusionRuntime $DiffusionDestination $NoticeRoot) {
+        try {
+            if (Test-Path -LiteralPath $DiffusionReceiptPath -PathType Leaf) {
+                $Receipt = Get-Content -LiteralPath $DiffusionReceiptPath -Raw | ConvertFrom-Json
+                $ReceiptBackends = @($Receipt.backends | ForEach-Object { [string]$_ })
+                if ([int]$Receipt.schemaVersion -eq $DiffusionBundleVersion -and
+                    [string]$Receipt.releaseTag -eq $DiffusionReleaseTag -and
+                    [string]$Receipt.commit -eq $DiffusionCommit -and
+                    ($ReceiptBackends -join ',') -eq ($DiffusionBackendOrder -join ',')) {
+                    Write-Host "[Darkstar Harness] stable-diffusion.cpp $DiffusionReleaseTag CPU + Vulkan backends are ready."
+                    return
+                }
+            }
+        } catch {
+            # A malformed receipt is rebuilt from the pinned runtime archives.
+        }
+    }
+
+    $PreviousCacheDirectory = $script:CacheDirectory
+    $script:CacheDirectory = $DiffusionCacheDirectory
+    $Staging = Join-Path $DiffusionStagingParent ("diffusion-$PID-" + [Guid]::NewGuid().ToString('N'))
+    $StagingRuntime = Join-Path $Staging 'diffusion'
+    $StagingLicenses = Join-Path $Staging 'licenses'
+    New-Item -ItemType Directory -Force -Path $StagingRuntime | Out-Null
+    New-Item -ItemType Directory -Force -Path $StagingLicenses | Out-Null
+    $ReceiptAssets = @()
+    try {
+        foreach ($BackendName in $DiffusionBackendOrder) {
+            $BackendDirectory = Join-Path $StagingRuntime $BackendName
+            $ExtractDirectory = Join-Path $Staging ("extract-$BackendName")
+            New-Item -ItemType Directory -Force -Path $BackendDirectory | Out-Null
+            New-Item -ItemType Directory -Force -Path $ExtractDirectory | Out-Null
+            $Pin = $DiffusionBackendPins.$BackendName
+            Write-Host "[Darkstar Harness] Preparing stable-diffusion.cpp $DiffusionReleaseTag $([string]$Pin.label) backend..."
+            foreach ($Asset in @($Pin.archives)) {
+                $Archive = Get-VerifiedDownload $Asset @('github.com')
+                Expand-Archive -LiteralPath $Archive -DestinationPath $ExtractDirectory -Force
+                $ReceiptAssets += [ordered]@{
+                    backend = $BackendName
+                    asset = [string]$Asset.asset
+                    source = [string]$Asset.url
+                    sha256 = [string]$Asset.sha256
+                }
+            }
+            $Cli = Get-ChildItem -LiteralPath $ExtractDirectory -Filter 'sd-cli.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $Cli) { throw "The verified stable-diffusion.cpp $BackendName archive does not contain sd-cli.exe." }
+            Get-ChildItem -LiteralPath $Cli.Directory.FullName -Force | Copy-Item -Destination $BackendDirectory -Recurse -Force
+            $ValidationIssues = @(Get-DiffusionBackendValidationIssues $BackendDirectory $BackendName)
+            if ($ValidationIssues.Count -gt 0) {
+                $IssueText = $ValidationIssues -join '; '
+                $ExtractedNames = @(Get-ChildItem -LiteralPath $BackendDirectory -File -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -ExpandProperty Name) -join ', '
+                throw "The verified stable-diffusion.cpp $BackendName archive extracted, but runtime validation failed: $IssueText. Extracted files: $ExtractedNames"
+            }
+        }
+
+        $CpuDirectory = Join-Path $StagingRuntime 'cpu'
+        $StableLicense = Get-ChildItem -LiteralPath $CpuDirectory -Filter 'stable-diffusion.cpp.txt' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        $GgmlLicense = Get-ChildItem -LiteralPath $CpuDirectory -Filter 'ggml.txt' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $StableLicense -or $null -eq $GgmlLicense) {
+            throw 'The pinned stable-diffusion.cpp archive is missing its bundled stable-diffusion.cpp/ggml MIT notices.'
+        }
+        Copy-Item -LiteralPath $StableLicense.FullName -Destination (Join-Path $StagingLicenses 'stable-diffusion.cpp-LICENSE') -Force
+        Copy-Item -LiteralPath $GgmlLicense.FullName -Destination (Join-Path $StagingLicenses 'stable-diffusion.cpp-ggml-LICENSE') -Force
+        if (-not (Test-MITNotice (Join-Path $StagingLicenses 'stable-diffusion.cpp-LICENSE')) -or
+            -not (Test-MITNotice (Join-Path $StagingLicenses 'stable-diffusion.cpp-ggml-LICENSE'))) {
+            throw 'The stable-diffusion.cpp runtime notices failed MIT-license validation.'
+        }
+        if (-not (Test-DiffusionRuntime $StagingRuntime $StagingLicenses)) {
+            throw 'The verified stable-diffusion.cpp CPU + Vulkan bundle failed final staging validation.'
+        }
+
+        New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+        $Backup = "$DiffusionDestination.bootstrap-backup-$PID"
+        if (Test-Path -LiteralPath $Backup) { Remove-Item -LiteralPath $Backup -Recurse -Force }
+        if (Test-Path -LiteralPath $DiffusionDestination) { Move-Item -LiteralPath $DiffusionDestination -Destination $Backup }
+        try {
+            Move-Item -LiteralPath $StagingRuntime -Destination $DiffusionDestination
+            New-Item -ItemType Directory -Force -Path $NoticeRoot | Out-Null
+            Copy-Item -LiteralPath (Join-Path $StagingLicenses 'stable-diffusion.cpp-LICENSE') -Destination (Join-Path $NoticeRoot 'stable-diffusion.cpp-LICENSE') -Force
+            Copy-Item -LiteralPath (Join-Path $StagingLicenses 'stable-diffusion.cpp-ggml-LICENSE') -Destination (Join-Path $NoticeRoot 'stable-diffusion.cpp-ggml-LICENSE') -Force
+
+            $Receipt = [ordered]@{
+                schemaVersion = $DiffusionBundleVersion
+                releaseTag = $DiffusionReleaseTag
+                commit = $DiffusionCommit
+                backends = @($DiffusionBackendOrder)
+                assets = $ReceiptAssets
+                installedAtUtc = [DateTime]::UtcNow.ToString('o')
+            }
+            $Receipt | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $DiffusionReceiptPath -Encoding UTF8
+            if (-not (Test-DiffusionRuntime $DiffusionDestination $NoticeRoot)) {
+                throw 'stable-diffusion.cpp installation completed but final runtime validation failed.'
+            }
+            if (Test-Path -LiteralPath $Backup) { Remove-Item -LiteralPath $Backup -Recurse -Force }
+        } catch {
+            if (Test-Path -LiteralPath $DiffusionDestination) { Remove-Item -LiteralPath $DiffusionDestination -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $Backup) { Move-Item -LiteralPath $Backup -Destination $DiffusionDestination }
+            throw
+        }
+        Write-Host "[Darkstar Harness] stable-diffusion.cpp $DiffusionReleaseTag CPU + Vulkan backends installed and verified."
+    } finally {
+        $script:CacheDirectory = $PreviousCacheDirectory
+        if (Test-Path -LiteralPath $Staging) { Remove-Item -LiteralPath $Staging -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Ensure-DiffusionRuntime
 
 if (Test-AllBackends $BackendsDestination (Join-Path $Destination 'licenses')) {
     try {

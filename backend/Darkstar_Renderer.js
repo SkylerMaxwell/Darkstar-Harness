@@ -33,7 +33,7 @@ function __darkstarRunRenderer() {
 let projects = [{ id: 0, title: 'New Project', activeTabId: 0 }];
 let activeProjectId = 0;
 let nextProjectId = 1;
-let tabs = [{ id: 0, projectId: 0, title: 'Chat 1', history: [], tokens: 0, tokensExact: false, tokensPerSecond: 0, scheduled: [], conversationNameState: 'idle', userScrolledUp: false, welcomeQuote: '' }];
+let tabs = [{ id: 0, projectId: 0, title: 'Chat 1', history: [], tokens: 0, tokensExact: false, tokensPerSecond: 0, scheduled: [], conversationNameState: 'idle', userScrolledUp: false, welcomeQuote: '', composerDraft: { text: '', image: null } }];
 let activeTabId = 0;
 let nextTabId = 1;
 
@@ -405,6 +405,83 @@ function unregisterGenerationSession(session) {
     });
 })(globalThis);
     // <DARKSTAR_SOURCE_END path="backend/renderer/image-data.js">
+    // RENDERER MODULE :: backend/renderer/image-generation-preview.js
+    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/image-generation-preview.js">
+(function initializeImageGenerationPreview(root) {
+    'use strict';
+
+    function normalize(value) {
+        if (!value || typeof value !== 'object') return null;
+        var phase = String(value.phase || 'denoising').toLowerCase();
+        if (['queued', 'preparing-runtime', 'loading', 'denoising', 'image-ready', 'finalizing', 'restoring-language-model'].indexOf(phase) < 0) phase = 'denoising';
+        var width = Math.max(0, Math.floor(Number(value.width) || 0));
+        var height = Math.max(0, Math.floor(Number(value.height) || 0));
+        var steps = Math.max(0, Math.floor(Number(value.steps) || 0));
+        var step = Math.max(0, Math.floor(Number(value.step) || 0));
+        if (steps && step > steps) step = steps;
+        var progress = Number(value.progress);
+        if (!Number.isFinite(progress)) progress = steps ? step / steps : 0;
+        progress = Math.max(0, Math.min(1, progress));
+        var mimeType = String(value.mimeType || '');
+        if (!/^image\/(?:png|jpeg|webp)$/iu.test(mimeType)) mimeType = '';
+        var base64 = String(value.base64 || '');
+        if (base64.length > 24 * 1024 * 1024) base64 = '';
+        return {
+            phase: phase, finalImage: value.finalImage === true, step: step, steps: steps, progress: progress, width: width, height: height,
+            mimeType: mimeType, base64: mimeType ? base64 : '',
+            previewSequence: Math.max(0, Math.floor(Number(value.previewSequence) || 0)),
+            statusText: String(value.statusText || '').slice(0, 240), backend: String(value.backend || '').slice(0, 80)
+        };
+    }
+
+    function stageHtml() {
+        return '<div class="image-generation-stage" aria-hidden="true"><div class="image-generation-frame"><div class="image-generation-abstract"></div><img class="image-generation-preview-image" alt="Live image generation preview"><div class="image-generation-blur-veil"></div><div class="image-generation-grid"></div><div class="image-generation-flow"></div><div class="image-generation-vignette"></div><div class="image-generation-hud"><span class="image-generation-status">Preparing image…</span><span class="image-generation-step"></span></div></div></div>';
+    }
+
+    function render(block, segment, isActive, setText) {
+        if (!block) return;
+        var state = segment && segment.name === 'generate_image' ? normalize(segment.imageGeneration) : null;
+        // A valid final image is no longer a preview. Retire the animated generation
+        // stage immediately so the normal expanded context-image block can own the
+        // finished pixels while any post-generation LM restoration continues.
+        var finalDelivered = Boolean(state && state.finalImage && state.mimeType && state.base64);
+        var active = Boolean(state && isActive(segment.state, segment.status) && !finalDelivered);
+        block.classList.toggle('image-generation-active', active);
+        block.classList.toggle('image-generation-final-delivered', finalDelivered);
+        var stage = block.querySelector('.image-generation-stage');
+        if (!stage) return;
+        stage.setAttribute('aria-hidden', active ? 'false' : 'true');
+        if (!active) {
+            block.dataset.imagePreviewSequence = '';
+            var staleImage = stage.querySelector('.image-generation-preview-image');
+            if (staleImage) staleImage.removeAttribute('src');
+            return;
+        }
+        var frame = stage.querySelector('.image-generation-frame');
+        var width = state.width || 1024, height = state.height || 1024;
+        if (frame) {
+            frame.style.aspectRatio = String(width) + ' / ' + String(height);
+            frame.style.setProperty('--image-progress', String(state.progress));
+            frame.style.setProperty('--image-preview-blur', state.finalImage ? '0px' : (Math.max(2.25, 11.5 - state.progress * 7.5)).toFixed(2) + 'px');
+            frame.style.setProperty('--image-preview-opacity', state.finalImage ? '1' : String(Math.min(0.9, 0.42 + state.progress * 0.42)));
+        }
+        var image = stage.querySelector('.image-generation-preview-image');
+        var sequence = String(state.previewSequence || 0);
+        if (image && state.mimeType && state.base64 && block.dataset.imagePreviewSequence !== sequence) {
+            var dataUrl = root.Darkstar.imageData.safeDataUrl({ mimeType: state.mimeType, base64: state.base64 }, 'image/png');
+            if (dataUrl) image.setAttribute('src', dataUrl);
+            block.dataset.imagePreviewSequence = sequence;
+        }
+        var statusText = state.statusText;
+        if (!statusText) statusText = state.phase === 'queued' ? 'Waiting for image engine' : state.phase === 'preparing-runtime' ? 'Preparing VRAM' : state.phase === 'loading' ? 'Loading diffusion model' : state.phase === 'image-ready' ? 'Image ready' : state.phase === 'restoring-language-model' ? 'Restoring language model' : state.phase === 'finalizing' ? 'Finalizing image' : 'Generating image';
+        setText(stage.querySelector('.image-generation-status'), statusText);
+        setText(stage.querySelector('.image-generation-step'), state.steps && state.step ? String(state.step) + ' / ' + String(state.steps) : '');
+    }
+
+    root.Darkstar = root.Darkstar || {};
+    root.Darkstar.imageGenerationPreview = Object.freeze({ normalize: normalize, render: render, stageHtml: stageHtml });
+})(globalThis);
+    // <DARKSTAR_SOURCE_END path="backend/renderer/image-generation-preview.js">
     // RENDERER MODULE :: backend/renderer/message-markup.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/message-markup.js">
 // === MESSAGE-MARKUP.JS ===
@@ -528,6 +605,155 @@ function unregisterGenerationSession(session) {
     root.safeMessageLinkHref = safeMessageLinkHref;
 })(globalThis);
     // <DARKSTAR_SOURCE_END path="backend/renderer/message-markup.js">
+    // RENDERER MODULE :: backend/renderer/generation-stream-surface.js
+    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/generation-stream-surface.js">
+(function initializeGenerationStreamSurface(root) {
+    'use strict';
+
+    var namespace = root.Darkstar = root.Darkstar || {};
+    var TYPING_INDICATOR_HTML = '<div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>';
+    var STREAM_TEXT_CLASS = 'generation-stream-text';
+    var STREAM_PREFIX_GUARD_CHARS = 64;
+
+    function hasVisibleAnswer(value) {
+        return String(value === undefined || value === null ? '' : value).trim().length > 0;
+    }
+
+    function create(options) {
+        options = options || {};
+        var session = options.session;
+        if (!session || typeof session !== 'object') throw new Error('Generation stream surface requires a generation session.');
+        if (typeof options.formatMessage !== 'function') throw new Error('Generation stream surface requires formatMessage().');
+        var continuingFinalMessage = options.continuingFinalMessage === true;
+        var formatMessage = options.formatMessage;
+        var contentDiv = null;
+        var streamSurface = null;
+        var streamSurfaceBase = '';
+        var renderedStreamLength = 0;
+        var renderedStreamTail = '';
+
+        function supportsIncrementalStreaming() {
+            var documentRef = root.document;
+            return Boolean(contentDiv
+                && documentRef
+                && typeof documentRef.createElement === 'function'
+                && typeof documentRef.createTextNode === 'function'
+                && typeof contentDiv.appendChild === 'function');
+        }
+
+        function streamingParts() {
+            var answer = String(session.responseText || (continuingFinalMessage ? session.continuationBaseText : '') || '');
+            var base = continuingFinalMessage ? String(session.continuationBaseText || '') : '';
+            if (base && answer.startsWith(base)) return { answer: answer, base: base, live: answer.slice(base.length) };
+            return { answer: answer, base: '', live: answer };
+        }
+
+        function resetIncrementalSurface(base) {
+            if (streamSurface && typeof streamSurface.remove === 'function') streamSurface.remove();
+            streamSurface = null;
+            streamSurfaceBase = String(base || '');
+            renderedStreamLength = 0; renderedStreamTail = '';
+        }
+
+        function attach(nextContentDiv) {
+            if (contentDiv === nextContentDiv) return;
+            resetIncrementalSurface('');
+            contentDiv = nextContentDiv || null;
+        }
+
+        function ensureTypingIndicator() {
+            if (!contentDiv) return null;
+            if (typeof contentDiv.querySelector === 'function') {
+                var existing = contentDiv.querySelector('.typing-indicator');
+                if (existing) return existing;
+            }
+            if (!supportsIncrementalStreaming()) {
+                contentDiv.innerHTML += TYPING_INDICATOR_HTML;
+                return null;
+            }
+            var indicator = root.document.createElement('div');
+            indicator.className = 'typing-indicator';
+            for (var index = 0; index < 3; index += 1) {
+                var dot = root.document.createElement('div');
+                dot.className = 'typing-dot';
+                indicator.appendChild(dot);
+            }
+            contentDiv.appendChild(indicator);
+            return indicator;
+        }
+
+        function ensureStreamSurface(parts) {
+            if (!supportsIncrementalStreaming()) return null;
+            var base = String(parts && parts.base || '');
+            if (streamSurfaceBase !== base) resetIncrementalSurface(base);
+            if (streamSurface && streamSurface.isConnected !== false) return streamSurface;
+            var surface = root.document.createElement('span');
+            surface.className = STREAM_TEXT_CLASS;
+            surface.setAttribute('aria-live', 'off');
+            var indicator = typeof contentDiv.querySelector === 'function' ? contentDiv.querySelector('.typing-indicator') : null;
+            if (indicator && typeof contentDiv.insertBefore === 'function') contentDiv.insertBefore(surface, indicator);
+            else contentDiv.appendChild(surface);
+            streamSurface = surface;
+            renderedStreamLength = 0; renderedStreamTail = '';
+            return surface;
+        }
+
+        function canAppendFromCursor(live) {
+            if (!renderedStreamLength) return true;
+            if (live.length < renderedStreamLength) return false;
+            var guardLength = Math.min(STREAM_PREFIX_GUARD_CHARS, renderedStreamLength, renderedStreamTail.length);
+            return !guardLength || live.slice(renderedStreamLength - guardLength, renderedStreamLength) === renderedStreamTail.slice(-guardLength);
+        }
+        function rememberRenderedCursor(live) {
+            renderedStreamLength = live.length; renderedStreamTail = live.slice(Math.max(0, live.length - STREAM_PREFIX_GUARD_CHARS));
+        }
+
+        function paint() {
+            if (!contentDiv) return;
+            var parts = streamingParts();
+            if (!supportsIncrementalStreaming()) {
+                contentDiv.innerHTML = (hasVisibleAnswer(parts.answer) ? formatMessage(parts.answer) : '') + TYPING_INDICATOR_HTML;
+                return;
+            }
+
+            // The persisted continuation prefix remains formatted in-place. Only the
+            // newly generated suffix is appended while tokens arrive, so live output
+            // never reparses text whose cost grows with the full response length.
+            var surface = ensureStreamSurface(parts);
+            if (!surface) return;
+            var live = String(parts.live || '');
+            if (canAppendFromCursor(live)) {
+                var delta = live.slice(renderedStreamLength);
+                if (delta) surface.appendChild(root.document.createTextNode(delta));
+            } else {
+                surface.textContent = live;
+            }
+            rememberRenderedCursor(live);
+            ensureTypingIndicator();
+        }
+
+        function showTyping() {
+            if (!contentDiv) return;
+            if (supportsIncrementalStreaming()) {
+                ensureTypingIndicator();
+                return;
+            }
+            if (typeof contentDiv.querySelector === 'function' && contentDiv.querySelector('.typing-indicator')) return;
+            var answer = String(session.responseText || (continuingFinalMessage ? session.continuationBaseText : '') || '');
+            contentDiv.innerHTML = (hasVisibleAnswer(answer) ? formatMessage(answer) : '') + TYPING_INDICATOR_HTML;
+        }
+
+        function close() {
+            resetIncrementalSurface('');
+            contentDiv = null;
+        }
+
+        return Object.freeze({ attach: attach, close: close, paint: paint, showTyping: showTyping });
+    }
+
+    namespace.generationStreamSurface = Object.freeze({ create: create });
+})(globalThis);
+// <DARKSTAR_SOURCE_END path="backend/renderer/generation-stream-surface.js">
     // RENDERER MODULE :: backend/renderer/generation-ui.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/generation-ui.js">
 (function initializeGenerationMetrics(root) {
@@ -601,7 +827,6 @@ function unregisterGenerationSession(session) {
 
     var namespace = root.Darkstar = root.Darkstar || {};
     var STREAM_UI_MIN_INTERVAL_MS = 50;
-    var TYPING_INDICATOR_HTML = '<div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>';
 
     function requiredFunction(options, key) {
         if (!options || typeof options[key] !== 'function') {
@@ -616,9 +841,6 @@ function unregisterGenerationSession(session) {
             : Date.now();
     }
 
-    function hasVisibleAnswer(value) {
-        return String(value === undefined || value === null ? '' : value).trim().length > 0;
-    }
 
     class GenerationUiCoordinator {
         constructor(options) {
@@ -631,6 +853,7 @@ function unregisterGenerationSession(session) {
             this.addMessage = requiredFunction(options, 'addMessage');
             this.formatMessage = requiredFunction(options, 'formatMessage');
             this.updateMessageAgentTimeline = requiredFunction(options, 'updateMessageAgentTimeline');
+            this.syncPresentedMessageImages = typeof options.syncPresentedMessageImages === 'function' ? options.syncPresentedMessageImages : null;
             this.timelineForDisplay = typeof options.timelineForDisplay === 'function'
                 ? options.timelineForDisplay
                 : function(timeline) { return timeline; };
@@ -650,6 +873,11 @@ function unregisterGenerationSession(session) {
             this.paintTimer = null;
             this.paintFrame = null;
             this.lastPaintAt = 0;
+            this.streamController = namespace.generationStreamSurface.create({
+                session: this.session,
+                continuingFinalMessage: this.continuingFinalMessage,
+                formatMessage: this.formatMessage,
+            });
             this.closed = false;
 
             this.mount = this.mount.bind(this);
@@ -686,9 +914,14 @@ function unregisterGenerationSession(session) {
             };
         }
 
+        syncImages() {
+            if (this.syncPresentedMessageImages && this.assistantDiv) this.syncPresentedMessageImages(this.assistantDiv, this.session, this.session.assistantIndex);
+        }
+
         mount() {
             if (!this.isCurrent() || !this.isActiveTab()) return null;
             var session = this.session;
+            var mountedNow = false;
             if (!this.isMounted(this.assistantDiv)) {
                 var transientRole = this.displayRole();
                 this.assistantDiv = this.findMountedAssistant() || (this.continuingFinalMessage ? null : this.addMessage({
@@ -700,6 +933,7 @@ function unregisterGenerationSession(session) {
                     messageId: 'generation-' + session.id,
                 }));
                 if (!this.assistantDiv) return null;
+                mountedNow = true;
                 this.assistantDiv.dataset.transient = this.continuingFinalMessage ? 'false' : 'true';
                 this.assistantDiv.dataset.generationId = String(session.id);
                 this.assistantDiv.classList.add('generating');
@@ -707,8 +941,15 @@ function unregisterGenerationSession(session) {
                 if (session.agentTimeline.length) this.updateMessageAgentTimeline(this.assistantDiv, this.timelineForDisplay(session.agentTimeline));
             } else if (!this.contentDiv) {
                 this.contentDiv = this.assistantDiv.querySelector('.message-answer') || this.assistantDiv.querySelector('.message-content');
+                mountedNow = true;
             }
-            this.showTyping();
+            this.streamController.attach(this.contentDiv);
+            if (mountedNow && this.contentDiv) {
+                this.streamController.paint();
+                this.syncImages();
+            } else {
+                this.streamController.showTyping();
+            }
 
             session.assistantDiv = this.assistantDiv;
             session.contentDiv = this.contentDiv;
@@ -718,12 +959,19 @@ function unregisterGenerationSession(session) {
             return this.elements();
         }
 
+        paintStreamingAnswer() {
+            if (!this.contentDiv) return;
+            this.streamController.attach(this.contentDiv);
+            this.streamController.paint();
+            this.syncImages();
+        }
+
         showTyping() {
             this.pendingAnswer = false;
             if (this.closed || !this.isCurrent() || !this.isActiveTab() || !this.contentDiv) return;
-            if (typeof this.contentDiv.querySelector === 'function' && this.contentDiv.querySelector('.typing-indicator')) return;
-            var answer = String(this.session.responseText || (this.continuingFinalMessage ? this.session.continuationBaseText : '') || '');
-            this.contentDiv.innerHTML = (hasVisibleAnswer(answer) ? this.formatMessage(answer) : '') + TYPING_INDICATOR_HTML;
+            this.streamController.attach(this.contentDiv);
+            this.streamController.showTyping();
+            this.syncImages();
         }
 
         ensureTypingVisible() {
@@ -747,6 +995,13 @@ function unregisterGenerationSession(session) {
             if (this.closed) return;
             this.pendingTimeline = timeline;
             this.schedulePaint();
+        }
+
+        queueTimelineBoundary(timeline) {
+            if (this.closed) return; this.pendingTimeline = timeline;
+            if (!this.isCurrent() || !this.isActiveTab()) { this.schedulePaint(); return; }
+            if (this.paintTimer !== null) { clearTimeout(this.paintTimer); this.paintTimer = null; }
+            this.requestPaintFrame();
         }
 
         schedulePaint() {
@@ -789,10 +1044,7 @@ function unregisterGenerationSession(session) {
             if (this.pendingAnswer) {
                 this.pendingAnswer = false;
                 this.mount();
-                if (this.contentDiv) {
-                    var answer = String(this.session.responseText || (this.continuingFinalMessage ? this.session.continuationBaseText : '') || '');
-                    this.contentDiv.innerHTML = (hasVisibleAnswer(answer) ? this.formatMessage(answer) : '') + TYPING_INDICATOR_HTML;
-                }
+                if (this.contentDiv) this.paintStreamingAnswer();
                 shouldScroll = true;
             }
             if (this.pendingTimeline) {
@@ -831,6 +1083,7 @@ function unregisterGenerationSession(session) {
                 frameWindow.cancelAnimationFrame(this.paintFrame);
             }
             this.paintFrame = null;
+            this.streamController.close();
         }
     }
 
@@ -842,7 +1095,7 @@ function unregisterGenerationSession(session) {
         createCoordinator: createCoordinator,
     });
 })(globalThis);
-    // <DARKSTAR_SOURCE_END path="backend/renderer/generation-ui.js">
+// <DARKSTAR_SOURCE_END path="backend/renderer/generation-ui.js">
     // RENDERER MODULE :: backend/renderer/modal-coordinator.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/modal-coordinator.js">
 (function(root) {
@@ -960,10 +1213,11 @@ function unregisterGenerationSession(session) {
 (function initializeDarkstarPreferences(root) {
     'use strict';
 
-    var THEME_KEY = 'darkstar.ui.theme';
+    var LEGACY_THEME_KEY = 'darkstar.ui.theme';
+    var DEFAULT_THEME = 'space';
     var MUTE_KEY = 'darkstar.ui.muted';
     var themes = Object.freeze([
-        Object.freeze({ id: 'deep-blue', label: 'Deep Blue', chrome: '#03060c' }),
+        // Retired theme slot intentionally omitted; Core remains the canonical theme owner.
         Object.freeze({ id: 'light', label: 'Light', chrome: '#eef2f8' }),
         Object.freeze({ id: 'quantum', label: 'Quantum', chrome: '#000000' }),
         Object.freeze({ id: 'terminal', label: 'Terminal', chrome: '#020503' }),
@@ -971,15 +1225,15 @@ function unregisterGenerationSession(session) {
         Object.freeze({ id: 'space', label: 'Space', chrome: '#000000' }),
     ]);
     var validThemes = themes.map(function(theme) { return theme.id; });
-    var legacyThemeAliases = Object.freeze({ dark: 'deep-blue', 'blue-bird': 'quantum', horizon: 'terminal', sunset: 'deep-blue' });
+    var legacyThemeAliases = Object.freeze({ 'deep-blue': 'space', dark: 'space', 'blue-bird': 'quantum', horizon: 'terminal', sunset: 'space' });
 
     function normalizeThemeId(themeId) {
         var aliased = legacyThemeAliases[themeId] || themeId;
-        return validThemes.indexOf(aliased) >= 0 ? aliased : 'deep-blue';
+        return validThemes.indexOf(aliased) >= 0 ? aliased : DEFAULT_THEME;
     }
 
     function themeDefinition(themeId) {
-        return themes.find(function(theme) { return theme.id === themeId; }) || themes[0];
+        return themes.find(function(theme) { return theme.id === themeId; }) || themes.find(function(theme) { return theme.id === DEFAULT_THEME; }) || themes[0];
     }
 
     function nextThemeDefinition(themeId) {
@@ -997,11 +1251,18 @@ function unregisterGenerationSession(session) {
         } catch (_error) {}
     }
 
-    var storedTheme = readStoredValue(THEME_KEY);
-    var currentTheme = normalizeThemeId(storedTheme);
-    if (storedTheme && storedTheme !== currentTheme && legacyThemeAliases[storedTheme]) {
-        writeStoredValue(THEME_KEY, currentTheme);
+    function removeStoredValue(key) {
+        try {
+            if (root.localStorage) root.localStorage.removeItem(key);
+        } catch (_error) {}
     }
+
+    var nativeTheme = root.darkstar && root.darkstar.app ? root.darkstar.app.initialTheme : '';
+    var currentTheme = normalizeThemeId(nativeTheme || DEFAULT_THEME);
+    // Core owns the program-wide theme before either window is shown. A stale
+    // pre-store localStorage value must never override that launch-time choice,
+    // otherwise renderer-local state can disagree with the Core-selected launch theme.
+    removeStoredValue(LEGACY_THEME_KEY);
     var muted = readStoredValue(MUTE_KEY) === 'true';
 
     function updateThemeButton() {
@@ -1043,7 +1304,6 @@ function unregisterGenerationSession(session) {
         currentTheme = normalized;
         if (document.documentElement) document.documentElement.setAttribute('data-theme', normalized);
         if (document.body) document.body.setAttribute('data-theme', normalized);
-        if (persist !== false) writeStoredValue(THEME_KEY, normalized);
         updateThemeChrome(normalized);
         updateThemeButton();
         return normalized;
@@ -1172,7 +1432,7 @@ function unregisterGenerationSession(session) {
         state.busy = true; setError(''); render(levelId);
         try {
             var level = applySnapshot(await api.set(String(levelId || DEFAULT_PERMISSION_LEVEL)));
-            if (options.persistWorkflow !== false && typeof root.scheduleWorkflowSessionSave === 'function') root.scheduleWorkflowSessionSave(0);
+            if (options.persistWorkflow !== false && typeof root.scheduleWorkflowSessionSave === 'function') { root.scheduleWorkflowSessionSave(0); if (typeof root.saveWorkflowSessionNow === 'function') await root.saveWorkflowSessionNow({ force: true }); }
             return level;
         } finally { state.busy = false; render(); }
     }
@@ -1234,7 +1494,8 @@ function unregisterGenerationSession(session) {
     function workflowSecuritySnapshot() {
         return {
             modelActionPermissionLevel: currentPermissionPolicyLevel(),
-            filesystemAccessLevel: typeof root.getDarkstarFilesystemAccessLevel === 'function' ? root.getDarkstarFilesystemAccessLevel() : '2'
+            filesystemAccessLevel: typeof root.getDarkstarFilesystemAccessLevel === 'function' ? root.getDarkstarFilesystemAccessLevel() : '2',
+            internetAccessEnabled: typeof root.getDarkstarInternetAccessEnabled === 'function' ? root.getDarkstarInternetAccessEnabled() : true
         };
     }
     function restoreWorkflowSecurity(value) {
@@ -1243,7 +1504,10 @@ function unregisterGenerationSession(session) {
         var filesystemTask = typeof root.restoreDarkstarFilesystemAccessLevel === 'function'
             ? root.restoreDarkstarFilesystemAccessLevel(String(security.filesystemAccessLevel || '3'))
             : Promise.resolve('3');
-        return Promise.all([permissionTask, filesystemTask]).then(function(results) { return results[0]; });
+        var internetTask = typeof root.restoreDarkstarInternetAccessEnabled === 'function'
+            ? root.restoreDarkstarInternetAccessEnabled(security.internetAccessEnabled !== false)
+            : Promise.resolve(true);
+        return Promise.all([permissionTask, filesystemTask, internetTask]).then(function(results) { return results[0]; });
     }
     root.getDarkstarPermissionPolicyLevel = currentPermissionPolicyLevel;
     root.restoreDarkstarPermissionPolicyLevel = restorePermissionPolicyLevel;
@@ -1342,7 +1606,7 @@ function unregisterGenerationSession(session) {
         state.busy = true; setError(''); render(levelId);
         try {
             var level = applySnapshot(await api.set(String(levelId || DEFAULT_FILESYSTEM_ACCESS_LEVEL)));
-            if (options.persistWorkflow !== false && typeof root.scheduleWorkflowSessionSave === 'function') root.scheduleWorkflowSessionSave(0);
+            if (options.persistWorkflow !== false && typeof root.scheduleWorkflowSessionSave === 'function') { root.scheduleWorkflowSessionSave(0); if (typeof root.saveWorkflowSessionNow === 'function') await root.saveWorkflowSessionNow({ force: true }); }
             return level;
         } finally { state.busy = false; render(); }
     }
@@ -1406,6 +1670,86 @@ function unregisterGenerationSession(session) {
     root.initializeFilesystemAccessUi = initializeFilesystemAccessUi;
 })(globalThis);
     // <DARKSTAR_SOURCE_END path="backend/renderer/filesystem-access-policy.js">
+    // RENDERER MODULE :: backend/renderer/internet-access-policy.js
+    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/internet-access-policy.js">
+(function initializeInternetAccessUiModule(root) {
+    'use strict';
+
+    var state = { enabled: true, initialized: false, busy: false };
+    function bridge() { return root.darkstar && root.darkstar.internetAccess ? root.darkstar.internetAccess : null; }
+    function button() { return document.getElementById('nodeInternetAccessButton'); }
+    function syncButton() {
+        var target = button();
+        if (!target) return;
+        var enabled = state.enabled === true;
+        var actionLabel = enabled ? 'Disable Internet Access' : 'Enable Internet Access';
+        target.dataset.enabled = enabled ? 'true' : 'false';
+        target.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+        target.setAttribute('aria-label', actionLabel);
+        target.title = actionLabel;
+        target.classList.toggle('is-active', enabled);
+        target.disabled = state.busy;
+    }
+    function applySnapshot(response) {
+        if (!response || response.success !== true || typeof response.enabled !== 'boolean') {
+            throw new Error(response && response.error ? response.error : 'Internet Access policy is unavailable.');
+        }
+        state.enabled = response.enabled === true;
+        syncButton();
+        return state.enabled;
+    }
+    async function commitEnabled(enabled, options) {
+        options = options || {};
+        var api = bridge();
+        if (!api || typeof api.set !== 'function') throw new Error('Internet Access bridge is unavailable.');
+        if (state.busy && options.force !== true) return state.enabled;
+        state.busy = true;
+        syncButton();
+        try {
+            var value = applySnapshot(await api.set(enabled === true));
+            if (options.persistWorkflow !== false && typeof root.scheduleWorkflowSessionSave === 'function') { root.scheduleWorkflowSessionSave(0); if (typeof root.saveWorkflowSessionNow === 'function') await root.saveWorkflowSessionNow({ force: true }); }
+            return value;
+        } finally {
+            state.busy = false;
+            syncButton();
+        }
+    }
+    async function toggleInternetAccess() {
+        try { return await commitEnabled(!state.enabled, { persistWorkflow: true }); }
+        catch (error) {
+            console.error('Could not update Internet Access:', error);
+            syncButton();
+            return state.enabled;
+        }
+    }
+    function restoreInternetAccessEnabled(enabled) { return commitEnabled(enabled !== false, { persistWorkflow: false, force: true }); }
+    function currentInternetAccessEnabled() { return state.enabled === true; }
+    async function initializeInternetAccessUi() {
+        if (state.initialized) return;
+        state.initialized = true;
+        var target = button(), api = bridge();
+        if (!target) return;
+        target.addEventListener('click', function() { toggleInternetAccess(); });
+        syncButton();
+        if (!api || typeof api.get !== 'function') {
+            target.disabled = true;
+            target.title = 'Internet Access unavailable';
+            target.setAttribute('aria-label', target.title);
+            return;
+        }
+        try { applySnapshot(await api.get()); }
+        catch (error) {
+            console.error('Could not load Internet Access:', error);
+            target.disabled = true;
+            target.title = 'Internet Access unavailable';
+            target.setAttribute('aria-label', target.title);
+        }
+    }
+    root.getDarkstarInternetAccessEnabled = currentInternetAccessEnabled;
+    root.restoreDarkstarInternetAccessEnabled = restoreInternetAccessEnabled;
+    root.initializeInternetAccessUi = initializeInternetAccessUi;
+})(globalThis);
+    // <DARKSTAR_SOURCE_END path="backend/renderer/internet-access-policy.js">
     // --------------------------------------------------------------------------
     // [9200] NODE PLATFORM :: SDK, controls and backend-service bridge
     // --------------------------------------------------------------------------
@@ -1424,7 +1768,10 @@ function unregisterGenerationSession(session) {
 
     var PORT_TYPES = Object.freeze({
         SERVER: 'SERVER',
+        MODEL_CONFIG: 'MODEL_CONFIG',
         MODEL: 'MODEL',
+        SAMPLER_PARAMETERS: 'SAMPLER_PARAMETERS',
+        DM_SAMPLER: 'DM_SAMPLER',
         TEXT: 'TEXT',
         IMAGE: 'IMAGE',
         CONTROL: 'CONTROL',
@@ -1539,19 +1886,34 @@ function unregisterGenerationSession(session) {
         var min = options.min !== undefined ? ' min="' + escapeHtml(options.min) + '"' : '';
         var max = options.max !== undefined ? ' max="' + escapeHtml(options.max) + '"' : '';
         var step = options.step !== undefined ? ' step="' + escapeHtml(options.step) + '"' : '';
-        return '<div class="node-param"><div class="node-param-label"><span>' + escapeHtml(label) + '</span><span class="node-param-value">' + escapeHtml(value) + '</span></div>' +
-            '<input type="number" class="node-port-input" value="' + escapeHtml(value) + '"' + min + max + step +
-            ' data-node-id="' + escapeHtml(nodeId) + '" data-param="' + escapeHtml(param) + '" data-param-kind="number"></div>';
+        var safeLabel = escapeHtml(label);
+        return '<div class="node-param node-param-number"><div class="node-param-label"><span>' + safeLabel + '</span></div>' +
+            '<div class="node-number-control"><input type="number" class="node-port-input" value="' + escapeHtml(value) + '"' + min + max + step +
+            ' data-node-id="' + escapeHtml(nodeId) + '" data-param="' + escapeHtml(param) + '" data-param-kind="number">' +
+            '<span class="node-number-stepper" role="group" aria-label="' + safeLabel + ' controls">' +
+            '<button type="button" class="node-number-stepper-button is-up" data-number-step="up" aria-label="Increase ' + safeLabel + '"><span class="node-number-stepper-icon" aria-hidden="true"></span></button>' +
+            '<button type="button" class="node-number-stepper-button is-down" data-number-step="down" aria-label="Decrease ' + safeLabel + '"><span class="node-number-stepper-icon" aria-hidden="true"></span></button>' +
+            '</span></div></div>';
+    }
+
+    function stepNumberInput(button) {
+        var control = button && button.closest ? button.closest('.node-number-control') : null;
+        var input = control ? control.querySelector('input[type="number"].node-port-input') : null;
+        if (!input || input.disabled || input.readOnly) return false;
+        try { button.dataset.numberStep === 'down' ? input.stepDown() : input.stepUp(); } catch (_error) { return false; }
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        try { input.focus({ preventScroll: true }); } catch (_error) { input.focus(); }
+        return true;
     }
 
     function textInput(label, value, nodeId, param, placeholder) {
-        return '<div class="node-param"><div class="node-param-label"><span>' + escapeHtml(label) + '</span></div>' +
+        return '<div class="node-param node-param-text"><div class="node-param-label"><span>' + escapeHtml(label) + '</span></div>' +
             '<input type="text" class="node-port-input" value="' + escapeHtml(value) + '" placeholder="' + escapeHtml(placeholder || '') + '"' +
             ' data-node-id="' + escapeHtml(nodeId) + '" data-param="' + escapeHtml(param) + '" data-param-kind="string"></div>';
     }
 
     function textarea(label, value, nodeId, param, placeholder) {
-        return '<div class="node-param"><div class="node-param-label"><span>' + escapeHtml(label) + '</span></div>' +
+        return '<div class="node-param node-param-textarea"><div class="node-param-label"><span>' + escapeHtml(label) + '</span></div>' +
             '<textarea class="node-port-input" rows="3" placeholder="' + escapeHtml(placeholder || '') + '"' +
             ' data-node-id="' + escapeHtml(nodeId) + '" data-param="' + escapeHtml(param) + '" data-param-kind="string">' + escapeHtml(value) + '</textarea></div>';
     }
@@ -1569,15 +1931,16 @@ function unregisterGenerationSession(session) {
         });
     }
 
-    function dropdown(label, value, nodeId, param, options, kind) {
+    function dropdown(label, value, nodeId, param, options, kind, placeholderLabel) {
         var normalized = normalizeDropdownOptions(options);
         var stringValue = value === undefined || value === null ? '' : String(value);
         var hasSelectedValue = normalized.some(function(item) { return item.value === stringValue; });
         var selected = normalized.find(function(option) { return option.value === stringValue; }) || normalized[0] || { value: '', label: 'No options', disabled: true };
-        var html = '<div class="node-param"><div class="node-param-label"><span>' + escapeHtml(label) + '</span></div>' +
+        var displayLabel = hasSelectedValue ? selected.label : (!stringValue && placeholderLabel ? String(placeholderLabel) : selected.label);
+        var html = '<div class="node-param node-param-dropdown"><div class="node-param-label"><span>' + escapeHtml(label) + '</span></div>' +
             '<div class="node-dropdown" data-node-control="true" data-node-id="' + escapeHtml(nodeId) + '" data-param="' + escapeHtml(param || '') + '" data-param-kind="' + escapeHtml(kind || 'string') + '">' +
             '<button type="button" class="node-dropdown-trigger" data-node-control="true" aria-haspopup="listbox" aria-expanded="false">' +
-            '<span class="node-dropdown-value">' + escapeHtml(selected.label) + '</span><span class="node-dropdown-chevron" aria-hidden="true"></span></button>' +
+            '<span class="node-dropdown-value">' + escapeHtml(displayLabel) + '</span><span class="node-dropdown-chevron" aria-hidden="true"></span></button>' +
             '<div class="node-dropdown-menu" role="listbox">';
         for (var i = 0; i < normalized.length; i++) {
             var option = normalized[i];
@@ -1626,13 +1989,20 @@ function unregisterGenerationSession(session) {
 
     function slider(label, value, min, max, step, decimals, nodeId, param) {
         var displayValue = decimals === 0 ? parseInt(value, 10) : parseFloat(value).toFixed(decimals);
-        return '<div class="node-param"><div class="node-param-label"><span>' + escapeHtml(label) + '</span><span class="node-param-value">' + escapeHtml(displayValue) + '</span></div><input type="range" class="node-slider" min="' + escapeHtml(min) + '" max="' + escapeHtml(max) + '" step="' + escapeHtml(step) + '" value="' + escapeHtml(value) + '" data-node-id="' + escapeHtml(nodeId) + '" data-param="' + escapeHtml(param) + '"></div>';
+        return '<div class="node-param node-param-slider"><div class="node-param-label"><span>' + escapeHtml(label) + '</span><span class="node-param-value">' + escapeHtml(displayValue) + '</span></div><input type="range" class="node-slider" min="' + escapeHtml(min) + '" max="' + escapeHtml(max) + '" step="' + escapeHtml(step) + '" value="' + escapeHtml(value) + '" data-node-id="' + escapeHtml(nodeId) + '" data-param="' + escapeHtml(param) + '"></div>';
+    }
+
+    function group(title, description, content, className) {
+        var classes = 'settings-control-group' + (className ? ' ' + escapeHtml(className) : '');
+        var copy = description ? '<p class="settings-control-group-description">' + escapeHtml(description) + '</p>' : '';
+        return '<section class="' + classes + '"><div class="settings-control-group-heading"><h3 class="settings-control-group-title">' + escapeHtml(title) + '</h3>' + copy + '</div><div class="settings-control-group-body">' + String(content || '') + '</div></section>';
     }
 
     nodes.controls = Object.freeze({
         escapeHtml: escapeHtml,
         status: status,
         numberInput: numberInput,
+        stepNumberInput: stepNumberInput,
         textInput: textInput,
         textarea: textarea,
         dropdown: dropdown,
@@ -1641,6 +2011,7 @@ function unregisterGenerationSession(session) {
         toggle: toggle,
         button: button,
         slider: slider,
+        group: group,
         normalizeDropdownOptions: normalizeDropdownOptions
     });
 })(globalThis);
@@ -1697,6 +2068,19 @@ function unregisterGenerationSession(session) {
             hash = Math.imul(hash, 16777619) >>> 0;
         }
         return text.length + ':' + hash.toString(16).padStart(8, '0');
+    }
+
+    function extendTraceTextKey(state, increment) {
+        var trace = state && typeof state === 'object' ? state : { length: 0, hash: 2166136261 };
+        var text = String(increment === undefined || increment === null ? '' : increment);
+        var hash = Number(trace.hash) >>> 0;
+        for (var index = 0; index < text.length; index++) {
+            hash ^= text.charCodeAt(index);
+            hash = Math.imul(hash, 16777619) >>> 0;
+        }
+        trace.length = Math.max(0, Number(trace.length) || 0) + text.length;
+        trace.hash = hash;
+        return trace.length + ':' + hash.toString(16).padStart(8, '0');
     }
 
     function imageSourceKey(source) {
@@ -1918,6 +2302,10 @@ function unregisterGenerationSession(session) {
         pair.toolCall.argumentTokenEstimate = Math.max(0, Number(activity.argumentTokenEstimate) || pair.toolCall.argumentTokenEstimate || 0);
         pair.toolCall.argumentHint = String(activity.argumentHint || pair.toolCall.argumentHint || '');
         pair.toolCall.idleMs = 0;
+        if (payload.type === 'image-generation-progress' && payload.imageGeneration && typeof payload.imageGeneration === 'object') {
+            pair.toolCall.imageGeneration = Object.assign({}, pair.toolCall.imageGeneration || {}, payload.imageGeneration);
+        }
+        if (terminal) pair.toolCall.imageGeneration = null;
         if (payload.type === 'complete') pair.toolCall.result = String(payload.resultPreview || '');
         if (payload.type === 'error') pair.toolCall.result = '';
     }
@@ -1984,9 +2372,11 @@ function unregisterGenerationSession(session) {
             var fullReasoning = '';
             var fullWorking = [];
             var fullToolContext = [];
+            var presentedImageIds = [];
             var latestContextUsage = null;
             var agentTimeline = [];
             var activeReasoningId = null;
+            var reasoningTraceStates = new Map();
             var timelineSequence = 1;
             var currentAgentRound = 0;
             var settled = false;
@@ -2075,7 +2465,12 @@ function unregisterGenerationSession(session) {
                     activeReasoningId = ensured.id;
                     timelineSequence = ensured.sequence;
                     ensured.segment.content += reasoning;
-                    ensured.segment.traceKey = traceTextKey(ensured.segment.content);
+                    var traceState = reasoningTraceStates.get(ensured.id);
+                    if (!traceState) {
+                        traceState = { length: 0, hash: 2166136261 };
+                        reasoningTraceStates.set(ensured.id, traceState);
+                    }
+                    ensured.segment.traceKey = extendTraceTextKey(traceState, reasoning);
                     if (context.onReasoningToken) {
                         context.onReasoningToken(
                             reasoning,
@@ -2107,6 +2502,7 @@ function unregisterGenerationSession(session) {
                         && !payload.preparation
                         && !contextMessages.length
                         && payload.type !== 'context-image'
+                        && payload.type !== 'response-image'
                         && payload.type !== 'browser-compartment-activated'
                         && payload.type !== 'tool-call-fresh-retry'
                     ) return;
@@ -2121,6 +2517,13 @@ function unregisterGenerationSession(session) {
                         var ensuredImage = ensureImageTimelineSegment(agentTimeline, payload, timelineSequence);
                         timelineSequence = ensuredImage.sequence;
                     }
+                    if (payload.type === 'response-image' && payload.imageId) {
+                        var presentedImageId = String(payload.imageId);
+                        if (!presentedImageIds.includes(presentedImageId)) presentedImageIds.push(presentedImageId);
+                    }
+                    // Timeline state is authoritative UI state. Publish the reasoning -> tool
+                    // boundary before secondary callbacks can perform persistence or workspace work.
+                    emitTimeline();
                     if (context.onToolEvent) {
                         context.onToolEvent(
                             payload,
@@ -2129,7 +2532,6 @@ function unregisterGenerationSession(session) {
                             copyToolContext(fullToolContext)
                         );
                     }
-                    emitTimeline();
                 });
             }
 
@@ -2167,6 +2569,7 @@ function unregisterGenerationSession(session) {
                     working: Array.isArray(payload.working) ? payload.working : copyWorking(fullWorking),
                     toolMessages: toolMessages,
                     agentTimeline: copyAgentTimeline(agentTimeline),
+                    presentedImageIds: Array.from(new Set(presentedImageIds.concat(Array.isArray(payload.presentedImageIds) ? payload.presentedImageIds.map(String) : []))),
                     usage: payload.usage || null,
                     contextUsage: latestContextUsage,
                     finishReason: payload.finishReason || null,
@@ -2205,6 +2608,7 @@ function unregisterGenerationSession(session) {
                             working: copyWorking(fullWorking),
                             toolMessages: copyToolContext(fullToolContext),
                             agentTimeline: copyAgentTimeline(agentTimeline),
+                            presentedImageIds: Array.from(new Set(presentedImageIds.concat(Array.isArray(partial.presentedImageIds) ? partial.presentedImageIds.map(String) : []))),
                             partialToolCall: partial.partialToolCall && typeof partial.partialToolCall === 'object'
                                 ? structuredClone(partial.partialToolCall)
                                 : null,
@@ -2280,7 +2684,7 @@ function unregisterGenerationSession(session) {
 })(globalThis);
 // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/services.js">
     // --------------------------------------------------------------------------
-    // [9300] BUILT-IN NODES :: server, model, context, skills, tools, control and sampler
+    // [9300] BUILT-IN NODES :: server, local sampler, model, context/control compatibility services, Loader and orchestrator
     // --------------------------------------------------------------------------
     // RENDERER MODULE :: backend/renderer/nodes/builtin/common.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/nodes/builtin/common.js">
@@ -2314,9 +2718,9 @@ function unregisterGenerationSession(session) {
         return namespace.modelInventory.find(function(candidate) { return String(candidate && candidate.id || '') === id; }) || null;
     }
 
-    function listModelOptions(selectedModel, placeholderLabel) {
+    function listModelOptions(selectedModel) {
         var select = document.getElementById('modelSelect');
-        var options = [{ value: '', label: String(placeholderLabel || 'C:/Your/Model/Path') }];
+        var options = [{ value: '', label: 'None' }];
         if (select) {
             for (var i = 0; i < select.options.length; i++) {
                 var option = select.options[i];
@@ -2334,7 +2738,15 @@ function unregisterGenerationSession(session) {
 
     function modelDropdown(node) {
         var params = node && node.params && typeof node.params === 'object' ? node.params : {};
-        return controls.dropdown('Model', node.selectedModel, node.id, '', listModelOptions(node.selectedModel, params.modelPathPlaceholder), 'model');
+        return controls.dropdown('Model', node.selectedModel, node.id, '', listModelOptions(node.selectedModel), 'model', params.modelPathPlaceholder || 'C:/Your/Model/Path');
+    }
+
+    function localBrowseField(dropdownHtml, nodeId, action, label) {
+        return '<div class="node-local-browser-field">' + dropdownHtml + controls.button('⋯', nodeId, action, {
+            className: 'node-local-browser-button',
+            title: 'Browse Local Filesystem …',
+            ariaLabel: 'Browse Local Filesystem for ' + label
+        }) + '</div>';
     }
 
     function getLlamaBridge() {
@@ -2390,6 +2802,7 @@ function unregisterGenerationSession(session) {
         modelInventoryRecord: modelInventoryRecord,
         listModelOptions: listModelOptions,
         modelDropdown: modelDropdown,
+        localBrowseField: localBrowseField,
         getLlamaBridge: getLlamaBridge,
         getAgentBridge: getAgentBridge,
         normalizedPathKey: normalizedPathKey,
@@ -2418,9 +2831,13 @@ function unregisterGenerationSession(session) {
     }
     var KV_CACHE_TYPES = ['f32', 'f16', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1'];
     var LIVE_GPU_REFRESH_MS = 1000;
-    var LOAD_SERVER_UI_WIDTH = 420;
+    var LOAD_SERVER_UI_WIDTH = 760;
     var GPU_LAYER_SLIDER_MIN = -2;
     var CONTEXT_STEP = 256;
+    var CONTEXT_PERCENT_MIN = 10;
+    var CONTEXT_PERCENT_MAX = 100;
+    var CONTEXT_PERCENT_STEP = 10;
+    var modelMetadataQueries = Object.create(null);
     var LLAMA_BACKENDS = [
         { value: 'cuda', label: 'CUDA — NVIDIA GPU' },
         { value: 'vulkan', label: 'Vulkan — cross-vendor GPU' },
@@ -2452,7 +2869,6 @@ function unregisterGenerationSession(session) {
         { value: 'sequential', label: 'Sequential — layer pipeline (default)' },
         { value: 'parallel', label: 'Parallel — tensor split' }
     ];
-
     function normalizedBackend(value) {
         var backend = String(value || 'cuda').trim().toLowerCase();
         return ['cuda', 'vulkan', 'cpu'].indexOf(backend) >= 0 ? backend : 'cuda';
@@ -2508,12 +2924,12 @@ function unregisterGenerationSession(session) {
         if (!state || !Array.isArray(state.nodes)) return { loaderId: '', modelId: '' };
         var connections = Array.isArray(state.connections) ? state.connections : [];
         var connectedLoaders = connections.filter(function(connection) {
-            return String(connection.fromNode) === String(node.id)
-                && connection.fromSocket === 'server'
-                && connection.toSocket === 'server';
+            return String(connection.toNode) === String(node.id)
+                && connection.toSocket === 'model'
+                && connection.fromSocket === 'model';
         }).map(function(connection) {
             return state.nodes.find(function(candidate) {
-                return String(candidate.id) === String(connection.toNode) && candidate.type === 'modelLoader';
+                return String(candidate.id) === String(connection.fromNode) && candidate.type === 'modelLoader';
             });
         }).filter(Boolean);
         var selected = connectedLoaders.find(function(loader) { return String(loader.selectedModel || '').trim(); })
@@ -2590,14 +3006,18 @@ function unregisterGenerationSession(session) {
         return p;
     }
 
-    function mtpSettingsHTML(node) {
+    function mtpModeControlHTML(node) {
+        var p = normalizeMtpParams(node);
+        return controls.select('MTP', p.mtpMode, node.id, 'mtpMode', MTP_MODES);
+    }
+
+    function mtpContinuationHTML(node) {
         var p = normalizeMtpParams(node);
         var capability = modelMtpCapabilityForServer(node);
         var capabilityText = capability
             ? 'Selected GGUF advertises ' + capability.nextnPredictLayers + ' embedded NextN/MTP layer' + (capability.nextnPredictLayers === 1 ? '' : 's') + '.'
             : 'Selected GGUF does not currently advertise embedded NextN/MTP metadata.';
-        var html = controls.select('MTP', p.mtpMode, node.id, 'mtpMode', MTP_MODES) +
-            '<div class="node-param"><div class="node-param-label"><span>MTP capability</span></div><div class="node-param-value">' + controls.escapeHtml(capabilityText) + '</div></div>';
+        var html = '<div class="node-param"><div class="node-param-label"><span>MTP capability</span></div><div class="node-param-value">' + controls.escapeHtml(capabilityText) + '</div></div>';
         if (p.mtpMode !== 'on') return html;
         return html +
             controls.textInput('MTP max draft tokens', p.mtpDraftTokens, node.id, 'mtpDraftTokens', 'auto') +
@@ -2617,17 +3037,13 @@ function unregisterGenerationSession(session) {
 
     function modelContextLengthForServer(node) {
         var modelId = selectedModelIdForServer(node);
-        var record = inventoryModelRecord(modelId);
-        var contextLength = normalizedContextLength(record && record.contextLength);
-        if (contextLength) return contextLength;
-        var select = root.document && root.document.getElementById ? root.document.getElementById('modelSelect') : null;
-        if (!select || !select.options) return null;
-        for (var index = 0; index < select.options.length; index += 1) {
-            var option = select.options[index];
-            if (String(option.value || '') !== modelId) continue;
-            return normalizedContextLength(option.dataset && option.dataset.contextLength);
+        var runtime = ensureGpuState(node);
+        if (String(runtime.modelMetadataModelId || '') === modelId) {
+            var cached = normalizedContextLength(runtime.modelMetadataContextLength);
+            if (cached) return cached;
         }
-        return null;
+        var record = inventoryModelRecord(modelId);
+        return normalizedContextLength(record && record.contextLength);
     }
 
     function normalizeContextSize(value, maximum) {
@@ -2641,64 +3057,147 @@ function unregisterGenerationSession(session) {
         return String(parsed);
     }
 
+    function normalizedContextPercent(value) {
+        var parsed = Number(value);
+        if (!Number.isFinite(parsed)) return null;
+        var snapped = Math.round(parsed / CONTEXT_PERCENT_STEP) * CONTEXT_PERCENT_STEP;
+        return Math.max(CONTEXT_PERCENT_MIN, Math.min(CONTEXT_PERCENT_MAX, snapped));
+    }
+
+    function contextSizeForPercent(modelMaximum, percent) {
+        var maximum = normalizedContextLength(modelMaximum);
+        var normalizedPercent = normalizedContextPercent(percent);
+        if (!maximum || !normalizedPercent) return null;
+        if (normalizedPercent === CONTEXT_PERCENT_MAX) return maximum;
+        return Math.max(CONTEXT_STEP, Math.min(maximum, Math.floor(maximum * normalizedPercent / 100)));
+    }
+
+    function contextPercentFromLegacySize(value, modelMaximum) {
+        var maximum = normalizedContextLength(modelMaximum);
+        if (!maximum) return null;
+        var raw = String(value === undefined || value === null ? '' : value).trim().toLowerCase();
+        if (!raw || raw === 'auto' || raw === '0') return CONTEXT_PERCENT_MAX;
+        var size = Number.parseInt(raw, 10);
+        if (!Number.isFinite(size)) return CONTEXT_PERCENT_MAX;
+        size = Math.max(CONTEXT_STEP, Math.min(maximum, size));
+        return normalizedContextPercent((size / maximum) * 100) || CONTEXT_PERCENT_MIN;
+    }
+
+    function serverContextSelection(node, knownMaximum) {
+        node.params = node.params || {};
+        var modelId = selectedModelIdForServer(node);
+        var modelMaximum = normalizedContextLength(knownMaximum) || modelContextLengthForServer(node);
+        var percent = normalizedContextPercent(node.params.contextPercent);
+        if (modelMaximum) {
+            if (!percent) percent = contextPercentFromLegacySize(node.params.contextSize, modelMaximum);
+            node.params.contextPercent = percent;
+            node.params.contextSize = contextSizeForPercent(modelMaximum, percent);
+        } else {
+            node.params.contextSize = normalizeContextSize(node.params.contextSize, null);
+            if (percent) node.params.contextPercent = percent;
+        }
+        return { modelId: modelId, modelMaximum: modelMaximum, percent: percent, contextSize: node.params.contextSize };
+    }
+
+    function formatContextTokens(value) {
+        var parsed = Number(value);
+        return Number.isFinite(parsed) ? Math.trunc(parsed).toLocaleString('en-US') : '';
+    }
+
+    function serverContextDisplay(node) {
+        var selection = serverContextSelection(node);
+        if (!selection.modelMaximum) {
+            if (!selection.modelId) return 'Select model';
+            var runtime = ensureGpuState(node);
+            var status = String(runtime.modelMetadataModelId || '') === selection.modelId ? runtime.modelMetadataStatus : 'idle';
+            return status === 'unavailable' || status === 'error' ? 'Context limit unavailable' : 'Reading context limit…';
+        }
+        return selection.percent + '% · ' + formatContextTokens(selection.contextSize);
+    }
+
+    function contextSliderHTML(node) {
+        var selection = serverContextSelection(node);
+        var escape = controls.escapeHtml;
+        var available = Boolean(selection.modelMaximum);
+        var sliderValue = selection.percent || normalizedContextPercent(node.params.contextPercent) || CONTEXT_PERCENT_MAX;
+        var display = serverContextDisplay(node);
+        var disabled = available ? '' : ' disabled';
+        var maximumText = available ? ' data-model-context-maximum="' + escape(selection.modelMaximum) + '"' : '';
+        return '<div class="node-param node-context-size-control"><div class="node-param-label"><span>Context size</span><span class="node-param-value">' + escape(display) + '</span></div>' +
+            '<input type="range" class="node-slider node-context-size-slider" min="' + CONTEXT_PERCENT_MIN + '" max="' + CONTEXT_PERCENT_MAX + '" step="' + CONTEXT_PERCENT_STEP + '" value="' + escape(sliderValue) + '"' + disabled +
+            ' data-node-id="' + escape(node.id) + '" data-param="contextPercent" data-param-kind="number"' + maximumText + ' aria-label="Context size" aria-valuetext="' + escape(display) + '"></div>';
+    }
+
     function gpuLayerContext(node) {
         var runtime = ensureGpuState(node);
         var modelId = selectedModelIdForServer(node);
-        var discovered = inventoryLayerCount(modelId);
-        if (discovered) {
-            runtime.gpuLayerModelId = modelId;
-            runtime.gpuLayerCount = discovered;
-        }
-        var layerCount = runtime.gpuLayerModelId === modelId
-            ? normalizedModelLayerCount(runtime.gpuLayerCount)
+        var layerCount = String(runtime.modelMetadataModelId || '') === modelId
+            ? normalizedModelLayerCount(runtime.modelMetadataLayerCount)
             : null;
+        if (!layerCount) layerCount = inventoryLayerCount(modelId);
         return { modelId: modelId, layerCount: layerCount };
     }
 
+    async function inspectSelectedModelMetadata(modelId) {
+        if (!modelId) return null;
+        if (modelMetadataQueries[modelId]) return modelMetadataQueries[modelId];
+        var bridge = common.getLlamaBridge();
+        if (typeof bridge.inspectModel !== 'function') return null;
+        var query = Promise.resolve(bridge.inspectModel(modelId)).then(function(response) {
+            var record = response && response.success && response.model && typeof response.model === 'object' ? response.model : null;
+            if (record && typeof common.cacheModelRecord === 'function') common.cacheModelRecord(record);
+            return record;
+        }).catch(function() { return null; }).finally(function() {
+            if (modelMetadataQueries[modelId] === query) delete modelMetadataQueries[modelId];
+        });
+        modelMetadataQueries[modelId] = query;
+        return query;
+    }
+
     async function refreshGpuLayerMetadata(node, options) {
+        options = options || {};
         var runtime = ensureGpuState(node);
         var modelContext = selectedModelContextForServer(node);
         var modelId = modelContext.modelId;
-        var previousModelId = String(runtime.gpuLayerModelId || '');
-        var previousCount = normalizedModelLayerCount(runtime.gpuLayerCount);
+        var previousModelId = String(runtime.modelMetadataModelId || '');
+        var previousCount = normalizedModelLayerCount(runtime.modelMetadataLayerCount);
+        var previousContextLength = normalizedContextLength(runtime.modelMetadataContextLength);
         var previousValue = node.params.gpuLayers;
-        var previousContextValue = node.params.contextSize;
-        var previousContextLength = modelContextLengthForServer(node);
-        var shouldResetForModelSwitch = options && options.resetGpuLayers === true
+        var shouldResetForModelSwitch = options.resetGpuLayers === true
             && String(options.changedLoaderId || '') === modelContext.loaderId
             && String(options.previousModelId || '') !== modelId;
         if (shouldResetForModelSwitch) node.params.gpuLayers = 'auto';
-        var layerCount = inventoryLayerCount(modelId);
-
-        var contextLength = modelContextLengthForServer(node);
-        if (modelId && (!layerCount || !contextLength)) {
-            try {
-                var bridge = common.getLlamaBridge();
-                if (typeof bridge.listModels === 'function') {
-                    var response = await bridge.listModels();
-                    var models = response && response.success && Array.isArray(response.models) ? response.models : [];
-                    var record = models.find(function(candidate) {
-                        return String(candidate && (candidate.id || candidate.fileName || candidate.displayName) || '') === modelId;
-                    });
-                    layerCount = normalizedModelLayerCount(record && record.layerCount);
-                    contextLength = normalizedContextLength(record && record.contextLength);
-                    if (root.Darkstar && models.length) root.Darkstar.modelInventory = models.slice();
-                }
-            } catch (_error) {
-                layerCount = null;
-            }
+        if (previousModelId !== modelId) {
+            runtime.modelMetadataModelId = modelId;
+            runtime.modelMetadataLayerCount = null;
+            runtime.modelMetadataContextLength = null;
+            runtime.modelMetadataStatus = modelId ? 'idle' : 'unavailable';
         }
-
-        runtime.gpuLayerModelId = modelId;
-        runtime.gpuLayerCount = layerCount;
+        var record = inventoryModelRecord(modelId);
+        var layerCount = normalizedModelLayerCount(record && record.layerCount);
+        var contextLength = normalizedContextLength(record && record.contextLength);
+        var hasCompleteMetadata = Boolean(layerCount && contextLength);
+        var alreadyResolved = previousModelId === modelId && (runtime.modelMetadataStatus === 'ready' || runtime.modelMetadataStatus === 'unavailable');
+        var inspectionAttempted = false;
+        if (modelId && !hasCompleteMetadata && !alreadyResolved && options.queryModelMetadata === true) {
+            runtime.modelMetadataStatus = 'loading';
+            inspectionAttempted = true;
+            var inspected = await inspectSelectedModelMetadata(modelId);
+            if (selectedModelIdForServer(node) !== modelId) return true;
+            layerCount = normalizedModelLayerCount(inspected && inspected.layerCount) || layerCount;
+            contextLength = normalizedContextLength(inspected && inspected.contextLength) || contextLength;
+        }
+        runtime.modelMetadataModelId = modelId;
+        runtime.modelMetadataLayerCount = layerCount;
+        runtime.modelMetadataContextLength = contextLength;
+        if (contextLength) runtime.modelMetadataStatus = 'ready';
+        else if (!modelId || inspectionAttempted) runtime.modelMetadataStatus = 'unavailable';
+        else if (!alreadyResolved) runtime.modelMetadataStatus = 'idle';
         node.params.gpuLayers = normalizeGpuLayers(node.params.gpuLayers, layerCount);
-        contextLength = modelContextLengthForServer(node) || contextLength;
-        node.params.contextSize = normalizeContextSize(node.params.contextSize, contextLength);
         return previousModelId !== modelId
             || previousCount !== layerCount
             || previousContextLength !== contextLength
-            || previousValue !== node.params.gpuLayers
-            || previousContextValue !== node.params.contextSize;
+            || previousValue !== node.params.gpuLayers;
     }
 
     function gpuLayersSliderHTML(node) {
@@ -2731,6 +3230,10 @@ function unregisterGenerationSession(session) {
         if (typeof node.runtime.gpuDetectionError !== 'string') node.runtime.gpuDetectionError = '';
         if (!Number.isFinite(Number(node.runtime.gpuNextRefreshAt))) node.runtime.gpuNextRefreshAt = 0;
         if (typeof node.runtime.gpuRefreshInFlight !== 'boolean') node.runtime.gpuRefreshInFlight = false;
+        if (typeof node.runtime.modelMetadataModelId !== 'string') node.runtime.modelMetadataModelId = '';
+        if (!normalizedModelLayerCount(node.runtime.modelMetadataLayerCount)) node.runtime.modelMetadataLayerCount = null;
+        if (!normalizedContextLength(node.runtime.modelMetadataContextLength)) node.runtime.modelMetadataContextLength = null;
+        if (['idle', 'loading', 'ready', 'unavailable', 'error'].indexOf(node.runtime.modelMetadataStatus) < 0) node.runtime.modelMetadataStatus = 'idle';
         return node.runtime;
     }
 
@@ -2849,12 +3352,14 @@ function unregisterGenerationSession(session) {
 
     var definition = {
         id: 'loadServer',
-        title: 'Load Server',
+        title: 'LlamaCPP Server',
         badge: 'LLAMA.CPP',
         outputNode: false,
         rerenderOnParameterChange: true,
-        inputs: [],
-        outputs: [{ name: 'server', label: 'server', type: types.SERVER }],
+        inputs: [
+            { name: 'model', label: 'Language Model', type: types.MODEL_CONFIG, required: true }
+        ],
+        outputs: [{ name: 'gguf', label: 'Language Model', type: types.MODEL }],
         factory: function(nodeId, x, y) {
             return common.baseNode(definition, nodeId, x, y, {
                 uiWidth: LOAD_SERVER_UI_WIDTH,
@@ -2862,6 +3367,7 @@ function unregisterGenerationSession(session) {
                     backend: 'cuda',
                     port: 0,
                     contextSize: 'auto',
+                    contextPercent: 100,
                     cacheTypeK: 'f16',
                     cacheTypeV: 'f16',
                     kvCacheLocation: 'gpu',
@@ -2883,23 +3389,28 @@ function unregisterGenerationSession(session) {
                     mtpGpuLayers: 'auto',
                     mtpCacheTypeK: 'auto',
                     mtpCacheTypeV: 'auto',
-                    mtpBackendSampling: 'auto'
+                    mtpBackendSampling: 'auto',
                 },
                 runtime: {
                     gpuDevices: [],
                     gpuDetectionStatus: 'idle',
                     gpuDetectionError: '',
-                    gpuLayerModelId: '',
-                    gpuLayerCount: null
+                    modelMetadataModelId: '',
+                    modelMetadataLayerCount: null,
+                    modelMetadataContextLength: null,
+                    modelMetadataStatus: 'idle'
                 }
             });
         },
         normalizeNode: function(node) {
             node.uiWidth = LOAD_SERVER_UI_WIDTH;
+            var savedTitle = String(node && node.title ? node.title : '').trim();
+            if (!savedTitle || savedTitle === 'Load Server' || savedTitle === 'Load GGUF Server' || savedTitle === 'GGUF Server') node.title = definition.title;
+            node.inputs = definition.inputs.map(function(input) { return Object.assign({}, input); });
+            node.outputs = definition.outputs.map(function(output) { return Object.assign({}, output); });
             var runtime = ensureGpuState(node);
             node.params.backend = normalizedBackend(node.params.backend);
-            node.params.gpuLayers = normalizeGpuLayers(node.params.gpuLayers, runtime.gpuLayerCount);
-            node.params.contextSize = normalizeContextSize(node.params.contextSize, modelContextLengthForServer(node));
+            node.params.gpuLayers = normalizeGpuLayers(node.params.gpuLayers, runtime.modelMetadataLayerCount);
             if (node.params.kvCacheLocation !== 'cpu') node.params.kvCacheLocation = 'gpu';
             node.params.multiGpuMode = node.params.multiGpuMode === 'parallel' ? 'parallel' : 'sequential';
             if (node.params.backend === 'cpu') {
@@ -2914,6 +3425,7 @@ function unregisterGenerationSession(session) {
                 node.params.flashAttention = false;
             }
             normalizeMtpParams(node);
+            serverContextSelection(node);
         },
         buildContentHTML: function(node) {
             var p = node.params;
@@ -2935,25 +3447,31 @@ function unregisterGenerationSession(session) {
                 kvLocationControl = '<div class="node-param"><div class="node-param-label"><span>KV cache location</span></div><div class="node-param-value">CPU — system RAM</div></div>';
                 backendControls = '<div class="node-param"><div class="node-param-label"><span>GPU offload</span></div><div class="node-param-value">Disabled for CPU backend</div></div>';
             }
-            return controls.select('llama.cpp backend', p.backend, node.id, 'backend', LLAMA_BACKENDS) +
+            var runtimeControls = controls.select('llama.cpp backend', p.backend, node.id, 'backend', LLAMA_BACKENDS) +
                 controls.numberInput('Port (0 = auto)', p.port, node.id, 'port', { min: 0, max: 65535, step: 1 }) +
-                kvLocationControl +
+                contextSliderHTML(node) +
+                controls.numberInput('Rope Frequency Base', p.ropeFrequencyBase, node.id, 'ropeFrequencyBase', { min: 0, max: 1000000000000, step: 1 });
+            var memoryControls = kvLocationControl +
                 controls.select('KV cache K type', p.cacheTypeK || 'f16', node.id, 'cacheTypeK', KV_CACHE_TYPES) +
-                controls.select('KV cache V type', p.cacheTypeV || 'f16', node.id, 'cacheTypeV', KV_CACHE_TYPES) +
-                controls.numberInput('Rope Frequency Base', p.ropeFrequencyBase, node.id, 'ropeFrequencyBase', { min: 0, max: 1000000000000, step: 1 }) +
-                backendControls +
-                controls.numberInput('Threads (0 = auto)', p.threads, node.id, 'threads', { min: 0, max: 1024, step: 1 }) +
+                controls.select('KV cache V type', p.cacheTypeV || 'f16', node.id, 'cacheTypeV', KV_CACHE_TYPES);
+            var performanceControls = controls.numberInput('Threads (0 = auto)', p.threads, node.id, 'threads', { min: 0, max: 1024, step: 1 }) +
                 controls.numberInput('Batch size', p.batchSize, node.id, 'batchSize', { min: 1, max: 1048576, step: 1 }) +
                 controls.numberInput('Micro-batch size', p.ubatchSize, node.id, 'ubatchSize', { min: 1, max: 1048576, step: 1 }) +
                 controls.numberInput('Parallel Slots', p.parallel, node.id, 'parallel', { min: 1, max: 128, step: 1 }) +
                 flashAttentionControl +
-                mtpSettingsHTML(node) +
-                controls.status(node, 'Not running');
+                mtpModeControlHTML(node) +
+                mtpContinuationHTML(node);
+            return '<div class="load-server-settings">' +
+                controls.group('Runtime', 'Server backend, context window, and process settings.', runtimeControls) +
+                controls.group('Memory', 'Key/value cache placement and precision.', memoryControls) +
+                controls.group('Acceleration', 'GPU offload and device visibility.', backendControls, 'load-server-acceleration-group') +
+                controls.group('Performance', 'Threading, batching, attention, and parallel inference.', performanceControls) +
+                controls.status(node, 'Not running') + '</div>';
         },
         onMount: async function(node) {
             var runtime = ensureGpuState(node);
             node.params.backend = normalizedBackend(node.params.backend);
-            var changed = await refreshGpuLayerMetadata(node);
+            var changed = await refreshGpuLayerMetadata(node, { queryModelMetadata: false });
             if (node.params.backend === 'cuda' && runtime.gpuDetectionStatus === 'idle') {
                 await refreshGpuDevices(node, { showLoading: true });
                 changed = true;
@@ -2964,8 +3482,8 @@ function unregisterGenerationSession(session) {
             var view = document.getElementById('settingsView');
             if (!view || !view.classList.contains('active')) return false;
             var runtime = ensureGpuState(node);
-            if (selectedModelIdForServer(node) !== String(runtime.gpuLayerModelId || '')) {
-                if (await refreshGpuLayerMetadata(node)) return true;
+            if (selectedModelIdForServer(node) !== String(runtime.modelMetadataModelId || '')) {
+                if (await refreshGpuLayerMetadata(node, { queryModelMetadata: true })) return true;
             }
             if (normalizedBackend(node.params.backend) !== 'cuda') return false;
             if (runtime.gpuRefreshInFlight || now < runtime.gpuNextRefreshAt) return false;
@@ -2973,7 +3491,17 @@ function unregisterGenerationSession(session) {
             updateGpuPanelElement(node, element);
             return false;
         },
+        getParameterDisplayValue: function(node, param) {
+            return param === 'contextPercent' ? serverContextDisplay(node) : undefined;
+        },
         onParameterChange: function(node, param) {
+            if (param === 'contextPercent') {
+                node.params.contextPercent = normalizedContextPercent(node.params.contextPercent) || CONTEXT_PERCENT_MIN;
+                serverContextSelection(node);
+                node.status = 'idle';
+                node.statusMessage = '';
+                return;
+            }
             if (param === 'backend') {
                 node.params.backend = normalizedBackend(node.params.backend);
                 if (node.params.backend === 'cpu') {
@@ -2998,7 +3526,7 @@ function unregisterGenerationSession(session) {
                 return;
             }
             if (param === 'gpuLayers') {
-                node.params.gpuLayers = normalizeGpuLayers(node.params.gpuLayers, ensureGpuState(node).gpuLayerCount);
+                node.params.gpuLayers = normalizeGpuLayers(node.params.gpuLayers, ensureGpuState(node).modelMetadataLayerCount);
                 node.status = 'idle';
                 node.statusMessage = '';
                 return;
@@ -3029,71 +3557,134 @@ function unregisterGenerationSession(session) {
                 node.statusMessage = '';
             }
         },
-        execute: async function(_inputs, node, context) {
+        execute: async function(inputs, node, context) {
             ensureGpuState(node);
+            var modelRequest = inputs && inputs.model;
+            if (!modelRequest || !String(modelRequest.id || '').trim()) throw new Error('LlamaCPP Server: no Language Model input.');
             if (typeof root.setContextContractRuntimeContextReady === 'function') root.setContextContractRuntimeContextReady(false);
             else root.window.CONTEXT_LIMIT_READY = false;
             var bridge = common.getLlamaBridge();
+            var modelId = String(modelRequest.id || '').trim();
             node.status = 'loading';
             node.statusMessage = 'Starting llama.cpp...';
-            var selectedContext = selectedModelContextForServer(node);
-            var modelContextLength = modelContextLengthForServer(node);
-            var graphContextSize = Number.parseInt(context && context.localModelContextSize, 10);
-            var authoritativeContextSize = Number.isFinite(graphContextSize) && graphContextSize >= CONTEXT_STEP
-                ? graphContextSize
-                : node.params.contextSize;
+            var record = modelRequest.metadata && typeof modelRequest.metadata === 'object' ? modelRequest.metadata : inventoryModelRecord(modelId);
+            var modelContextLength = normalizedContextLength(record && record.contextLength) || modelContextLengthForServer(node);
+            var contextSelection = serverContextSelection(node, modelContextLength);
+            var authoritativeContextSize = normalizeContextSize(contextSelection.contextSize, modelContextLength);
             var serverConfig = Object.assign({}, node.params, {
                 contextSize: authoritativeContextSize,
-                modelId: selectedContext.modelId,
+                modelId: modelId,
                 modelContextLength: modelContextLength
             });
-            var result = await runGenerationOperation(context, function() {
+            delete serverConfig.contextPercent;
+            var started = await runGenerationOperation(context, function() {
                 return bridge.startServer(serverConfig);
             });
-            if (!result || !result.success || !result.port) {
-                throw new Error('Load Server: ' + (result && result.error ? result.error : 'failed to start llama.cpp.'));
+            if (!started || !started.success || !started.port) {
+                throw new Error('LlamaCPP Server: ' + (started && started.error ? started.error : 'failed to start llama.cpp.'));
             }
-            node.status = 'active';
-            var backend = normalizedBackend(result.backend || node.params.backend);
-            var backendLabel = ' · ' + (backend === 'cuda' ? 'CUDA' : (backend === 'vulkan' ? 'Vulkan' : 'CPU'));
-            var gpuLabel = backend === 'cuda' && result.gpuSelection && result.gpuSelection.label ? ' · ' + result.gpuSelection.label : '';
-            var multiGpuMode = backend === 'cuda' ? (result.multiGpuMode || node.params.multiGpuMode || 'sequential') : 'sequential';
-            var splitLabel = multiGpuMode === 'parallel' && result.tensorSplitLabel ? ' [' + result.tensorSplitLabel + ']' : '';
-            var multiGpuLabel = backend === 'cuda' ? ' · ' + (multiGpuMode === 'parallel' ? 'Parallel GPUs' + splitLabel : 'Sequential GPUs') : '';
-            var mtp = result.mtp && typeof result.mtp === 'object' ? result.mtp : null;
-            var mtpLabel = mtp && mtp.enabled
-                ? ' · MTP ' + (mtp.autoTuned ? 'Auto' : 'On') + (mtp.draftTokens ? ' (draft ' + mtp.draftTokens + ')' : '')
-                : (node.params.mtpMode === 'off' ? ' · MTP Off' : '');
-            var parallelSlots = Math.max(1, Number(result.parallelSlots) || Number(node.params.parallel) || 1);
-            var requestedContext = serverConfig.contextSize === 'auto' ? modelContextLengthForServer(node) : Number(serverConfig.contextSize);
-            var reportedTotalContext = Math.max(256, Number(result.totalContextSize) || Number(requestedContext) || 8192);
+
+            var backend = normalizedBackend(started.backend || node.params.backend);
+            var parallelSlots = Math.max(1, Number(started.parallelSlots) || Number(node.params.parallel) || 1);
+            var requestedContext = serverConfig.contextSize === 'auto' ? modelContextLength : Number(serverConfig.contextSize);
+            var reportedTotalContext = Math.max(CONTEXT_STEP, Number(started.totalContextSize) || Number(requestedContext) || 8192);
             var totalContextSize = Number.isFinite(Number(requestedContext)) && Number(requestedContext) >= CONTEXT_STEP
                 ? Math.min(reportedTotalContext, Number(requestedContext))
                 : reportedTotalContext;
-            var reportedPerSlotContext = Math.max(256, Number(result.contextSizePerSlot) || Math.floor(reportedTotalContext / parallelSlots));
-            var configuredPerSlotContext = Math.max(256, Math.floor(totalContextSize / parallelSlots));
+            var reportedPerSlotContext = Math.max(CONTEXT_STEP, Number(started.contextSizePerSlot) || Math.floor(reportedTotalContext / parallelSlots));
+            var configuredPerSlotContext = Math.max(CONTEXT_STEP, Math.floor(totalContextSize / parallelSlots));
             var perSlotContext = Math.min(reportedPerSlotContext, configuredPerSlotContext);
-            node.statusMessage = '127.0.0.1:' + result.port + backendLabel + gpuLabel + multiGpuLabel + mtpLabel + ' · ' + perSlotContext.toLocaleString() + ' ctx/slot';
             root.window.TOKEN_LIMIT = perSlotContext;
+
+            node.statusMessage = 'Loading ' + modelId + '...';
+            var projectorPath = String(modelRequest.projectorPath || '').trim();
+            var autoDetectProjector = modelRequest.projectorSource !== 'none';
+            var loaded = await runGenerationOperation(context, function() {
+                return bridge.loadModel(modelId, projectorPath, { autoDetectProjector: autoDetectProjector });
+            });
+            if (!loaded || !loaded.success || !loaded.modelId) {
+                throw new Error('LlamaCPP Server: ' + (loaded && loaded.error ? loaded.error : 'model loading failed.'));
+            }
+            if (loaded.metadata && typeof common.cacheModelRecord === 'function') common.cacheModelRecord(loaded.metadata);
+
+            // Direct-file and projector-backed loads can replace the process that
+            // startServer() created. Refresh the runtime identity after loading so
+            // the GGUF output never publishes a stale host/port/backend snapshot.
+            var postLoadStatus = null;
+            if (typeof bridge.getStatus === 'function') {
+                try {
+                    var refreshedStatus = await runGenerationOperation(context, function() {
+                        return bridge.getStatus();
+                    });
+                    if (refreshedStatus && refreshedStatus.success !== false && refreshedStatus.running && refreshedStatus.port) {
+                        postLoadStatus = refreshedStatus;
+                    }
+                } catch (statusError) {
+                    if (statusError && statusError.name === 'AbortError') throw statusError;
+                }
+            }
+            var authoritativeServer = postLoadStatus || started;
+            backend = normalizedBackend(authoritativeServer.backend || backend || node.params.backend);
+            parallelSlots = Math.max(1, Number(authoritativeServer.parallelSlots) || parallelSlots || 1);
+
+            var measuredPerSlot = Number(loaded.contextSizePerSlot || loaded.effectiveContextSize || authoritativeServer.contextSizePerSlot);
+            var measuredTotal = Number(loaded.totalContextSize || authoritativeServer.totalContextSize);
+            var measuredParallel = Math.max(1, Number(loaded.parallelSlots || loaded.effectiveParallelSlots || authoritativeServer.parallelSlots || parallelSlots) || 1);
+            var effectivePerSlot = Number.isFinite(measuredPerSlot) && measuredPerSlot > 0 ? Math.floor(measuredPerSlot) : perSlotContext;
+            effectivePerSlot = Math.min(effectivePerSlot, perSlotContext);
+            var effectiveTotal = Number.isFinite(measuredTotal) && measuredTotal > 0 ? Math.floor(measuredTotal) : effectivePerSlot * measuredParallel;
+            effectiveTotal = Math.min(effectiveTotal, totalContextSize);
+            root.window.TOKEN_LIMIT = effectivePerSlot;
+            if (typeof root.setContextContractRuntimeContextReady === 'function') root.setContextContractRuntimeContextReady(true, effectivePerSlot);
+            else root.window.CONTEXT_LIMIT_READY = true;
+            if (typeof root.updateTokenCounter === 'function') root.updateTokenCounter();
+            else if (typeof updateTokenCounter === 'function') updateTokenCounter();
+
+            var serverMtp = loaded.mtp && typeof loaded.mtp === 'object'
+                ? loaded.mtp
+                : (authoritativeServer.mtp && typeof authoritativeServer.mtp === 'object' ? authoritativeServer.mtp : null);
+            var server = {
+                running: true,
+                host: authoritativeServer.host || started.host || '127.0.0.1',
+                port: authoritativeServer.port || started.port,
+                mode: authoritativeServer.mode || started.mode || 'unknown',
+                backend: backend,
+                reused: Boolean(loaded.reused || authoritativeServer.reused || started.reused),
+                gpuSelection: authoritativeServer.gpuSelection || started.gpuSelection || null,
+                multiGpuMode: backend === 'cuda' ? (authoritativeServer.multiGpuMode || started.multiGpuMode || node.params.multiGpuMode || 'sequential') : 'sequential',
+                tensorSplit: authoritativeServer.tensorSplit || started.tensorSplit || null,
+                tensorSplitLabel: authoritativeServer.tensorSplitLabel || started.tensorSplitLabel || null,
+                kvCacheLocation: authoritativeServer.kvCacheLocation || started.kvCacheLocation || node.params.kvCacheLocation || 'gpu',
+                requestedContextMode: authoritativeServer.requestedContextMode || started.requestedContextMode || (serverConfig.contextSize === 'auto' ? 'auto' : 'manual'),
+                parallelSlots: measuredParallel,
+                totalContextSize: effectiveTotal,
+                contextSizePerSlot: effectivePerSlot,
+                contextMeasurementSource: loaded.contextMeasurementSource || authoritativeServer.contextMeasurementSource || started.contextMeasurementSource || 'model-load',
+                mtp: serverMtp
+            };
+
+            var gpuLabel = backend === 'cuda' && server.gpuSelection && server.gpuSelection.label ? ' · ' + server.gpuSelection.label : '';
+            var splitLabel = server.multiGpuMode === 'parallel' && server.tensorSplitLabel ? ' [' + server.tensorSplitLabel + ']' : '';
+            var multiGpuLabel = backend === 'cuda' ? ' · ' + (server.multiGpuMode === 'parallel' ? 'Parallel GPUs' + splitLabel : 'Sequential GPUs') : '';
+            var mtpLabel = serverMtp && serverMtp.enabled
+                ? ' · MTP ' + (serverMtp.autoTuned ? 'Auto' : 'On') + (serverMtp.draftTokens ? ' (draft ' + serverMtp.draftTokens + ')' : '')
+                : (node.params.mtpMode === 'off' ? ' · MTP Off' : '');
+            var fallbackLabel = (loaded.mtpFallback ? ' · MTP Auto→Off' : '') + (loaded.memoryFallback ? ' · adaptive VRAM settings' : '');
+            node.status = 'active';
+            node.statusMessage = loaded.modelId + ' · ' + server.host + ':' + server.port + ' · ' + (backend === 'cuda' ? 'CUDA' : (backend === 'vulkan' ? 'Vulkan' : 'CPU')) + gpuLabel + multiGpuLabel + mtpLabel + ' · ' + effectivePerSlot.toLocaleString() + ' ctx/slot' + fallbackLabel;
+
+            var reasoningCapability = loaded.reasoning || (loaded.metadata && loaded.metadata.reasoning) || modelRequest.reasoning || (record && record.reasoning) || null;
             return {
-                server: {
-                    running: true,
-                    host: result.host || '127.0.0.1',
-                    port: result.port,
-                    mode: result.mode || 'unknown',
-                    backend: backend,
-                    reused: Boolean(result.reused),
-                    gpuSelection: result.gpuSelection || null,
-                    multiGpuMode: multiGpuMode,
-                    tensorSplit: result.tensorSplit || null,
-                    tensorSplitLabel: result.tensorSplitLabel || null,
-                    kvCacheLocation: result.kvCacheLocation || node.params.kvCacheLocation || 'gpu',
-                    requestedContextMode: result.requestedContextMode || (serverConfig.contextSize === 'auto' ? 'auto' : 'manual'),
-                    parallelSlots: parallelSlots,
-                    totalContextSize: totalContextSize,
-                    contextSizePerSlot: perSlotContext,
-                    contextMeasurementSource: result.contextMeasurementSource || 'configured',
-                    mtp: mtp
+                gguf: {
+                    id: loaded.modelId,
+                    status: loaded.status || 'loaded',
+                    metadata: loaded.metadata || record || null,
+                    reasoning: reasoningCapability,
+                    mtp: loaded.mtpCapability || (loaded.metadata && loaded.metadata.mtp) || modelRequest.mtp || (record && record.mtp) || null,
+                    serverMtp: serverMtp,
+                    server: server,
+                    projectorPath: loaded.projectorPath || projectorPath || null,
+                    multimodal: loaded.multimodal === true || Boolean(loaded.projectorPath || projectorPath)
                 }
             };
         }
@@ -3107,7 +3698,12 @@ function unregisterGenerationSession(session) {
         for (var index = 0; index < servers.length; index += 1) {
             if (await refreshGpuLayerMetadata(servers[index], options || null)) {
                 changed = true;
-                if (typeof rerenderNode === 'function') rerenderNode(servers[index].id);
+                if (typeof rerenderNode === 'function') {
+                    rerenderNode(servers[index].id);
+                    state.nodes.filter(function(node) { return node.type === 'localSampler'; }).forEach(function(node) {
+                        rerenderNode(node.id);
+                    });
+                }
             }
         }
         return changed;
@@ -3116,6 +3712,332 @@ function unregisterGenerationSession(session) {
     nodes.registerNode(definition);
 })(globalThis);
     // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/load-server.js">
+    // RENDERER MODULE :: backend/renderer/nodes/builtin/local-sampler.js
+    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/nodes/builtin/local-sampler.js">
+(function registerLocalSamplerNode(root) {
+    'use strict';
+
+    var nodes = root.Darkstar.nodes;
+    var common = nodes.builtinCommon;
+    var controls = nodes.controls;
+    var types = nodes.PORT_TYPES;
+    var SAMPLING_PARAM_KEYS = [
+        'seed', 'temperature', 'topK', 'topP', 'minP', 'typicalP',
+        'repeatPenalty', 'repeatLastN', 'presencePenalty', 'frequencyPenalty',
+        'dryMultiplier', 'dryBase', 'dryAllowedLength', 'dryPenaltyLastN',
+        'mirostat', 'mirostatTau', 'mirostatEta', 'samplers',
+        'stop', 'cachePrompt', 'ignoreEos'
+    ];
+    function boundedNumber(value, fallback, minimum, maximum) {
+        var number = Number(value);
+        if (!Number.isFinite(number)) number = fallback;
+        return Math.max(minimum, Math.min(maximum, number));
+    }
+
+    function boundedInteger(value, fallback, minimum, maximum) {
+        return Math.trunc(boundedNumber(value, fallback, minimum, maximum));
+    }
+
+    function currentGraphState() {
+        if (typeof nodeEditorState !== 'undefined' && nodeEditorState) return nodeEditorState;
+        return root.nodeEditorState || null;
+    }
+
+    function selectedModelIdForSampler(node) {
+        var state = currentGraphState();
+        if (!state || !Array.isArray(state.nodes)) return '';
+        var connections = Array.isArray(state.connections) ? state.connections : [];
+        var serverEdge = connections.find(function(connection) {
+            return String(connection.toNode) === String(node.id)
+                && connection.toSocket === 'gguf'
+                && connection.fromSocket === 'gguf';
+        });
+        var server = serverEdge ? state.nodes.find(function(candidate) {
+            return String(candidate.id) === String(serverEdge.fromNode) && candidate.type === 'loadServer';
+        }) : null;
+        if (!server) {
+            var orchestratorEdge = connections.find(function(connection) {
+                return String(connection.fromNode) === String(node.id)
+                    && connection.fromSocket === 'samplerParameters'
+                    && connection.toSocket === 'samplerParameters';
+            });
+            var orchestrator = orchestratorEdge ? state.nodes.find(function(candidate) {
+                return String(candidate.id) === String(orchestratorEdge.toNode) && candidate.type === 'sampler';
+            }) : null;
+            if (orchestrator) {
+                var ggufEdge = connections.find(function(connection) {
+                    return String(connection.toNode) === String(orchestrator.id)
+                        && connection.toSocket === 'gguf'
+                        && connection.fromSocket === 'gguf';
+                });
+                if (ggufEdge) {
+                    server = state.nodes.find(function(candidate) {
+                        return String(candidate.id) === String(ggufEdge.fromNode) && candidate.type === 'loadServer';
+                    }) || null;
+                }
+            }
+        }
+        if (!server) {
+            var servers = state.nodes.filter(function(candidate) { return candidate.type === 'loadServer'; });
+            if (servers.length === 1) server = servers[0];
+        }
+        var loader = null;
+        if (server) {
+            var modelEdge = connections.find(function(connection) {
+                return String(connection.toNode) === String(server.id)
+                    && connection.toSocket === 'model'
+                    && connection.fromSocket === 'model';
+            });
+            if (modelEdge) {
+                loader = state.nodes.find(function(candidate) {
+                    return String(candidate.id) === String(modelEdge.fromNode) && candidate.type === 'modelLoader';
+                }) || null;
+            }
+        }
+        if (!loader) {
+            var loaders = state.nodes.filter(function(candidate) { return candidate.type === 'modelLoader'; });
+            if (loaders.length === 1) loader = loaders[0];
+        }
+        return String(loader && loader.selectedModel || '').trim();
+    }
+
+    function inventoryModelRecord(modelId) {
+        if (!modelId) return null;
+        if (common && typeof common.modelInventoryRecord === 'function') {
+            var record = common.modelInventoryRecord(modelId);
+            if (record) return record;
+        }
+        var inventory = root.Darkstar && Array.isArray(root.Darkstar.modelInventory) ? root.Darkstar.modelInventory : [];
+        return inventory.find(function(candidate) {
+            return String(candidate && (candidate.id || candidate.fileName || candidate.displayName) || '') === modelId;
+        }) || null;
+    }
+
+    function safeReasoningValue(value) {
+        var normalized = String(value || '').trim();
+        return /^(?:auto|on|off)$/i.test(normalized) || /^[A-Za-z][A-Za-z0-9_.-]{0,31}$/.test(normalized)
+            ? normalized
+            : 'auto';
+    }
+
+    function normalizedReasoningForCapability(value, capability) {
+        var requested = safeReasoningValue(value);
+        var mode = requested.toLowerCase();
+        if (!capability) return requested;
+        if (capability.type === 'effort' && Array.isArray(capability.efforts) && capability.efforts.length >= 2) {
+            if (mode === 'auto') return 'auto';
+            if (mode === 'on') return capability.efforts.indexOf(capability.defaultEffort) >= 0 ? capability.defaultEffort : 'auto';
+            if (mode === 'off') return 'auto';
+            var exact = capability.efforts.find(function(effort) { return String(effort).toLowerCase() === mode; });
+            return exact || 'auto';
+        }
+        return ['auto', 'on', 'off'].indexOf(mode) >= 0 ? mode : 'auto';
+    }
+
+    function reasoningEffortLabel(value) {
+        var normalized = String(value || '').trim();
+        if (normalized.toLowerCase() === 'xhigh') return 'X-High';
+        return normalized.split(/[._-]+/).filter(Boolean).map(function(part) {
+            return part.charAt(0).toUpperCase() + part.slice(1);
+        }).join(' ') || normalized;
+    }
+
+    function reasoningOptions(capability, currentValue) {
+        if (capability && capability.type === 'effort' && Array.isArray(capability.efforts) && capability.efforts.length >= 2) {
+            var defaultEffort = capability.efforts.indexOf(capability.defaultEffort) >= 0 ? capability.defaultEffort : '';
+            return [{
+                value: 'auto',
+                label: defaultEffort ? 'Auto (model default: ' + reasoningEffortLabel(defaultEffort) + ')' : 'Auto (model default)'
+            }].concat(capability.efforts.map(function(effort) { return { value: effort, label: reasoningEffortLabel(effort) }; }));
+        }
+        var options = [
+            { value: 'auto', label: 'Auto (model default)' },
+            { value: 'on', label: 'On' },
+            { value: 'off', label: 'Off' }
+        ];
+        var preserved = safeReasoningValue(currentValue);
+        if (!capability && ['auto', 'on', 'off'].indexOf(preserved.toLowerCase()) < 0) {
+            options.splice(1, 0, { value: preserved, label: reasoningEffortLabel(preserved) + ' (saved)' });
+        }
+        return options;
+    }
+
+    function reasoningCapabilityForSampler(node) {
+        var record = inventoryModelRecord(selectedModelIdForSampler(node));
+        return record && record.reasoning && typeof record.reasoning === 'object' ? record.reasoning : null;
+    }
+
+    function normalizeSamplingParams(node) {
+        var p = node.params = node.params || {};
+        p.seed = boundedInteger(p.seed, -1, -1, 2147483647);
+        p.temperature = boundedNumber(p.temperature, 0.8, 0, 2);
+        p.topK = boundedInteger(p.topK, 40, 0, 100000);
+        p.topP = boundedNumber(p.topP, 0.95, 0, 1);
+        p.minP = boundedNumber(p.minP, 0.05, 0, 1);
+        p.typicalP = boundedNumber(p.typicalP, 1.0, 0, 1);
+        p.repeatPenalty = boundedNumber(p.repeatPenalty, 1.1, 0, 2);
+        p.repeatLastN = boundedInteger(p.repeatLastN, 64, -1, 1048576);
+        p.presencePenalty = boundedNumber(p.presencePenalty, 0, -2, 2);
+        p.frequencyPenalty = boundedNumber(p.frequencyPenalty, 0, -2, 2);
+        p.dryMultiplier = boundedNumber(p.dryMultiplier, 0, 0, 5);
+        p.dryBase = boundedNumber(p.dryBase, 1.75, 1, 4);
+        p.dryAllowedLength = boundedInteger(p.dryAllowedLength, 2, 0, 10000);
+        p.dryPenaltyLastN = boundedInteger(p.dryPenaltyLastN, 0, 0, 2147483647);
+        p.mirostat = ['0', '1', '2'].indexOf(String(p.mirostat)) >= 0 ? String(p.mirostat) : '0';
+        p.mirostatTau = boundedNumber(p.mirostatTau, 5, 0, 10);
+        p.mirostatEta = boundedNumber(p.mirostatEta, 0.1, 0, 1);
+        p.samplers = typeof p.samplers === 'string' && p.samplers.trim()
+            ? p.samplers
+            : 'dry;top_k;typ_p;top_p;min_p;xtc;temperature';
+        p.reasoning = safeReasoningValue(p.reasoning);
+        p.stop = typeof p.stop === 'string' ? p.stop : '';
+        p.cachePrompt = typeof p.cachePrompt === 'boolean' ? p.cachePrompt : true;
+        p.ignoreEos = typeof p.ignoreEos === 'boolean' ? p.ignoreEos : false;
+        return p;
+    }
+
+    function samplingConfig(node) {
+        var p = normalizeSamplingParams(node);
+        var reasoningCapability = reasoningCapabilityForSampler(node);
+        var reasoning = normalizedReasoningForCapability(p.reasoning, reasoningCapability);
+        p.reasoning = reasoning;
+        return {
+            reasoning: reasoning,
+            seed: Number(p.seed),
+            temperature: Number(p.temperature),
+            topK: Number(p.topK),
+            topP: Number(p.topP),
+            minP: Number(p.minP),
+            typicalP: Number(p.typicalP),
+            repeatPenalty: Number(p.repeatPenalty),
+            repeatLastN: Number(p.repeatLastN),
+            presencePenalty: Number(p.presencePenalty),
+            frequencyPenalty: Number(p.frequencyPenalty),
+            dryMultiplier: Number(p.dryMultiplier),
+            dryBase: Number(p.dryBase),
+            dryAllowedLength: Number(p.dryAllowedLength),
+            dryPenaltyLastN: Number(p.dryPenaltyLastN),
+            mirostat: Number(p.mirostat),
+            mirostatTau: Number(p.mirostatTau),
+            mirostatEta: Number(p.mirostatEta),
+            samplers: String(p.samplers || '').split(/[;,]/).map(function(value) { return value.trim(); }).filter(Boolean),
+            stop: String(p.stop || ''),
+            cachePrompt: p.cachePrompt !== false,
+            ignoreEos: p.ignoreEos === true
+        };
+    }
+
+    function primaryControls(node) {
+        var p = normalizeSamplingParams(node);
+        var capability = reasoningCapabilityForSampler(node);
+        var displayedReasoning = normalizedReasoningForCapability(p.reasoning, capability);
+        if (displayedReasoning !== p.reasoning) p.reasoning = displayedReasoning;
+        return controls.select('Reasoning Effort', displayedReasoning, node.id, 'reasoning', reasoningOptions(capability, displayedReasoning)) +
+            controls.numberInput('Seed (-1 = random)', p.seed, node.id, 'seed', { min: -1, max: 2147483647, step: 1 }) +
+            controls.slider('Temperature', p.temperature, 0, 2, 0.01, 2, node.id, 'temperature') +
+            controls.numberInput('Top K', p.topK, node.id, 'topK', { min: 0, max: 100000, step: 1 }) +
+            controls.slider('Top P', p.topP, 0, 1, 0.01, 2, node.id, 'topP') +
+            controls.slider('Min P', p.minP, 0, 1, 0.01, 2, node.id, 'minP') +
+            controls.slider('Typical P', p.typicalP, 0, 1, 0.01, 2, node.id, 'typicalP') +
+            controls.slider('Repeat penalty', p.repeatPenalty, 0, 2, 0.01, 2, node.id, 'repeatPenalty') +
+            controls.numberInput('Repeat last N', p.repeatLastN, node.id, 'repeatLastN', { min: -1, max: 1048576, step: 1 }) +
+            controls.slider('Presence penalty', p.presencePenalty, -2, 2, 0.01, 2, node.id, 'presencePenalty') +
+            controls.slider('Frequency penalty', p.frequencyPenalty, -2, 2, 0.01, 2, node.id, 'frequencyPenalty');
+    }
+
+    function advancedControls(node) {
+        var p = normalizeSamplingParams(node);
+        return controls.slider('DRY multiplier', p.dryMultiplier, 0, 5, 0.01, 2, node.id, 'dryMultiplier') +
+            controls.slider('DRY base', p.dryBase, 1, 4, 0.01, 2, node.id, 'dryBase') +
+            controls.numberInput('DRY allowed length', p.dryAllowedLength, node.id, 'dryAllowedLength', { min: 0, max: 10000, step: 1 }) +
+            controls.numberInput('DRY last N', p.dryPenaltyLastN, node.id, 'dryPenaltyLastN', { min: 0, max: 1048576, step: 1 }) +
+            controls.select('Mirostat', p.mirostat, node.id, 'mirostat', ['0', '1', '2']) +
+            controls.slider('Mirostat tau', p.mirostatTau, 0, 10, 0.1, 1, node.id, 'mirostatTau') +
+            controls.slider('Mirostat eta', p.mirostatEta, 0, 1, 0.01, 2, node.id, 'mirostatEta') +
+            controls.textInput('Sampler chain', p.samplers, node.id, 'samplers', 'top_k;top_p;temperature') +
+            controls.textarea('Stop strings', p.stop, node.id, 'stop', 'One stop string per line') +
+            controls.booleanSelect('Reuse prompt cache', p.cachePrompt, node.id, 'cachePrompt') +
+            controls.booleanSelect('Ignore EOS', p.ignoreEos, node.id, 'ignoreEos');
+    }
+
+    var definition = {
+        id: 'localSampler',
+        title: 'LM Sampler',
+        badge: 'SAMPLER',
+        outputNode: false,
+        samplingParamKeys: SAMPLING_PARAM_KEYS.slice(),
+        inputs: [{ name: 'gguf', label: 'Language Model', type: types.MODEL, required: true }],
+        outputs: [{ name: 'samplerParameters', label: 'LM Sampler', type: types.SAMPLER_PARAMETERS }],
+        factory: function(nodeId, x, y) {
+            return common.baseNode(definition, nodeId, x, y, {
+                uiWidth: 660,
+                params: {
+                    reasoning: 'auto',
+                    seed: -1,
+                    temperature: 0.8,
+                    topK: 40,
+                    topP: 0.95,
+                    minP: 0.05,
+                    typicalP: 1.0,
+                    repeatPenalty: 1.1,
+                    repeatLastN: 64,
+                    presencePenalty: 0,
+                    frequencyPenalty: 0,
+                    dryMultiplier: 0,
+                    dryBase: 1.75,
+                    dryAllowedLength: 2,
+                    dryPenaltyLastN: 0,
+                    mirostat: '0',
+                    mirostatTau: 5,
+                    mirostatEta: 0.1,
+                    samplers: 'dry;top_k;typ_p;top_p;min_p;xtc;temperature',
+                    stop: '',
+                    cachePrompt: true,
+                    ignoreEos: false
+                }
+            });
+        },
+        normalizeNode: function(node) {
+            node.uiWidth = 660;
+            var savedTitle = String(node && node.title ? node.title : '').trim();
+            if (!savedTitle || savedTitle === 'Local Sampler' || savedTitle === 'L Sampler' || savedTitle === 'L_Sampler') node.title = definition.title;
+            node.inputs = definition.inputs.map(function(input) { return Object.assign({}, input); });
+            node.outputs = definition.outputs.map(function(output) { return Object.assign({}, output); });
+            normalizeSamplingParams(node);
+        },
+        buildContentHTML: function(node) {
+            definition.normalizeNode(node);
+            return '<div class="sampler-settings local-sampler-settings">' +
+                controls.group('Sampling', 'Core generation and repetition controls.', primaryControls(node)) +
+                controls.group('Advanced sampling', 'DRY, Mirostat, sampler chain, stop strings, and cache behavior.', advancedControls(node)) +
+                '<div class="sampler-control-status">' + controls.status(node, 'Sampler parameters ready') + '</div>' +
+                '</div>';
+        },
+        onParameterChange: function(node, param) {
+            if (param === 'reasoning') {
+                node.params.reasoning = safeReasoningValue(node.params.reasoning);
+            } else if (SAMPLING_PARAM_KEYS.indexOf(String(param || '')) < 0) {
+                return;
+            } else {
+                normalizeSamplingParams(node);
+            }
+            node.status = 'idle';
+            node.statusMessage = '';
+        },
+        execute: function(inputs, node) {
+            definition.normalizeNode(node);
+            var model = inputs && (inputs.gguf || inputs.model);
+            var samplerParameters = samplingConfig(node);
+            if (model && model.id) samplerParameters.model = model;
+            node.status = 'active';
+            node.statusMessage = 'Sampler parameters ready';
+            return { samplerParameters: samplerParameters };
+        }
+    };
+
+    nodes.registerNode(definition);
+})(globalThis);
+    // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/local-sampler.js">
     // RENDERER MODULE :: backend/renderer/nodes/builtin/load-model.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/nodes/builtin/load-model.js">
 (function registerLoadModelNode(root) {
@@ -3127,6 +4049,7 @@ function unregisterGenerationSession(session) {
     var types = nodes.PORT_TYPES;
     var DEFAULT_MODEL_PATH_PLACEHOLDER = 'C:/Your/Model/Path';
     var DEFAULT_PROJECTOR_PATH_PLACEHOLDER = 'C:/Your/MMProj/Path';
+    var MODEL_LOADER_UI_WIDTH = 520;
 
     function runGenerationOperation(context, action) {
         var signal = context && context.abortSignal;
@@ -3190,7 +4113,7 @@ function unregisterGenerationSession(session) {
 
     function projectorOptions(node) {
         var params = ensureProjectorState(node);
-        var options = [{ value: '', label: String(params.projectorPathPlaceholder || DEFAULT_PROJECTOR_PATH_PLACEHOLDER) }];
+        var options = [{ value: '', label: 'None' }];
         var seen = Object.create(null);
         params.projectorCandidates.forEach(function(candidate, index) {
             if (!candidate || !candidate.path || seen[candidate.path]) return;
@@ -3209,14 +4132,6 @@ function unregisterGenerationSession(session) {
             options.push({ value: params.projectorPath, label: common.fileName(params.projectorPath, params.projectorPath) + ' (Unavailable)' });
         }
         return options;
-    }
-
-    function localBrowseField(dropdownHtml, nodeId, action, label) {
-        return '<div class="node-local-browser-field">' + dropdownHtml + controls.button('⋯', nodeId, action, {
-            className: 'node-local-browser-button',
-            title: 'Browse Local Filesystem …',
-            ariaLabel: 'Browse Local Filesystem for ' + label
-        }) + '</div>';
     }
 
     function rememberProjectorSelection(projectorPath) {
@@ -3283,14 +4198,15 @@ function unregisterGenerationSession(session) {
 
     var definition = {
         id: 'modelLoader',
-        title: 'Load Model (GGUF)',
+        title: 'Invoke Language Model (GGUF)',
         badge: 'GGUF',
         outputNode: false,
         rerenderOnParameterChange: true,
-        inputs: [{ name: 'server', label: 'server', type: types.SERVER, required: true }],
-        outputs: [{ name: 'model', label: 'model', type: types.MODEL }],
+        inputs: [],
+        outputs: [{ name: 'model', label: 'Language Model', type: types.MODEL_CONFIG }],
         factory: function(nodeId, x, y) {
             return common.baseNode(definition, nodeId, x, y, {
+                uiWidth: MODEL_LOADER_UI_WIDTH,
                 selectedModel: '',
                 params: {
                     modelPathPlaceholder: DEFAULT_MODEL_PATH_PLACEHOLDER,
@@ -3303,8 +4219,11 @@ function unregisterGenerationSession(session) {
             });
         },
         normalizeNode: function(node, saved) {
+            node.uiWidth = MODEL_LOADER_UI_WIDTH;
             var savedTitle = String(saved && saved.title ? saved.title : '').trim();
-            if (!savedTitle || savedTitle === 'Load Model') node.title = definition.title;
+            if (!savedTitle || savedTitle === 'Load Model' || savedTitle === 'Load Model (GGUF)') node.title = definition.title;
+            node.inputs = [];
+            node.outputs = definition.outputs.map(function(output) { return Object.assign({}, output); });
             var params = ensureProjectorState(node);
             if (saved && params.projectorPath && params.projectorSource !== 'none') {
                 params.projectorSource = 'manual';
@@ -3329,10 +4248,13 @@ function unregisterGenerationSession(session) {
         },
         buildContentHTML: function(node) {
             var params = ensureProjectorState(node);
-            return localBrowseField(common.modelDropdown(node), node.id, 'browse-local-model', 'Model') +
-                localBrowseField(controls.dropdown('Projector', params.projectorPath, node.id, 'projectorPath', projectorOptions(node), 'string'), node.id, 'browse-local-projector', 'Projector') +
-                controls.button('Unload model', node.id, 'unload-model', { secondary: true, disabled: !node.selectedModel }) +
-                controls.status(node, node.selectedModel ? projectorLabel(node) : 'No model selected');
+            var modelControls = common.localBrowseField(common.modelDropdown(node), node.id, 'browse-local-model', 'Model') +
+                common.localBrowseField(controls.dropdown('Projector', params.projectorPath, node.id, 'projectorPath', projectorOptions(node), 'string', params.projectorPathPlaceholder || DEFAULT_PROJECTOR_PATH_PLACEHOLDER), node.id, 'browse-local-projector', 'Projector') +
+                '<div class="model-loader-action-row">' + controls.button('Unload model', node.id, 'unload-model', { secondary: true, disabled: !node.selectedModel }) + '</div>';
+            return '<div class="model-loader-controls">' +
+                controls.group('Model files', 'Choose the GGUF model and optional multimodal projector.', modelControls) +
+                controls.status(node, node.selectedModel ? projectorLabel(node) : 'No model selected') +
+                '</div>';
         },
         onModelChange: async function(node, value) {
             await detectProjectors(node, value, false);
@@ -3368,71 +4290,29 @@ function unregisterGenerationSession(session) {
             node.status = 'idle';
             node.statusMessage = response.unloaded ? 'Model unloaded' : 'Model was not loaded';
         },
-        execute: async function(inputs, node, context) {
-            if (!inputs.server || !inputs.server.running) throw new Error('Load Model (GGUF): no running server input.');
-            if (!node.selectedModel) throw new Error('Load Model (GGUF): select a GGUF model.');
-            if (typeof root.setContextContractRuntimeContextReady === 'function') root.setContextContractRuntimeContextReady(false);
-            else root.window.CONTEXT_LIMIT_READY = false;
+        execute: async function(_inputs, node, context) {
+            if (!node.selectedModel) throw new Error('Invoke Language Model (GGUF): select a GGUF model.');
             var params = ensureProjectorState(node);
             await runGenerationOperation(context, function() {
                 return detectProjectors(node, node.selectedModel, params.projectorModel === node.selectedModel);
             });
-            node.status = 'loading';
-            node.statusMessage = 'Loading ' + node.selectedModel + '...';
-            var projectorPath = String(params.projectorPath || '').trim();
-            var autoDetectProjector = params.projectorSource !== 'none';
-            var result = await runGenerationOperation(context, function() {
-                return common.getLlamaBridge().loadModel(node.selectedModel, projectorPath, { autoDetectProjector: autoDetectProjector });
-            });
-            if (!result || !result.success || !result.modelId) {
-                throw new Error('Load Model (GGUF): ' + (result && result.error ? result.error : 'model loading failed.'));
-            }
-            if (result.metadata) common.cacheModelRecord(result.metadata);
-            if (result.projectorPath) {
-                params.projectorPath = result.projectorPath;
-                if (params.projectorSource !== 'manual') params.projectorSource = 'detected';
-            } else if (params.projectorSource === 'none') {
-                params.projectorPath = '';
-            }
-            params.projectorModel = node.selectedModel;
-            var measuredPerSlot = Number(result.contextSizePerSlot || result.effectiveContextSize);
-            var measuredTotal = Number(result.totalContextSize);
-            var measuredParallel = Math.max(1, Number(result.parallelSlots || result.effectiveParallelSlots || (inputs.server && inputs.server.parallelSlots)) || 1);
-            var serverPerSlotCeiling = Number(inputs.server && inputs.server.contextSizePerSlot);
-            var serverTotalCeiling = Number(inputs.server && inputs.server.totalContextSize);
-            var effectivePerSlot = Number.isFinite(measuredPerSlot) && measuredPerSlot > 0 ? Math.floor(measuredPerSlot) : 0;
-            if (Number.isFinite(serverPerSlotCeiling) && serverPerSlotCeiling > 0 && effectivePerSlot > 0) effectivePerSlot = Math.min(effectivePerSlot, Math.floor(serverPerSlotCeiling));
-            if (effectivePerSlot > 0) {
-                root.window.TOKEN_LIMIT = effectivePerSlot;
-                if (typeof root.setContextContractRuntimeContextReady === 'function') root.setContextContractRuntimeContextReady(true, effectivePerSlot);
-                else root.window.CONTEXT_LIMIT_READY = true;
-                if (inputs.server && typeof inputs.server === 'object') {
-                    inputs.server.contextSizePerSlot = effectivePerSlot;
-                    inputs.server.parallelSlots = measuredParallel;
-                    var effectiveTotal = Number.isFinite(measuredTotal) && measuredTotal > 0 ? Math.floor(measuredTotal) : effectivePerSlot * measuredParallel;
-                    if (Number.isFinite(serverTotalCeiling) && serverTotalCeiling > 0) effectiveTotal = Math.min(effectiveTotal, Math.floor(serverTotalCeiling));
-                    inputs.server.totalContextSize = effectiveTotal;
-                    inputs.server.contextMeasurementSource = result.contextMeasurementSource || 'model-load';
-                }
-                if (typeof root.updateTokenCounter === 'function') root.updateTokenCounter();
-                else if (typeof updateTokenCounter === 'function') updateTokenCounter();
-            }
-            if (inputs.server && typeof inputs.server === 'object' && result.mtp && typeof result.mtp === 'object') inputs.server.mtp = result.mtp;
+            var modelId = String(node.selectedModel || '').trim();
+            var record = typeof common.modelInventoryRecord === 'function'
+                ? common.modelInventoryRecord(modelId)
+                : ((root.Darkstar && Array.isArray(root.Darkstar.modelInventory))
+                    ? root.Darkstar.modelInventory.find(function(candidate) { return String(candidate && candidate.id || '') === modelId; }) || null
+                    : null);
             node.status = 'active';
-            var fallbackLabel = (result.mtpFallback ? ' · MTP Auto→Off' : '') + (result.memoryFallback ? ' · adaptive VRAM settings' : '');
-            var contextLabel = effectivePerSlot > 0 ? ' · ' + effectivePerSlot.toLocaleString() + ' ctx/slot' : '';
-            node.statusMessage = result.modelId + (result.projectorPath ? ' + projector' : '') + contextLabel + fallbackLabel;
+            node.statusMessage = modelId + (params.projectorPath ? ' + projector' : '');
             return {
                 model: {
-                    id: result.modelId,
-                    status: result.status || 'loaded',
-                    metadata: result.metadata || null,
-                    reasoning: result.reasoning || (result.metadata && result.metadata.reasoning) || null,
-                    mtp: result.mtpCapability || (result.metadata && result.metadata.mtp) || null,
-                    serverMtp: result.mtp || (inputs.server && inputs.server.mtp) || null,
-                    server: inputs.server,
-                    projectorPath: result.projectorPath || null,
-                    multimodal: result.multimodal === true || Boolean(result.projectorPath)
+                    id: modelId,
+                    metadata: record || null,
+                    reasoning: record && record.reasoning && typeof record.reasoning === 'object' ? record.reasoning : null,
+                    mtp: record && record.mtp && typeof record.mtp === 'object' ? record.mtp : null,
+                    projectorPath: String(params.projectorPath || '').trim() || null,
+                    projectorSource: String(params.projectorSource || ''),
+                    multimodal: Boolean(params.projectorPath)
                 }
             };
         }
@@ -3451,12 +4331,20 @@ function unregisterGenerationSession(session) {
     var controls = nodes.controls;
     var types = nodes.PORT_TYPES;
 
-    function normalizeNode(node) {
-        var params = node && node.params && typeof node.params === 'object' ? node.params : {};
-        node.params = {
+    function normalizeParams(value) {
+        var params = value && typeof value === 'object' ? value : {};
+        return {
             systemPrompt: typeof params.systemPrompt === 'string' ? params.systemPrompt : '',
             includeHistory: typeof params.includeHistory === 'boolean' ? params.includeHistory : true
         };
+    }
+
+    function normalizeNode(node) {
+        node.params = normalizeParams(node && node.params);
+        if (definition) {
+            node.inputs = definition.inputs.map(function(input) { return Object.assign({}, input); });
+            node.outputs = definition.outputs.map(function(output) { return Object.assign({}, output); });
+        }
     }
 
     function inferImageMimeType(image) {
@@ -3471,16 +4359,33 @@ function unregisterGenerationSession(session) {
         return 'image/jpeg';
     }
 
+    function normalizeImageEdit(edit) {
+        if (!edit || typeof edit !== 'object' || Number(edit.version) !== 1) return null;
+        var mode = String(edit.mode || '').trim().toLowerCase();
+        if (mode !== 'selection' && mode !== 'brush') return null;
+        var region = edit.region && typeof edit.region === 'object' ? {
+            x: Math.floor(Number(edit.region.x)), y: Math.floor(Number(edit.region.y)),
+            width: Math.floor(Number(edit.region.width)), height: Math.floor(Number(edit.region.height))
+        } : null;
+        var sourceWidth = Math.floor(Number(edit.sourceWidth)), sourceHeight = Math.floor(Number(edit.sourceHeight));
+        var sourceBase64 = String(edit.sourceBase64 || '').trim();
+        if (!region || !sourceBase64 || ![region.x, region.y, region.width, region.height, sourceWidth, sourceHeight].every(Number.isFinite)
+            || sourceWidth < 1 || sourceHeight < 1 || region.x < 0 || region.y < 0 || region.width < 1 || region.height < 1
+            || region.x + region.width > sourceWidth || region.y + region.height > sourceHeight) return null;
+        if (mode === 'brush' && region.width !== region.height) return null;
+        return { version: 1, mode: mode, sourceBase64: sourceBase64, sourceWidth: sourceWidth, sourceHeight: sourceHeight, region: region };
+    }
     function normalizeImage(image) {
         if (!image) return null;
-        if (typeof image === 'string') return { base64: image, mimeType: 'image/jpeg', name: '' };
+        if (typeof image === 'string') return { base64: image, mimeType: 'image/jpeg', name: '', edit: null };
         if (typeof image !== 'object') return null;
         var base64 = String(image.base64 || image.data || '').trim();
         if (!base64) return null;
         return {
             base64: base64,
             mimeType: inferImageMimeType(image),
-            name: String(image.name || '')
+            name: String(image.name || ''),
+            edit: normalizeImageEdit(image.edit)
         };
     }
 
@@ -3562,358 +4467,162 @@ function unregisterGenerationSession(session) {
         var normalizedText = String(text || '');
         if (normalizedText) parts.push({ type: 'text', text: normalizedText });
         images.forEach(function(image) {
-            var imageUrl = Darkstar.imageData.safeDataUrl(image, 'image/png');
+            if (image && image.edit) {
+                parts.push({ type: 'text', text: image.edit.mode === 'brush'
+                    ? "[Darkstar image edit is armed. The colored marks are the user's visual sketch. Darkstar has computed the smallest square edit region containing every stroke; Generate Image can change only that square and must preserve everything else.]"
+                    : '[Darkstar image edit is armed. The translucent red area marks the only user-approved region that may change. Use Generate Image to perform the requested edit while preserving everything else.]' });
+            }
+            var imageUrl = root.Darkstar.imageData.safeDataUrl(image, 'image/png');
             if (imageUrl) parts.push({ type: 'image_url', image_url: { url: imageUrl } });
         });
         return parts;
     }
 
+    function sourceTabForContext(context) {
+        var sourceTab = null;
+        if (typeof tabs !== 'undefined' && Array.isArray(tabs)) {
+            if (context.tabId !== undefined && context.tabId !== null) {
+                sourceTab = tabs.find(function(tab) { return Number(tab.id) === Number(context.tabId); }) || null;
+            } else if (typeof _sendingTabId !== 'undefined' && _sendingTabId !== null) {
+                sourceTab = tabs.find(function(tab) { return Number(tab.id) === Number(_sendingTabId); }) || null;
+            }
+            if (!sourceTab && typeof getActiveTab === 'function') sourceTab = getActiveTab();
+        }
+        return sourceTab;
+    }
+
+    function buildMessages(paramsValue, contextValue, ownerLabel) {
+        var params = normalizeParams(paramsValue);
+        var context = contextValue && typeof contextValue === 'object' ? contextValue : {};
+        var sourceTab = sourceTabForContext(context);
+        var source = Array.isArray(context.history)
+            ? context.history.slice()
+            : (sourceTab && Array.isArray(sourceTab.history) ? sourceTab.history.slice() : []);
+        if (params.includeHistory === false && source.length) source = source.slice(-1);
+
+        var messages = [];
+        var historySystemMessages = [];
+        var preparedImages = [];
+        var activeImageEdit = null;
+        source.forEach(function(message) {
+            if (!message || ['system', 'user', 'assistant'].indexOf(message.role) === -1) return;
+            if (message.excludeFromContext === true) return;
+            if (message.role === 'system') {
+                historySystemMessages.push({ role: 'system', content: String(message.content || '') });
+                return;
+            }
+            if (message.role === 'assistant' && Array.isArray(message.toolContext)) {
+                message.toolContext.forEach(function(toolMessage) {
+                    if (!toolMessage || ['assistant', 'tool', 'user'].indexOf(toolMessage.role) === -1) return;
+                    if (toolMessage.role === 'assistant' && Array.isArray(toolMessage.tool_calls)) {
+                        var assistantMessage = {
+                            role: 'assistant',
+                            content: toolMessage.content === null ? null : cloneMessageContent(toolMessage.content),
+                            tool_calls: cloneToolCalls(toolMessage)
+                        };
+                        var reasoningContent = assistantReasoningContent(toolMessage);
+                        if (reasoningContent) assistantMessage.reasoning_content = reasoningContent;
+                        messages.push(assistantMessage);
+                    } else if (toolMessage.role === 'tool' && toolMessage.tool_call_id) {
+                        messages.push({
+                            role: 'tool',
+                            tool_call_id: String(toolMessage.tool_call_id),
+                            name: String(toolMessage.name || ''),
+                            content: cloneMessageContent(toolMessage.content)
+                        });
+                    } else if (toolMessage.role === 'user') {
+                        messages.push({ role: 'user', content: cloneMessageContent(toolMessage.content) });
+                    }
+                });
+            }
+
+            if (message.role === 'assistant' && message.excludeOwnContentFromContext === true
+                && String(message.id || '') !== String(context.continueMessageId || '')) return;
+            var images = message.role === 'user' ? normalizeImages(message.images) : [];
+            if (message.role === 'user') {
+                activeImageEdit = null;
+                for (var imageIndex = images.length - 1; imageIndex >= 0; imageIndex -= 1) {
+                    if (!images[imageIndex].edit) continue;
+                    activeImageEdit = Object.assign({}, images[imageIndex].edit, { guideBase64: images[imageIndex].base64 });
+                    break;
+                }
+            }
+            if (images.length) {
+                preparedImages = preparedImages.concat(images);
+                messages.push({ role: message.role, content: contentWithImages(message.content, images) });
+            } else {
+                var preparedMessage = { role: message.role, content: String(message.content || '') };
+                if (message.role === 'assistant') {
+                    // Preserve assistant reasoning across ordinary history rebuilds.
+                    // toolContext already carries reasoning from tool-call rounds,
+                    // so assistantContextReasoning contributes only the final
+                    // non-tool reasoning tail and never duplicates protocol turns.
+                    var contextReasoning = assistantContextReasoning(message);
+                    if (contextReasoning) preparedMessage.reasoning_content = contextReasoning;
+                }
+                messages.push(preparedMessage);
+            }
+        });
+
+        var systemPrompt = String(params.systemPrompt || '').trim();
+        var systemParts = [];
+        if (systemPrompt) systemParts.push(systemPrompt);
+        historySystemMessages.forEach(function(message) {
+            var content = String(message && message.content || '').trim();
+            if (content) systemParts.push(content);
+        });
+        if (systemParts.length) messages.unshift({ role: 'system', content: systemParts.join('\n\n') });
+        if (!messages.length) throw new Error(String(ownerLabel || 'Context') + ': the chat contains no messages.');
+
+        return { messages: messages, imageCount: preparedImages.length, imageEdit: activeImageEdit };
+    }
+
+    function buildControls(node) {
+        var params = normalizeParams(node && node.params);
+        return controls.textarea('System prompt', params.systemPrompt, node.id, 'systemPrompt', 'Optional system instruction') +
+            controls.booleanSelect('Full chat context', params.includeHistory, node.id, 'includeHistory');
+    }
+
+    nodes.contextBuilder = Object.freeze({
+        normalizeParams: normalizeParams,
+        buildMessages: buildMessages,
+        buildControls: buildControls
+    });
+
+    // Context remains registered for API/custom workflows that explicitly use it.
+    // Canonical local GGUF workflows own these settings directly in Orchestrator.
     var definition = {
         id: 'context',
         title: 'Context',
         badge: 'CHAT',
         outputNode: false,
-        inputs: [{ name: 'model', label: 'model', type: types.MODEL, required: true }],
-        outputs: [
-            { name: 'text', label: 'text', type: types.TEXT },
-            { name: 'image', label: 'image', type: types.IMAGE }
-        ],
+        inputs: [],
+        outputs: [{ name: 'context', label: 'Context', type: types.TEXT }],
         factory: function(nodeId, x, y) {
             return common.baseNode(definition, nodeId, x, y, {
-                params: { systemPrompt: '', includeHistory: true }
+                params: normalizeParams(null)
             });
         },
         normalizeNode: normalizeNode,
         buildContentHTML: function(node) {
             normalizeNode(node);
-            return controls.textarea('System prompt', node.params.systemPrompt, node.id, 'systemPrompt', 'Optional system instruction') +
-                controls.booleanSelect('Full chat context', node.params.includeHistory, node.id, 'includeHistory') +
-                controls.status(node, 'Waiting for chat');
+            return controls.group('Conversation context', 'System instructions and history included with each request.', buildControls(node)) + controls.status(node, 'Waiting for chat');
         },
-        execute: function(inputs, node, context) {
-            if (!inputs.model) throw new Error('Context: no model input.');
+        execute: function(_inputs, node, context) {
             normalizeNode(node);
-            var sourceTab = null;
-            if (typeof tabs !== 'undefined' && Array.isArray(tabs)) {
-                if (context.tabId !== undefined && context.tabId !== null) {
-                    sourceTab = tabs.find(function(tab) { return Number(tab.id) === Number(context.tabId); }) || null;
-                } else if (typeof _sendingTabId !== 'undefined' && _sendingTabId !== null) {
-                    sourceTab = tabs.find(function(tab) { return Number(tab.id) === Number(_sendingTabId); }) || null;
-                }
-                if (!sourceTab && typeof getActiveTab === 'function') sourceTab = getActiveTab();
-            }
-            var source = Array.isArray(context.history)
-                ? context.history.slice()
-                : (sourceTab && Array.isArray(sourceTab.history) ? sourceTab.history.slice() : []);
-            if (node.params.includeHistory === false && source.length) source = source.slice(-1);
-
-            var messages = [];
-            var historySystemMessages = [];
-            var preparedImages = [];
-            source.forEach(function(message) {
-                if (!message || ['system', 'user', 'assistant'].indexOf(message.role) === -1) return;
-                if (message.excludeFromContext === true) return;
-                if (message.role === 'system') {
-                    historySystemMessages.push({ role: 'system', content: String(message.content || '') });
-                    return;
-                }
-                if (message.role === 'assistant' && Array.isArray(message.toolContext)) {
-                    message.toolContext.forEach(function(toolMessage) {
-                        if (!toolMessage || ['assistant', 'tool', 'user'].indexOf(toolMessage.role) === -1) return;
-                        if (toolMessage.role === 'assistant' && Array.isArray(toolMessage.tool_calls)) {
-                            var assistantMessage = {
-                                role: 'assistant',
-                                content: toolMessage.content === null ? null : cloneMessageContent(toolMessage.content),
-                                tool_calls: cloneToolCalls(toolMessage)
-                            };
-                            var reasoningContent = assistantReasoningContent(toolMessage);
-                            if (reasoningContent) assistantMessage.reasoning_content = reasoningContent;
-                            messages.push(assistantMessage);
-                        } else if (toolMessage.role === 'tool' && toolMessage.tool_call_id) {
-                            messages.push({
-                                role: 'tool',
-                                tool_call_id: String(toolMessage.tool_call_id),
-                                name: String(toolMessage.name || ''),
-                                content: cloneMessageContent(toolMessage.content)
-                            });
-                        } else if (toolMessage.role === 'user') {
-                            messages.push({ role: 'user', content: cloneMessageContent(toolMessage.content) });
-                        }
-                    });
-                }
-
-                if (message.role === 'assistant' && message.excludeOwnContentFromContext === true
-                    && String(message.id || '') !== String(context.continueMessageId || '')) return;
-                var images = message.role === 'user' ? normalizeImages(message.images) : [];
-                if (images.length) {
-                    if (!inputs.model.multimodal || !inputs.model.projectorPath) {
-                        throw new Error('Context: an image is attached, but the loaded model has no multimodal projector. Select a Projector in Load Model (GGUF).');
-                    }
-                    preparedImages = preparedImages.concat(images);
-                    messages.push({ role: message.role, content: contentWithImages(message.content, images) });
-                } else {
-                    var preparedMessage = { role: message.role, content: String(message.content || '') };
-                    if (message.role === 'assistant') {
-                        // Preserve assistant reasoning across ordinary history rebuilds.
-                        // toolContext already carries reasoning from tool-call rounds,
-                        // so assistantContextReasoning contributes only the final
-                        // non-tool reasoning tail and never duplicates protocol turns.
-                        var contextReasoning = assistantContextReasoning(message);
-                        if (contextReasoning) preparedMessage.reasoning_content = contextReasoning;
-                    }
-                    messages.push(preparedMessage);
-                }
-            });
-
-            var systemPrompt = String(node.params.systemPrompt || '').trim();
-            var systemParts = [];
-            if (systemPrompt) systemParts.push(systemPrompt);
-            historySystemMessages.forEach(function(message) {
-                var content = String(message && message.content || '').trim();
-                if (content) systemParts.push(content);
-            });
-            if (systemParts.length) messages.unshift({ role: 'system', content: systemParts.join('\n\n') });
-            if (!messages.length) throw new Error('Context: the chat contains no messages.');
-
-            var latestImage = preparedImages.length ? preparedImages[preparedImages.length - 1] : null;
+            var prepared = buildMessages(node.params, context, 'Context');
             node.status = 'active';
-            node.statusMessage = messages.length + ' messages' + (preparedImages.length ? ' · ' + preparedImages.length + ' image' + (preparedImages.length === 1 ? '' : 's') : '');
-            return {
-                text: messages,
-                image: latestImage ? {
-                    base64: latestImage.base64,
-                    mimeType: latestImage.mimeType,
-                    name: latestImage.name,
-                    projectorPath: inputs.model.projectorPath
-                } : null
-            };
+            node.statusMessage = prepared.messages.length + ' messages' + (prepared.imageCount ? ' · ' + prepared.imageCount + ' image' + (prepared.imageCount === 1 ? '' : 's') : '');
+            // Multimodal images are already represented inline as image_url parts in
+            // the same message sequence. Keep one authoritative Context payload so
+            // downstream API/custom orchestrators never need a second image-only edge.
+            return { context: prepared.messages };
         }
     };
 
     nodes.registerNode(definition);
 })(globalThis);
     // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/context.js">
-    // RENDERER MODULE :: backend/renderer/nodes/builtin/skills.js
-    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/nodes/builtin/skills.js">
-(function registerSkillsNode(root) {
-    'use strict';
-
-    var nodes = root.Darkstar.nodes;
-    var common = nodes.builtinCommon;
-    var controls = nodes.controls;
-    var types = nodes.PORT_TYPES;
-
-    var normalizedPathKey = common.normalizedPathKey;
-    function fileName(value) { return common.fileName(value, 'SKILL.md'); }
-
-    function isMarkdownFile(value) {
-        return /\.md$/iu.test(String(value || '').trim());
-    }
-
-    function normalizeSkill(value) {
-        if (!value || typeof value !== 'object') return null;
-        var path = String(value.path || '').trim();
-        if (!path) return null;
-        return {
-            path: path,
-            name: String(value.name || value.skillName || fileName(path)),
-            description: String(value.description || ''),
-            compatible: value.compatible !== false
-        };
-    }
-
-    function ensureSkills(node) {
-        if (!node.params || typeof node.params !== 'object') node.params = {};
-        var source = Array.isArray(node.params.skills)
-            ? node.params.skills
-            : (Array.isArray(node.params.skillFiles) ? node.params.skillFiles : []);
-        var seen = Object.create(null);
-        node.params.skills = source.map(normalizeSkill).filter(function(skill) {
-            if (!skill) return false;
-            var key = normalizedPathKey(skill.path);
-            if (seen[key]) return false;
-            seen[key] = true;
-            return true;
-        });
-        delete node.params.skillFiles;
-        node.inputs = [];
-        return node.params.skills;
-    }
-
-    function statusText(skills) {
-        if (!skills.length) return 'No skill files added';
-        return skills.length + (skills.length === 1 ? ' skill file' : ' skill files');
-    }
-
-    function additionStatus(skills, added, duplicates, rejected) {
-        var details = [];
-        if (added) details.push('added ' + added);
-        if (duplicates) details.push('ignored ' + duplicates + ' duplicate' + (duplicates === 1 ? '' : 's'));
-        if (rejected) details.push('rejected ' + rejected);
-        return statusText(skills) + (details.length ? ' · ' + details.join(' · ') : '');
-    }
-
-
-    function addInspectedSkills(node, inspectedSkills, errors) {
-        var skills = ensureSkills(node);
-        var existing = Object.create(null);
-        skills.forEach(function(skill) { existing[normalizedPathKey(skill.path)] = true; });
-        var added = 0;
-        var duplicates = 0;
-        var rejected = Array.isArray(errors) ? errors.length : 0;
-        var compatibilityErrors = [];
-
-        (Array.isArray(inspectedSkills) ? inspectedSkills : []).forEach(function(value) {
-            var skill = normalizeSkill(value);
-            if (!skill) {
-                rejected += 1;
-                return;
-            }
-            if (!skill.compatible) {
-                rejected += 1;
-                compatibilityErrors.push({ path: skill.path, error: 'This skill does not support the current operating system.' });
-                return;
-            }
-            var key = normalizedPathKey(skill.path);
-            if (existing[key]) {
-                duplicates += 1;
-                return;
-            }
-            existing[key] = true;
-            skills.push(skill);
-            added += 1;
-        });
-
-        var combinedErrors = (Array.isArray(errors) ? errors : []).concat(compatibilityErrors);
-        if (!added && rejected && !skills.length) {
-            throw new Error('Could not add Skill files. ' + common.inspectionErrorMessage(combinedErrors, 'No valid SKILL.md file was found.'));
-        }
-        node.status = skills.length ? 'active' : 'idle';
-        node.statusMessage = additionStatus(skills, added, duplicates, rejected);
-        if (!added && rejected && skills.length) {
-            node.statusMessage += ' · ' + common.inspectionErrorMessage(combinedErrors, 'No valid SKILL.md file was found.');
-        }
-        return { added: added, duplicates: duplicates, rejected: rejected };
-    }
-
-    async function inspectDroppedSkills(filePaths) {
-        var skills = [];
-        var errors = [];
-        var bridge = common.getAgentBridge();
-        for (var index = 0; index < filePaths.length; index++) {
-            var sourcePath = String(filePaths[index] || '').trim();
-            if (!sourcePath) continue;
-            if (!isMarkdownFile(sourcePath)) {
-                errors.push({ path: sourcePath, error: 'Skills accepts Markdown .md files only.' });
-                continue;
-            }
-            var response = await bridge.inspectSkill(sourcePath);
-            if (!response || !response.success || !response.skill) {
-                errors.push({ path: sourcePath, error: response && response.error ? response.error : 'Skill validation failed.' });
-                continue;
-            }
-            skills.push(response.skill);
-        }
-        return { skills: skills, errors: errors };
-    }
-
-    function skillListHTML(node, skills) {
-        if (!skills.length) {
-            return '<div class="node-asset-empty"><span class="node-asset-empty-icon" aria-hidden="true">＋</span><span>Add or drop SKILL.md files to make their instructions available.</span></div>';
-        }
-        return '<div class="node-asset-list">' + skills.map(function(skill, index) {
-            return '<div class="node-asset-row">' +
-                '<span class="node-asset-icon skill" aria-hidden="true">SK</span>' +
-                '<span class="node-asset-copy"><span class="node-asset-name">' + controls.escapeHtml(skill.name || fileName(skill.path)) + '</span>' +
-                    '<span class="node-asset-path" title="' + controls.escapeHtml(skill.path) + '">' + controls.escapeHtml(skill.description || skill.path) + '</span></span>' +
-                '<button type="button" class="node-action-button node-asset-remove" data-node-control="true" data-node-id="' + node.id + '" data-action="remove-skill-file:' + index + '" aria-label="Remove ' + controls.escapeHtml(skill.name || fileName(skill.path)) + '" title="Remove skill file">×</button>' +
-            '</div>';
-        }).join('') + '</div>';
-    }
-
-    var definition = {
-        id: 'skills',
-        title: 'Skills',
-        badge: 'AGENT',
-        outputNode: false,
-        inputs: [],
-        outputs: [{ name: 'skills', label: 'Skills', type: types.SKILLS }],
-        factory: function(nodeId, x, y) {
-            return common.baseNode(definition, nodeId, x, y, { params: { skills: [] } });
-        },
-        normalizeNode: function(node) {
-            ensureSkills(node);
-        },
-        buildContentHTML: function(node) {
-            var skills = ensureSkills(node);
-            return '<div class="node-asset-section node-file-drop-zone" data-node-file-drop="skills" data-node-id="' + node.id + '" data-drop-label="Drop SKILL.md files">' +
-                '<div class="node-asset-heading"><span>Skill files</span><span class="node-asset-heading-count">' + skills.length + '</span></div>' +
-                skillListHTML(node, skills) +
-                '<div class="node-asset-drop-hint"><span>Drop multiple SKILL.md files here</span><span>Shift/Ctrl-click to multi-select</span></div>' +
-                '<div class="node-action-row node-asset-actions">' + controls.button('Add SKILL.md Files…', node.id, 'add-skill-file') + '</div>' +
-                '</div>' +
-                controls.status(node, statusText(skills));
-        },
-        onAction: async function(node, action) {
-            var skills = ensureSkills(node);
-            if (action.indexOf('remove-skill-file:') === 0) {
-                var index = Number.parseInt(action.split(':')[1], 10);
-                if (Number.isInteger(index) && index >= 0 && index < skills.length) skills.splice(index, 1);
-                node.status = skills.length ? 'active' : 'idle';
-                node.statusMessage = statusText(skills);
-                return;
-            }
-            if (action !== 'add-skill-file') return;
-
-            var browser = root.Darkstar && root.Darkstar.skillFiles;
-            if (!browser || typeof browser.open !== 'function') throw new Error('Darkstar’s skill browser is unavailable in this build.');
-            var result = await browser.open({ multiple: true });
-            var selectedPaths = result && Array.isArray(result.paths) ? result.paths : (result && result.path ? [result.path] : []);
-            if (!selectedPaths.length) {
-                node.status = skills.length ? 'active' : 'idle';
-                node.statusMessage = statusText(skills);
-                return;
-            }
-            node.status = 'loading';
-            node.statusMessage = 'Inspecting selected skills…';
-            if (typeof rerenderNode === 'function') rerenderNode(node.id);
-            var inspected = await inspectDroppedSkills(selectedPaths);
-            addInspectedSkills(node, inspected.skills, inspected.errors);
-        },
-        onFilesDropped: async function(node, filePaths) {
-            var skills = ensureSkills(node);
-            node.status = 'loading';
-            node.statusMessage = 'Inspecting ' + filePaths.length + ' dropped file' + (filePaths.length === 1 ? '…' : 's…');
-            if (typeof rerenderNode === 'function') rerenderNode(node.id);
-            var inspected = await inspectDroppedSkills(filePaths);
-            if (!inspected.skills.length && !inspected.errors.length) {
-                node.status = skills.length ? 'active' : 'idle';
-                node.statusMessage = statusText(skills);
-                return;
-            }
-            addInspectedSkills(node, inspected.skills, inspected.errors);
-        },
-        execute: async function(_inputs, node) {
-            var skills = ensureSkills(node);
-            var references = [];
-            var refreshed = [];
-            for (var index = 0; index < skills.length; index++) {
-                var response = await common.getAgentBridge().inspectSkill(skills[index].path);
-                if (!response || !response.success) throw new Error(response && response.error ? response.error : 'Skills: validation failed.');
-                if (response.skill.compatible === false) throw new Error('Skills: ' + (response.skill.name || skills[index].name) + ' does not support the current operating system.');
-                refreshed.push(normalizeSkill(response.skill));
-                references.push({ path: response.skill.path || skills[index].path, name: response.skill.name || skills[index].name });
-            }
-            node.params.skills = refreshed.filter(Boolean);
-            node.status = references.length ? 'active' : 'idle';
-            node.statusMessage = statusText(node.params.skills);
-            return { skills: { skills: references } };
-        }
-    };
-
-    nodes.registerNode(definition);
-})(globalThis);
-    // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/skills.js">
     // RENDERER MODULE :: backend/renderer/nodes/builtin/load-tool.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/nodes/builtin/load-tool.js">
 (function registerLoadToolNode(root) {
@@ -3987,9 +4696,9 @@ function unregisterGenerationSession(session) {
     nodes.registerNode(definition);
 })(globalThis);
     // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/load-tool.js">
-    // RENDERER MODULE :: backend/renderer/nodes/builtin/tools.js
-    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/nodes/builtin/tools.js">
-(function registerToolsNode(root) {
+    // RENDERER MODULE :: backend/renderer/nodes/builtin/loader.js
+    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/nodes/builtin/loader.js">
+(function registerLoaderNode(root) {
     'use strict';
 
     var nodes = root.Darkstar.nodes;
@@ -4004,6 +4713,10 @@ function unregisterGenerationSession(session) {
     var TIMEOUT_TOOL_MIGRATION_VERSION = 1;
     var ASK_USER_YES_NO_TOOL_PATH = 'agent_assets/tools/ask_user_yes_no.py';
     var ASK_USER_YES_NO_TOOL_MIGRATION_VERSION = 1;
+    var GENERATE_IMAGE_TOOL_PATH = 'agent_assets/tools/generate_image.py';
+    var GENERATE_IMAGE_TOOL_MIGRATION_VERSION = 1;
+    var SHOW_IMAGE_TOOL_PATH = 'agent_assets/tools/show_image.py';
+    var SHOW_IMAGE_TOOL_MIGRATION_VERSION = 1;
     var MAX_ROUNDS_MIGRATION_VERSION = 2;
     var PACKAGED_PROVIDER_MIGRATIONS = Object.freeze([
         Object.freeze({ from: 'agent_assets/tools/edit_file_tool.py', to: 'agent_assets/tools/safe_edit_tool.py', name: 'Safe Edit Tool', toolCount: 1 }),
@@ -4014,10 +4727,9 @@ function unregisterGenerationSession(session) {
 
     var normalizedPathKey = common.normalizedPathKey;
     function fileName(value) { return common.fileName(value, 'Python tool file'); }
-
-    function isPythonFile(value) {
-        return /\.py$/iu.test(String(value || '').trim());
-    }
+    function skillFileName(value) { return common.fileName(value, 'SKILL.md'); }
+    function isPythonFile(value) { return /\.py$/iu.test(String(value || '').trim()); }
+    function isMarkdownFile(value) { return /\.md$/iu.test(String(value || '').trim()); }
 
     function packagedProviderMigration(sourcePath) {
         var key = normalizedPathKey(sourcePath);
@@ -4034,18 +4746,10 @@ function unregisterGenerationSession(session) {
             var id = String(value.id || '').trim().toLowerCase();
             if (!id || id === 'uip') return null;
             if (id === SCREENSHOT_PROVIDER_ID) {
-                return {
-                    kind: 'python',
-                    path: SCREENSHOT_TOOL_PATH,
-                    name: 'Screenshot HTML',
-                    toolCount: 1,
-                    locked: false
-                };
+                return { kind: 'python', path: SCREENSHOT_TOOL_PATH, name: 'Screenshot HTML', toolCount: 1, locked: false };
             }
             return {
-                kind: 'builtin',
-                id: id,
-                name: String(value.name || id),
+                kind: 'builtin', id: id, name: String(value.name || id),
                 toolCount: Math.max(0, Number.parseInt(value.toolCount !== undefined ? value.toolCount : value.tools, 10) || 0),
                 locked: value.locked === true
             };
@@ -4055,11 +4759,22 @@ function unregisterGenerationSession(session) {
         var migration = packagedProviderMigration(sourcePath);
         if (migration) sourcePath = migration.to;
         return {
-            kind: 'python',
-            path: sourcePath,
+            kind: 'python', path: sourcePath,
             name: migration ? migration.name : String(value.name || value.providerName || fileName(sourcePath)),
             toolCount: migration ? migration.toolCount : Math.max(0, Number.parseInt(value.toolCount !== undefined ? value.toolCount : value.tools, 10) || 0),
             locked: false
+        };
+    }
+
+    function normalizeSkill(value) {
+        if (!value || typeof value !== 'object') return null;
+        var path = String(value.path || '').trim();
+        if (!path) return null;
+        return {
+            path: path,
+            name: String(value.name || value.skillName || skillFileName(path)),
+            description: String(value.description || ''),
+            compatible: value.compatible !== false
         };
     }
 
@@ -4069,50 +4784,18 @@ function unregisterGenerationSession(session) {
             : 'python:' + normalizedPathKey(provider.path);
     }
 
-    function screenshotProvider() {
-        return normalizeProvider({
-            kind: 'python',
-            path: SCREENSHOT_TOOL_PATH,
-            name: 'Screenshot HTML',
-            toolCount: 1
-        });
-    }
-
-    function browserControlProvider() {
-        return normalizeProvider({
-            kind: 'python',
-            path: BROWSER_CONTROL_TOOL_PATH,
-            name: 'Browser Control',
-            toolCount: 1
-        });
-    }
-
-    function timeoutProvider() {
-        return normalizeProvider({
-            kind: 'python',
-            path: TIMEOUT_TOOL_PATH,
-            name: 'Timeout',
-            toolCount: 1
-        });
-    }
-
-    function askUserYesNoProvider() {
-        return normalizeProvider({
-            kind: 'python',
-            path: ASK_USER_YES_NO_TOOL_PATH,
-            name: 'Ask User Yes/No',
-            toolCount: 1
-        });
-    }
+    function screenshotProvider() { return normalizeProvider({ kind: 'python', path: SCREENSHOT_TOOL_PATH, name: 'Screenshot HTML', toolCount: 1 }); }
+    function browserControlProvider() { return normalizeProvider({ kind: 'python', path: BROWSER_CONTROL_TOOL_PATH, name: 'Browser Control', toolCount: 1 }); }
+    function timeoutProvider() { return normalizeProvider({ kind: 'python', path: TIMEOUT_TOOL_PATH, name: 'Timeout', toolCount: 1 }); }
+    function askUserYesNoProvider() { return normalizeProvider({ kind: 'python', path: ASK_USER_YES_NO_TOOL_PATH, name: 'Ask User Yes/No', toolCount: 1 }); }
+    function generateImageProvider() { return normalizeProvider({ kind: 'python', path: GENERATE_IMAGE_TOOL_PATH, name: 'Generate Image', toolCount: 1 }); }
+    function showImageProvider() { return normalizeProvider({ kind: 'python', path: SHOW_IMAGE_TOOL_PATH, name: 'Show Image', toolCount: 1 }); }
 
     function providerFromInspection(value, reference) {
         if (!value || typeof value !== 'object') return null;
         return normalizeProvider({
             kind: reference && reference.kind === 'builtin' ? 'builtin' : 'python',
             id: reference && reference.id ? reference.id : value.id,
-            // Inspection returns a resolved absolute path. Preserve the workflow's
-            // existing portable reference when one exists instead of rewriting a
-            // packaged provider to a machine-specific path during execution.
             path: (reference && reference.path) || value.path,
             name: value.name || value.id,
             toolCount: Array.isArray(value.tools) ? value.tools.length : value.toolCount,
@@ -4121,9 +4804,7 @@ function unregisterGenerationSession(session) {
     }
 
     function inspectedProviderKey(value, reference) {
-        if (reference && reference.kind === 'builtin') {
-            return 'builtin:' + String(reference.id || (value && value.id) || '').toLowerCase();
-        }
+        if (reference && reference.kind === 'builtin') return 'builtin:' + String(reference.id || (value && value.id) || '').toLowerCase();
         return 'python:' + normalizedPathKey(value && value.path ? value.path : (reference && reference.path));
     }
 
@@ -4142,72 +4823,64 @@ function unregisterGenerationSession(session) {
         return pythonReferencePreference(candidate) < pythonReferencePreference(current) ? candidate : current;
     }
 
-    function ensureProviders(node) {
+    function normalizeMaxRounds(value) {
+        if (value === undefined || value === null || value === '' || String(value).toLowerCase() === 'auto') return 'auto';
+        var parsed = Number.parseInt(value, 10);
+        if (!Number.isFinite(parsed) || parsed < 1) return 'auto';
+        return Math.min(32, parsed);
+    }
+
+    function ensureLoaderState(node) {
         if (!node.params || typeof node.params !== 'object') node.params = {};
-        var source = Array.isArray(node.params.providers)
-            ? node.params.providers
-            : (Array.isArray(node.params.toolFiles) ? node.params.toolFiles : []);
-        var seen = Object.create(null);
-        node.params.providers = source.map(normalizeProvider).filter(function(provider) {
+        var providerSource = Array.isArray(node.params.providers) ? node.params.providers : (Array.isArray(node.params.toolFiles) ? node.params.toolFiles : []);
+        var seenProviders = Object.create(null);
+        node.params.providers = providerSource.map(normalizeProvider).filter(function(provider) {
             if (!provider) return false;
             var key = providerKey(provider);
-            if (seen[key]) return false;
-            seen[key] = true;
+            if (seenProviders[key]) return false;
+            seenProviders[key] = true;
             return true;
         });
-        var browserControlMigrationVersion = Math.max(0, Number.parseInt(node.params.browserControlToolMigrationVersion, 10) || 0);
-        if (browserControlMigrationVersion < BROWSER_CONTROL_TOOL_MIGRATION_VERSION) {
-            var bundledBrowserControl = browserControlProvider();
-            var browserControlKey = providerKey(bundledBrowserControl);
-            if (!seen[browserControlKey]) {
-                node.params.providers.push(bundledBrowserControl);
-                seen[browserControlKey] = true;
+        var skillSource = Array.isArray(node.params.skills) ? node.params.skills : (Array.isArray(node.params.skillFiles) ? node.params.skillFiles : []);
+        var seenSkills = Object.create(null);
+        node.params.skills = skillSource.map(normalizeSkill).filter(function(skill) {
+            if (!skill) return false;
+            var key = normalizedPathKey(skill.path);
+            if (seenSkills[key]) return false;
+            seenSkills[key] = true;
+            return true;
+        });
+
+        var migrations = [
+            ['browserControlToolMigrationVersion', BROWSER_CONTROL_TOOL_MIGRATION_VERSION, browserControlProvider],
+            ['timeoutToolMigrationVersion', TIMEOUT_TOOL_MIGRATION_VERSION, timeoutProvider],
+            ['askUserYesNoToolMigrationVersion', ASK_USER_YES_NO_TOOL_MIGRATION_VERSION, askUserYesNoProvider],
+            ['generateImageToolMigrationVersion', GENERATE_IMAGE_TOOL_MIGRATION_VERSION, generateImageProvider],
+            ['showImageToolMigrationVersion', SHOW_IMAGE_TOOL_MIGRATION_VERSION, showImageProvider]
+        ];
+        migrations.forEach(function(entry) {
+            var current = Math.max(0, Number.parseInt(node.params[entry[0]], 10) || 0);
+            if (current >= entry[1]) return;
+            var provider = entry[2]();
+            var key = providerKey(provider);
+            if (!seenProviders[key]) {
+                node.params.providers.push(provider);
+                seenProviders[key] = true;
             }
-            node.params.browserControlToolMigrationVersion = BROWSER_CONTROL_TOOL_MIGRATION_VERSION;
-        }
-        var timeoutMigrationVersion = Math.max(0, Number.parseInt(node.params.timeoutToolMigrationVersion, 10) || 0);
-        if (timeoutMigrationVersion < TIMEOUT_TOOL_MIGRATION_VERSION) {
-            var bundledTimeout = timeoutProvider();
-            var timeoutKey = providerKey(bundledTimeout);
-            if (!seen[timeoutKey]) {
-                node.params.providers.push(bundledTimeout);
-                seen[timeoutKey] = true;
-            }
-            node.params.timeoutToolMigrationVersion = TIMEOUT_TOOL_MIGRATION_VERSION;
-        }
-        var askUserMigrationVersion = Math.max(0, Number.parseInt(node.params.askUserYesNoToolMigrationVersion, 10) || 0);
-        if (askUserMigrationVersion < ASK_USER_YES_NO_TOOL_MIGRATION_VERSION) {
-            var bundledAskUser = askUserYesNoProvider();
-            var askUserKey = providerKey(bundledAskUser);
-            if (!seen[askUserKey]) {
-                node.params.providers.push(bundledAskUser);
-                seen[askUserKey] = true;
-            }
-            node.params.askUserYesNoToolMigrationVersion = ASK_USER_YES_NO_TOOL_MIGRATION_VERSION;
-        }
+            node.params[entry[0]] = entry[1];
+        });
         delete node.params.uipToolMigrationVersion;
         delete node.params.toolFiles;
+        delete node.params.skillFiles;
         var maxRoundsMigrationVersion = Math.max(0, Number.parseInt(node.params.maxRoundsMigrationVersion, 10) || 0);
         if (maxRoundsMigrationVersion < MAX_ROUNDS_MIGRATION_VERSION) {
-            // The shipped workflow previously used the hard ceiling (32) as its default.
-            // Migrate that legacy default to Auto once. Version 2 deliberately re-runs the
-            // migration because a live workflow/session could have persisted the old 32
-            // before the first Auto-default fix was loaded. After migration, selecting a
-            // numeric limit remains explicit and is not changed again in this process.
             if (Number.parseInt(node.params.maxRounds, 10) === 32) node.params.maxRounds = 'auto';
             node.params.maxRoundsMigrationVersion = MAX_ROUNDS_MIGRATION_VERSION;
         }
         node.params.maxRounds = normalizeMaxRounds(node.params.maxRounds);
         if (['auto', 'none', 'required'].indexOf(node.params.toolChoice) < 0) node.params.toolChoice = 'auto';
         node.inputs = [];
-        return node.params.providers;
-    }
-
-    function normalizeMaxRounds(value) {
-        if (value === undefined || value === null || value === '' || String(value).toLowerCase() === 'auto') return 'auto';
-        var parsed = Number.parseInt(value, 10);
-        if (!Number.isFinite(parsed) || parsed < 1) return 'auto';
-        return Math.min(32, parsed);
+        return { providers: node.params.providers, skills: node.params.skills };
     }
 
     function maximumToolRoundOptions() {
@@ -4220,54 +4893,73 @@ function unregisterGenerationSession(session) {
         return providers.reduce(function(total, provider) { return total + (Number(provider.toolCount) || 0); }, 0);
     }
 
-    function statusText(providers) {
-        var fileCount = providers.length;
+    function statusText(providers, skills) {
+        var parts = [];
         var toolCount = totalToolCount(providers);
-        if (!fileCount) return 'No tool files added';
-        return fileCount + (fileCount === 1 ? ' file' : ' files') + (toolCount ? ' · ' + toolCount + (toolCount === 1 ? ' tool' : ' tools') : '');
+        if (toolCount) parts.push(toolCount + (toolCount === 1 ? ' tool' : ' tools'));
+        else if (providers.length) parts.push(providers.length + (providers.length === 1 ? ' provider' : ' providers'));
+        if (skills.length) parts.push(skills.length + (skills.length === 1 ? ' skill' : ' skills'));
+        return parts.length ? parts.join(' · ') : 'No assets loaded';
     }
 
-    function additionStatus(providers, added, duplicates, rejected) {
+    function additionStatus(providers, skills, added, duplicates, rejected) {
         var details = [];
         if (added) details.push('added ' + added);
         if (duplicates) details.push('ignored ' + duplicates + ' duplicate' + (duplicates === 1 ? '' : 's'));
         if (rejected) details.push('rejected ' + rejected);
-        return statusText(providers) + (details.length ? ' · ' + details.join(' · ') : '');
+        return statusText(providers, skills) + (details.length ? ' · ' + details.join(' · ') : '');
     }
 
-
     function addInspectedProviders(node, inspectedProviders, errors) {
-        var providers = ensureProviders(node);
+        var state = ensureLoaderState(node);
         var existing = Object.create(null);
-        providers.forEach(function(provider) { existing[providerKey(provider)] = true; });
+        state.providers.forEach(function(provider) { existing[providerKey(provider)] = true; });
         var added = 0;
         var duplicates = 0;
         var rejected = Array.isArray(errors) ? errors.length : 0;
-
         (Array.isArray(inspectedProviders) ? inspectedProviders : []).forEach(function(value) {
             var provider = providerFromInspection(value, { kind: 'python', path: value && value.path });
-            if (!provider) {
-                rejected += 1;
-                return;
-            }
+            if (!provider) { rejected += 1; return; }
             var key = providerKey(provider);
-            if (existing[key]) {
-                duplicates += 1;
-                return;
-            }
+            if (existing[key]) { duplicates += 1; return; }
             existing[key] = true;
-            providers.push(provider);
+            state.providers.push(provider);
             added += 1;
         });
+        if (!added && rejected && !state.providers.length) throw new Error('Could not add Tool files. ' + common.inspectionErrorMessage(errors, 'No valid Python tool provider was found.'));
+        node.status = state.providers.length || state.skills.length ? 'active' : 'idle';
+        node.statusMessage = additionStatus(state.providers, state.skills, added, duplicates, rejected);
+        if (!added && rejected && state.providers.length) node.statusMessage += ' · ' + common.inspectionErrorMessage(errors, 'No valid Python tool provider was found.');
+        return { added: added, duplicates: duplicates, rejected: rejected };
+    }
 
-        if (!added && rejected && !providers.length) {
-            throw new Error('Could not add Tool files. ' + common.inspectionErrorMessage(errors, 'No valid Python tool provider was found.'));
-        }
-        node.status = providers.length ? 'active' : 'idle';
-        node.statusMessage = additionStatus(providers, added, duplicates, rejected);
-        if (!added && rejected && providers.length) {
-            node.statusMessage += ' · ' + common.inspectionErrorMessage(errors, 'No valid Python tool provider was found.');
-        }
+    function addInspectedSkills(node, inspectedSkills, errors) {
+        var state = ensureLoaderState(node);
+        var existing = Object.create(null);
+        state.skills.forEach(function(skill) { existing[normalizedPathKey(skill.path)] = true; });
+        var added = 0;
+        var duplicates = 0;
+        var rejected = Array.isArray(errors) ? errors.length : 0;
+        var compatibilityErrors = [];
+        (Array.isArray(inspectedSkills) ? inspectedSkills : []).forEach(function(value) {
+            var skill = normalizeSkill(value);
+            if (!skill) { rejected += 1; return; }
+            if (!skill.compatible) {
+                rejected += 1;
+                compatibilityErrors.push({ path: skill.path, error: 'This skill does not support the current operating system.' });
+                return;
+            }
+            var key = normalizedPathKey(skill.path);
+            if (existing[key]) { duplicates += 1; return; }
+            existing[key] = true;
+            state.skills.push(skill);
+            added += 1;
+        });
+        var combinedErrors = (Array.isArray(errors) ? errors : []).concat(compatibilityErrors);
+        if (!added && rejected && !state.skills.length) throw new Error('Could not add Skill files. ' + common.inspectionErrorMessage(combinedErrors, 'No valid SKILL.md file was found.'));
+        node.status = state.providers.length || state.skills.length ? 'active' : 'idle';
+        node.statusMessage = additionStatus(state.providers, state.skills, added, duplicates, rejected);
+        if (!added && rejected && state.skills.length) node.statusMessage += ' · ' + common.inspectionErrorMessage(combinedErrors, 'No valid SKILL.md file was found.');
         return { added: added, duplicates: duplicates, rejected: rejected };
     }
 
@@ -4278,25 +4970,29 @@ function unregisterGenerationSession(session) {
         for (var index = 0; index < filePaths.length; index++) {
             var sourcePath = String(filePaths[index] || '').trim();
             if (!sourcePath) continue;
-            if (!isPythonFile(sourcePath)) {
-                errors.push({ path: sourcePath, error: 'Tools accepts Python .py files only.' });
-                continue;
-            }
             var response = await bridge.inspectToolProvider({ kind: 'python', path: sourcePath });
-            if (!response || !response.success || !response.provider) {
-                errors.push({ path: sourcePath, error: response && response.error ? response.error : 'Python tool validation failed.' });
-                continue;
-            }
-            providers.push(response.provider);
+            if (!response || !response.success || !response.provider) errors.push({ path: sourcePath, error: response && response.error ? response.error : 'Python tool validation failed.' });
+            else providers.push(response.provider);
         }
         return { providers: providers, errors: errors };
     }
 
-    function providerListHTML(node, providers) {
-        if (!providers.length) {
-            return '<div class="node-asset-empty"><span class="node-asset-empty-icon" aria-hidden="true">＋</span><span>Add or drop Python tool files to expose their functions.</span></div>';
+    async function inspectDroppedSkills(filePaths) {
+        var skills = [];
+        var errors = [];
+        var bridge = common.getAgentBridge();
+        for (var index = 0; index < filePaths.length; index++) {
+            var sourcePath = String(filePaths[index] || '').trim();
+            if (!sourcePath) continue;
+            var response = await bridge.inspectSkill(sourcePath);
+            if (!response || !response.success || !response.skill) errors.push({ path: sourcePath, error: response && response.error ? response.error : 'Skill validation failed.' });
+            else skills.push(response.skill);
         }
-        return '<div class="node-asset-list">' + providers.map(function(provider, index) {
+        return { skills: skills, errors: errors };
+    }
+
+    function providerListHTML(node, providers) {
+        return '<div class="node-asset-list" data-node-control="true">' + providers.map(function(provider, index) {
             var count = Number(provider.toolCount) || 0;
             var builtin = provider.kind === 'builtin';
             var displayName = provider.name || (builtin ? provider.id : fileName(provider.path));
@@ -4312,20 +5008,113 @@ function unregisterGenerationSession(session) {
         }).join('') + '</div>';
     }
 
+    function skillListHTML(node, skills) {
+        return '<div class="node-asset-list" data-node-control="true">' + skills.map(function(skill, index) {
+            return '<div class="node-asset-row">' +
+                '<span class="node-asset-icon skill" aria-hidden="true">SK</span>' +
+                '<span class="node-asset-copy"><span class="node-asset-name">' + controls.escapeHtml(skill.name || skillFileName(skill.path)) + '</span>' +
+                    '<span class="node-asset-path" title="' + controls.escapeHtml(skill.path) + '">' + controls.escapeHtml(skill.description || skill.path) + '</span></span>' +
+                '<button type="button" class="node-action-button node-asset-remove" data-node-control="true" data-node-id="' + node.id + '" data-action="remove-skill-file:' + index + '" aria-label="Remove ' + controls.escapeHtml(skill.name || skillFileName(skill.path)) + '" title="Remove skill file">×</button>' +
+            '</div>';
+        }).join('') + '</div>';
+    }
+
+    function assetSection(label, count, content, emptyMessage) {
+        var body = count
+            ? content
+            : '<div class="node-asset-empty"><span>' + controls.escapeHtml(emptyMessage || ('No ' + String(label || 'assets').toLowerCase() + ' loaded.')) + '</span></div>';
+        return '<div class="node-asset-section"><div class="node-asset-heading"><span>' + label + '</span><span class="node-asset-heading-count">' + count + '</span></div>' + body + '</div>';
+    }
+
+    async function browseToolAssets(node) {
+        var browser = root.Darkstar && root.Darkstar.toolFiles;
+        if (!browser || typeof browser.open !== 'function') throw new Error('Darkstar’s Python tool browser is unavailable in this build.');
+        var result = await browser.open({ multiple: true });
+        var selectedPaths = result && Array.isArray(result.paths) ? result.paths : (result && result.path ? [result.path] : []);
+        if (!selectedPaths.length) return;
+        node.status = 'loading';
+        node.statusMessage = 'Inspecting selected Python tools…';
+        if (typeof rerenderNode === 'function') rerenderNode(node.id);
+        var inspected = await inspectDroppedProviders(selectedPaths);
+        addInspectedProviders(node, inspected.providers, inspected.errors);
+    }
+
+    async function browseSkillAssets(node) {
+        var browser = root.Darkstar && root.Darkstar.skillFiles;
+        if (!browser || typeof browser.open !== 'function') throw new Error('Darkstar’s skill browser is unavailable in this build.');
+        var result = await browser.open({ multiple: true });
+        var selectedPaths = result && Array.isArray(result.paths) ? result.paths : (result && result.path ? [result.path] : []);
+        if (!selectedPaths.length) return;
+        node.status = 'loading';
+        node.statusMessage = 'Inspecting selected skills…';
+        if (typeof rerenderNode === 'function') rerenderNode(node.id);
+        var inspected = await inspectDroppedSkills(selectedPaths);
+        addInspectedSkills(node, inspected.skills, inspected.errors);
+    }
+
+    async function refreshProviders(node, providers) {
+        var references = [];
+        var refreshed = [];
+        var inspectedProviderKeys = Object.create(null);
+        for (var index = 0; index < providers.length; index++) {
+            var current = providers[index];
+            var reference = current.kind === 'builtin' ? { kind: 'builtin', id: current.id } : { kind: 'python', path: current.path };
+            var response = await common.getAgentBridge().inspectToolProvider(reference);
+            if (!response || !response.success) throw new Error(response && response.error ? response.error : 'Loader: tool provider validation failed.');
+            var inspectedKey = inspectedProviderKey(response.provider, reference);
+            if (Object.prototype.hasOwnProperty.call(inspectedProviderKeys, inspectedKey)) {
+                var existingIndex = inspectedProviderKeys[inspectedKey];
+                var preferredReference = preferProviderReference(references[existingIndex], reference);
+                if (preferredReference !== references[existingIndex]) {
+                    references[existingIndex] = preferredReference;
+                    refreshed[existingIndex] = providerFromInspection(response.provider, preferredReference);
+                }
+                continue;
+            }
+            inspectedProviderKeys[inspectedKey] = references.length;
+            refreshed.push(providerFromInspection(response.provider, reference));
+            references.push(reference);
+        }
+        node.params.providers = refreshed.filter(Boolean);
+        return references;
+    }
+
+    async function refreshSkills(node, skills) {
+        var references = [];
+        var refreshed = [];
+        for (var index = 0; index < skills.length; index++) {
+            var response = await common.getAgentBridge().inspectSkill(skills[index].path);
+            if (!response || !response.success) throw new Error(response && response.error ? response.error : 'Loader: skill validation failed.');
+            if (response.skill.compatible === false) throw new Error('Loader: ' + (response.skill.name || skills[index].name) + ' does not support the current operating system.');
+            refreshed.push(normalizeSkill(response.skill));
+            references.push({ path: response.skill.path || skills[index].path, name: response.skill.name || skills[index].name });
+        }
+        node.params.skills = refreshed.filter(Boolean);
+        return references;
+    }
+
     var definition = {
+        // Keep the serialized type id stable for existing workflows while broadening
+        // the node's ownership from tools to agent-loadable capabilities.
         id: 'tools',
-        title: 'Tools',
+        title: 'Loader',
         badge: 'AGENT',
         outputNode: false,
         inputs: [],
-        outputs: [{ name: 'tools', label: 'Tools', type: types.TOOLS }],
+        outputs: [
+            { name: 'tools', label: 'Tools', type: types.TOOLS },
+            { name: 'skills', label: 'Skills', type: types.SKILLS }
+        ],
         factory: function(nodeId, x, y) {
             return common.baseNode(definition, nodeId, x, y, {
                 params: {
-                    providers: [screenshotProvider(), browserControlProvider(), timeoutProvider(), askUserYesNoProvider()],
+                    providers: [screenshotProvider(), browserControlProvider(), timeoutProvider(), askUserYesNoProvider(), generateImageProvider(), showImageProvider()],
+                    skills: [],
                     browserControlToolMigrationVersion: BROWSER_CONTROL_TOOL_MIGRATION_VERSION,
                     timeoutToolMigrationVersion: TIMEOUT_TOOL_MIGRATION_VERSION,
                     askUserYesNoToolMigrationVersion: ASK_USER_YES_NO_TOOL_MIGRATION_VERSION,
+                    generateImageToolMigrationVersion: GENERATE_IMAGE_TOOL_MIGRATION_VERSION,
+                    showImageToolMigrationVersion: SHOW_IMAGE_TOOL_MIGRATION_VERSION,
                     maxRoundsMigrationVersion: MAX_ROUNDS_MIGRATION_VERSION,
                     maxRounds: 'auto',
                     toolChoice: 'auto'
@@ -4333,107 +5122,93 @@ function unregisterGenerationSession(session) {
             });
         },
         normalizeNode: function(node) {
-            ensureProviders(node);
+            ensureLoaderState(node);
+            var savedTitle = String(node && node.title ? node.title : '').trim();
+            if (!savedTitle || savedTitle === 'Tools' || savedTitle === 'Skills') node.title = definition.title;
+            node.outputs = definition.outputs.map(function(output) { return Object.assign({}, output); });
         },
         buildContentHTML: function(node) {
-            var providers = ensureProviders(node);
-            return '<div class="node-asset-section node-file-drop-zone" data-node-file-drop="tools" data-node-id="' + node.id + '" data-drop-label="Drop Python tool files">' +
-                '<div class="node-asset-heading"><span>Tool providers</span><span class="node-asset-heading-count">' + providers.length + '</span></div>' +
-                providerListHTML(node, providers) +
-                '<div class="node-asset-drop-hint"><span>Drop multiple .py files here</span><span>Shift/Ctrl-click to multi-select</span></div>' +
-                '<div class="node-action-row node-asset-actions">' + controls.button('Add Tool Files…', node.id, 'add-tool-file') + '</div>' +
+            var state = ensureLoaderState(node);
+            var capabilityControls = '<div class="node-file-drop-zone" data-node-file-drop="loader" data-node-id="' + node.id + '" data-drop-label="Drop tool or skill files">' +
+                '<div class="node-asset-column">' +
+                    assetSection('Tool providers', state.providers.length, providerListHTML(node, state.providers), 'No tool providers loaded.') +
+                    '<div class="node-action-row node-asset-actions">' + controls.button('Add Tool Files…', node.id, 'add-tool-file') + '</div>' +
                 '</div>' +
-                controls.dropdown('Maximum tool rounds', node.params.maxRounds, node.id, 'maxRounds', maximumToolRoundOptions(), 'string') +
+                '<div class="node-asset-column">' +
+                    assetSection('Skills', state.skills.length, skillListHTML(node, state.skills), 'No skills loaded.') +
+                    '<div class="node-action-row node-asset-actions">' + controls.button('Add SKILL.md Files…', node.id, 'add-skill-file') + '</div>' +
+                '</div>' +
+                '</div>';
+            var behaviorControls = controls.dropdown('Maximum tool rounds', node.params.maxRounds, node.id, 'maxRounds', maximumToolRoundOptions(), 'string') +
                 controls.dropdown('Tool choice', node.params.toolChoice, node.id, 'toolChoice', [
-                    { value: 'auto', label: 'Auto' },
-                    { value: 'none', label: 'Disabled' },
-                    { value: 'required', label: 'Required' }
-                ], 'string') +
-                controls.status(node, statusText(providers));
+                    { value: 'auto', label: 'Auto' }, { value: 'none', label: 'Disabled' }, { value: 'required', label: 'Required' }
+                ], 'string');
+            return controls.group('Capabilities', 'Tools and skills available to the model.', capabilityControls, 'loader-capabilities-group') +
+                controls.group('Tool behavior', 'Control how the model may invoke loaded tools.', behaviorControls) +
+                controls.status(node, statusText(state.providers, state.skills));
         },
         onAction: async function(node, action) {
-            var providers = ensureProviders(node);
+            var state = ensureLoaderState(node);
             if (action.indexOf('remove-tool-file:') === 0) {
-                var index = Number.parseInt(action.split(':')[1], 10);
-                if (Number.isInteger(index) && index >= 0 && index < providers.length && !providers[index].locked) providers.splice(index, 1);
-                node.status = providers.length ? 'active' : 'idle';
-                node.statusMessage = statusText(providers);
+                var toolIndex = Number.parseInt(action.split(':')[1], 10);
+                if (Number.isInteger(toolIndex) && toolIndex >= 0 && toolIndex < state.providers.length && !state.providers[toolIndex].locked) state.providers.splice(toolIndex, 1);
+            } else if (action.indexOf('remove-skill-file:') === 0) {
+                var skillIndex = Number.parseInt(action.split(':')[1], 10);
+                if (Number.isInteger(skillIndex) && skillIndex >= 0 && skillIndex < state.skills.length) state.skills.splice(skillIndex, 1);
+            } else if (action === 'add-tool-file') {
+                await browseToolAssets(node);
                 return;
-            }
-            if (action !== 'add-tool-file') return;
-
-            var browser = root.Darkstar && root.Darkstar.toolFiles;
-            if (!browser || typeof browser.open !== 'function') throw new Error('Darkstar’s Python tool browser is unavailable in this build.');
-            var result = await browser.open({ multiple: true });
-            var selectedPaths = result && Array.isArray(result.paths) ? result.paths : (result && result.path ? [result.path] : []);
-            if (!selectedPaths.length) {
-                node.status = providers.length ? 'active' : 'idle';
-                node.statusMessage = statusText(providers);
+            } else if (action === 'add-skill-file') {
+                await browseSkillAssets(node);
                 return;
-            }
-            node.status = 'loading';
-            node.statusMessage = 'Inspecting selected Python tools…';
-            if (typeof rerenderNode === 'function') rerenderNode(node.id);
-            var inspected = await inspectDroppedProviders(selectedPaths);
-            addInspectedProviders(node, inspected.providers, inspected.errors);
+            } else return;
+            node.status = state.providers.length || state.skills.length ? 'active' : 'idle';
+            node.statusMessage = statusText(state.providers, state.skills);
         },
         onFilesDropped: async function(node, filePaths) {
-            var providers = ensureProviders(node);
+            var pythonPaths = [];
+            var skillPaths = [];
+            var rejected = [];
+            (Array.isArray(filePaths) ? filePaths : []).forEach(function(value) {
+                var sourcePath = String(value || '').trim();
+                if (!sourcePath) return;
+                if (isPythonFile(sourcePath)) pythonPaths.push(sourcePath);
+                else if (isMarkdownFile(sourcePath)) skillPaths.push(sourcePath);
+                else rejected.push({ path: sourcePath, error: 'Loader accepts Python .py tools and Markdown .md skills.' });
+            });
             node.status = 'loading';
-            node.statusMessage = 'Inspecting ' + filePaths.length + ' dropped file' + (filePaths.length === 1 ? '…' : 's…');
+            node.statusMessage = 'Inspecting dropped assets…';
             if (typeof rerenderNode === 'function') rerenderNode(node.id);
-            var inspected = await inspectDroppedProviders(filePaths);
-            if (!inspected.providers.length && !inspected.errors.length) {
-                node.status = providers.length ? 'active' : 'idle';
-                node.statusMessage = statusText(providers);
-                return;
-            }
-            addInspectedProviders(node, inspected.providers, inspected.errors);
+            var providerResult = pythonPaths.length ? await inspectDroppedProviders(pythonPaths) : { providers: [], errors: [] };
+            var skillResult = skillPaths.length ? await inspectDroppedSkills(skillPaths) : { skills: [], errors: [] };
+            if (providerResult.providers.length || providerResult.errors.length) addInspectedProviders(node, providerResult.providers, providerResult.errors);
+            if (skillResult.skills.length || skillResult.errors.length) addInspectedSkills(node, skillResult.skills, skillResult.errors);
+            var state = ensureLoaderState(node);
+            if (rejected.length) node.statusMessage = statusText(state.providers, state.skills) + ' · rejected ' + rejected.length;
+            else node.statusMessage = statusText(state.providers, state.skills);
+            node.status = state.providers.length || state.skills.length ? 'active' : 'idle';
         },
         execute: async function(_inputs, node) {
-            var providers = ensureProviders(node);
-            var references = [];
-            var refreshed = [];
-            var inspectedProviderKeys = Object.create(null);
-            for (var index = 0; index < providers.length; index++) {
-                var current = providers[index];
-                var reference = current.kind === 'builtin'
-                    ? { kind: 'builtin', id: current.id }
-                    : { kind: 'python', path: current.path };
-                var response = await common.getAgentBridge().inspectToolProvider(reference);
-                if (!response || !response.success) {
-                    throw new Error(response && response.error ? response.error : 'Tools: tool provider validation failed.');
-                }
-                var inspectedKey = inspectedProviderKey(response.provider, reference);
-                if (Object.prototype.hasOwnProperty.call(inspectedProviderKeys, inspectedKey)) {
-                    var existingIndex = inspectedProviderKeys[inspectedKey];
-                    var preferredReference = preferProviderReference(references[existingIndex], reference);
-                    if (preferredReference !== references[existingIndex]) {
-                        references[existingIndex] = preferredReference;
-                        refreshed[existingIndex] = providerFromInspection(response.provider, preferredReference);
-                    }
-                    continue;
-                }
-                inspectedProviderKeys[inspectedKey] = references.length;
-                refreshed.push(providerFromInspection(response.provider, reference));
-                references.push(reference);
-            }
-            node.params.providers = refreshed.filter(Boolean);
-            node.status = references.length ? 'active' : 'idle';
-            node.statusMessage = statusText(node.params.providers);
+            var state = ensureLoaderState(node);
+            var toolReferences = await refreshProviders(node, state.providers);
+            var skillReferences = await refreshSkills(node, state.skills);
+            var refreshed = ensureLoaderState(node);
+            node.status = toolReferences.length || skillReferences.length ? 'active' : 'idle';
+            node.statusMessage = statusText(refreshed.providers, refreshed.skills);
             return {
                 tools: {
-                    providers: references,
+                    providers: toolReferences,
                     maxRounds: normalizeMaxRounds(node.params.maxRounds),
                     toolChoice: ['auto', 'none', 'required'].indexOf(node.params.toolChoice) >= 0 ? node.params.toolChoice : 'auto'
-                }
+                },
+                skills: { skills: skillReferences }
             };
         }
     };
 
     nodes.registerNode(definition);
 })(globalThis);
-    // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/tools.js">
+// <DARKSTAR_SOURCE_END path="backend/renderer/nodes/builtin/loader.js">
     // RENDERER MODULE :: backend/renderer/nodes/builtin/control.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/nodes/builtin/control.js">
 (function registerControlNode(root) {
@@ -4445,11 +5220,33 @@ function unregisterGenerationSession(session) {
     var types = nodes.PORT_TYPES;
 
     var FIXED_MODEL_IDLE_UNLOAD_SECONDS = 600;
+    var MIN_IMAGE_COUNT_OVERRIDE = 0;
+    var MAX_IMAGE_COUNT_OVERRIDE = 50;
 
     function normalizeIdleUnloadSeconds(value) {
         var parsed = Number(value);
         if (!Number.isFinite(parsed) || parsed <= 0) return 0;
         return FIXED_MODEL_IDLE_UNLOAD_SECONDS;
+    }
+
+    function normalizeImageCountOverride(value) {
+        var parsed = Number(value);
+        if (!Number.isFinite(parsed)) return MIN_IMAGE_COUNT_OVERRIDE;
+        return Math.max(MIN_IMAGE_COUNT_OVERRIDE, Math.min(MAX_IMAGE_COUNT_OVERRIDE, Math.round(parsed)));
+    }
+
+    function normalizeParams(value) {
+        var params = value && typeof value === 'object' ? value : {};
+        var enabled = typeof params.modelIdleUnloadEnabled === 'boolean'
+            ? params.modelIdleUnloadEnabled
+            : normalizeIdleUnloadSeconds(params.modelIdleUnloadSeconds) > 0;
+        return {
+            nameConversations: typeof params.nameConversations === 'boolean' ? params.nameConversations : true,
+            autoCompact: typeof params.autoCompact === 'boolean' ? params.autoCompact : false,
+            modelIdleUnloadEnabled: enabled,
+            dynamicVramEnabled: typeof params.dynamicVramEnabled === 'boolean' ? params.dynamicVramEnabled : false,
+            negativePromptEnabled: typeof params.negativePromptEnabled === 'boolean' ? params.negativePromptEnabled : false
+        };
     }
 
     function applyIdleUnloadPolicy(value) {
@@ -4458,34 +5255,82 @@ function unregisterGenerationSession(session) {
         root.Darkstar.async.runBestEffort(function() { return runtime.configureModelIdleUnload(normalizeIdleUnloadSeconds(value)); }, 'CONTROL');
     }
 
-    function syncIdleUnloadPolicyFromGraph() {
-        var editor = typeof nodeEditorState !== 'undefined' && nodeEditorState && Array.isArray(nodeEditorState.nodes) ? nodeEditorState : null;
-        var control = editor ? editor.nodes.find(function(node) { return node && node.type === 'control'; }) : null;
-        var params = control && control.params && typeof control.params === 'object' ? control.params : null;
-        var enabled = Boolean(params && (params.modelIdleUnloadEnabled === true
-            || (typeof params.modelIdleUnloadEnabled !== 'boolean' && normalizeIdleUnloadSeconds(params.modelIdleUnloadSeconds) > 0)));
-        applyIdleUnloadPolicy(enabled ? FIXED_MODEL_IDLE_UNLOAD_SECONDS : 0);
-    }
-
-    function statusText(node) {
-        var naming = node.params.nameConversations === true ? 'Conversation naming on' : 'Conversation naming off';
-        var autoCompact = node.params.autoCompact === true ? 'Auto-compact on' : 'Auto-compact off';
-        var idleUnload = node.params.modelIdleUnloadEnabled === true ? 'Model idle unload on · 10 min' : 'Model idle unload off';
-        return naming + ' · ' + autoCompact + ' · ' + idleUnload;
-    }
-
-    function normalizeNode(node) {
-        var params = node && node.params && typeof node.params === 'object' ? node.params : {};
-        var enabled = typeof params.modelIdleUnloadEnabled === 'boolean'
-            ? params.modelIdleUnloadEnabled
-            : normalizeIdleUnloadSeconds(params.modelIdleUnloadSeconds) > 0;
-        node.params = {
-            nameConversations: typeof params.nameConversations === 'boolean' ? params.nameConversations : true,
-            autoCompact: typeof params.autoCompact === 'boolean' ? params.autoCompact : false,
-            modelIdleUnloadEnabled: enabled
+    function runtimeControl(value) {
+        var params = normalizeParams(value);
+        return {
+            nameConversations: params.nameConversations === true,
+            autoCompact: params.autoCompact === true,
+            modelIdleUnloadSeconds: params.modelIdleUnloadEnabled === true ? FIXED_MODEL_IDLE_UNLOAD_SECONDS : 0,
+            dynamicVramEnabled: params.dynamicVramEnabled === true,
+            negativePromptEnabled: params.negativePromptEnabled === true
         };
     }
 
+    function statusText(value) {
+        var params = normalizeParams(value);
+        var naming = params.nameConversations === true ? 'Conversation naming on' : 'Conversation naming off';
+        var autoCompact = params.autoCompact === true ? 'Auto-compact on' : 'Auto-compact off';
+        var idleUnload = params.modelIdleUnloadEnabled === true ? 'Model idle unload on · 10 min' : 'Model idle unload off';
+        var dynamicVram = params.dynamicVramEnabled === true ? 'Dynamic VRAM on' : 'Dynamic VRAM off';
+        return naming + ' · ' + autoCompact + ' · ' + idleUnload + ' · ' + dynamicVram;
+    }
+
+    function buildControls(node) {
+        var params = normalizeParams(node && node.params);
+        return controls.toggle('Name Conversations', params.nameConversations, node.id, 'nameConversations', {
+            onLabel: 'ON',
+            offLabel: 'OFF',
+            description: 'Name a new tab with the loaded model before its first answer.'
+        }) + controls.toggle('Auto-compact', params.autoCompact, node.id, 'autoCompact', {
+            onLabel: 'ON',
+            offLabel: 'OFF',
+            description: 'When 90% of the context window is occupied, compact the earliest 50% into a system handoff summary before the next generation.'
+        }) + controls.toggle('Model idle unload', params.modelIdleUnloadEnabled, node.id, 'modelIdleUnloadEnabled', {
+            onLabel: 'ON',
+            offLabel: 'OFF',
+            description: 'When enabled, unload the loaded model after 10 minutes with no active or queued inference.'
+        }) + controls.toggle('Dynamic VRAM', params.dynamicVramEnabled, node.id, 'dynamicVramEnabled', {
+            onLabel: 'ON',
+            offLabel: 'OFF',
+            description: 'When Generate Image runs, temporarily unload the loaded text model before diffusion starts and load it again after the image finishes.'
+        }) + controls.toggle('Negative Prompt', params.negativePromptEnabled, node.id, 'negativePromptEnabled', {
+            onLabel: 'ON',
+            offLabel: 'OFF',
+            description: 'Allow Generate Image to use an explicit negative prompt for unwanted visual elements.'
+        });
+    }
+
+    function normalizeNode(node) {
+        node.params = normalizeParams(node && node.params);
+        (node.outputs || []).forEach(function(output) {
+            if (output && (output.name === 'while' || output.name === 'control')) output.label = 'Passive';
+        });
+    }
+
+    function syncIdleUnloadPolicyFromGraph() {
+        var editor = typeof nodeEditorState !== 'undefined' && nodeEditorState && Array.isArray(nodeEditorState.nodes) ? nodeEditorState : null;
+        var owner = editor ? editor.nodes.find(function(node) { return node && node.type === 'sampler'; }) : null;
+        if (!owner && editor) owner = editor.nodes.find(function(node) { return node && node.type === 'control'; }) || null;
+        var params = owner && owner.params && typeof owner.params === 'object' ? owner.params : null;
+        var normalized = normalizeParams(params);
+        applyIdleUnloadPolicy(owner && normalized.modelIdleUnloadEnabled === true ? FIXED_MODEL_IDLE_UNLOAD_SECONDS : 0);
+    }
+
+    nodes.orchestrationControl = Object.freeze({
+        fixedIdleUnloadSeconds: FIXED_MODEL_IDLE_UNLOAD_SECONDS,
+        minImageCountOverride: MIN_IMAGE_COUNT_OVERRIDE,
+        maxImageCountOverride: MAX_IMAGE_COUNT_OVERRIDE,
+        normalizeIdleUnloadSeconds: normalizeIdleUnloadSeconds,
+        normalizeImageCountOverride: normalizeImageCountOverride,
+        normalizeParams: normalizeParams,
+        applyIdleUnloadPolicy: applyIdleUnloadPolicy,
+        runtimeControl: runtimeControl,
+        statusText: statusText,
+        buildControls: buildControls
+    });
+
+    // Control remains registered for API/custom workflows that explicitly use it.
+    // Canonical local GGUF workflows own these controls directly in Orchestrator.
     var definition = {
         id: 'control',
         title: 'Control',
@@ -4493,12 +5338,12 @@ function unregisterGenerationSession(session) {
         lockRenderedWidth: true,
         outputNode: false,
         inputs: [],
-        outputs: [{ name: 'while', label: 'While', type: types.CONTROL }],
+        outputs: [{ name: 'while', label: 'Passive', type: types.CONTROL }],
         factory: function(nodeId, x, y) {
             return common.baseNode(definition, nodeId, x, y, {
-                params: { nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: false },
+                params: normalizeParams(null),
                 status: 'active',
-                statusMessage: 'Conversation naming on · Auto-compact off · Model idle unload off'
+                statusMessage: statusText(null)
             });
         },
         normalizeNode: normalizeNode,
@@ -4508,36 +5353,17 @@ function unregisterGenerationSession(session) {
                 applyIdleUnloadPolicy(node.params.modelIdleUnloadEnabled ? FIXED_MODEL_IDLE_UNLOAD_SECONDS : 0);
             }
             node.status = 'active';
-            node.statusMessage = statusText(node);
+            node.statusMessage = statusText(node.params);
         },
         buildContentHTML: function(node) {
             normalizeNode(node);
-            return controls.toggle('Name Conversations', node.params.nameConversations, node.id, 'nameConversations', {
-                onLabel: 'ON',
-                offLabel: 'OFF',
-                description: 'Name a new tab with the loaded model before its first answer.'
-            }) + controls.toggle('Auto-compact', node.params.autoCompact, node.id, 'autoCompact', {
-                onLabel: 'ON',
-                offLabel: 'OFF',
-                description: 'When 90% of the context window is occupied, compact the earliest 50% into a system handoff summary before the next generation.'
-            }) + controls.toggle('Model idle unload', node.params.modelIdleUnloadEnabled, node.id, 'modelIdleUnloadEnabled', {
-                onLabel: 'ON',
-                offLabel: 'OFF',
-                description: 'When enabled, unload the loaded model after 10 minutes with no active or queued inference.'
-            }) + '<div class="node-control-help">The 10-minute timeout is fixed. Any new inference resets the idle window. Pending Authorization decisions pause automatic unloading.</div>' +
-                controls.status(node, statusText(node));
+            return controls.group('Runtime behavior', 'Conversation lifecycle and memory behavior.', buildControls(node)) + controls.status(node, statusText(node.params));
         },
         execute: async function(_inputs, node) {
             normalizeNode(node);
             node.status = 'active';
-            node.statusMessage = statusText(node);
-            return {
-                while: {
-                    nameConversations: node.params.nameConversations === true,
-                    autoCompact: node.params.autoCompact === true,
-                    modelIdleUnloadSeconds: node.params.modelIdleUnloadEnabled === true ? FIXED_MODEL_IDLE_UNLOAD_SECONDS : 0
-                }
-            };
+            node.statusMessage = statusText(node.params);
+            return { while: runtimeControl(node.params) };
         }
     };
 
@@ -4555,143 +5381,10 @@ function unregisterGenerationSession(session) {
     var chatRuntime = root.Darkstar.chatRuntime || nodes.services;
     var controls = nodes.controls;
     var types = nodes.PORT_TYPES;
-
-    function currentGraphState() {
-        if (typeof nodeEditorState !== 'undefined' && nodeEditorState) return nodeEditorState;
-        return root.nodeEditorState || null;
-    }
-
-    function connectedModelId(node) {
-        var state = currentGraphState();
-        if (!state || !Array.isArray(state.nodes)) return '';
-        var connection = (Array.isArray(state.connections) ? state.connections : []).find(function(candidate) {
-            return String(candidate.toNode) === String(node.id)
-                && candidate.toSocket === 'model'
-                && candidate.fromSocket === 'model';
-        });
-        if (connection) {
-            var loader = state.nodes.find(function(candidate) {
-                return String(candidate.id) === String(connection.fromNode) && candidate.type === 'modelLoader';
-            });
-            if (loader) return String(loader.selectedModel || '').trim();
-        }
-        var loaders = state.nodes.filter(function(candidate) { return candidate.type === 'modelLoader'; });
-        return loaders.length === 1 ? String(loaders[0].selectedModel || '').trim() : '';
-    }
-
-
-    function inventoryModelRecord(modelId) {
-        if (!modelId || !root.Darkstar || !Array.isArray(root.Darkstar.modelInventory)) return null;
-        return root.Darkstar.modelInventory.find(function(candidate) {
-            return String(candidate && candidate.id || '') === modelId;
-        }) || null;
-    }
-
-    function inventoryReasoningCapability(modelId) {
-        var record = inventoryModelRecord(modelId);
-        return record && record.reasoning && typeof record.reasoning === 'object' ? record.reasoning : null;
-    }
-
-    function modelReasoningCapability(node) {
-        return inventoryReasoningCapability(connectedModelId(node));
-    }
-
-    var CONTEXT_PERCENT_MIN = 10;
-    var CONTEXT_PERCENT_MAX = 100;
-    var CONTEXT_PERCENT_STEP = 10;
-
-    function normalizedModelContextMaximum(value) {
-        var parsed = Number.parseInt(value, 10);
-        return Number.isSafeInteger(parsed) && parsed >= 256 ? parsed : null;
-    }
-
-    function normalizedContextSize(value, modelMaximum) {
-        var parsed = Number.parseInt(value, 10);
-        if (!Number.isFinite(parsed)) parsed = 4096;
-        parsed = Math.max(256, Math.min(1048576, parsed));
-        var maximum = normalizedModelContextMaximum(modelMaximum);
-        if (maximum) parsed = Math.min(parsed, maximum);
-        return parsed;
-    }
-
-    function normalizedContextPercent(value) {
-        var parsed = Number(value);
-        if (!Number.isFinite(parsed)) return null;
-        var snapped = Math.round(parsed / CONTEXT_PERCENT_STEP) * CONTEXT_PERCENT_STEP;
-        return Math.max(CONTEXT_PERCENT_MIN, Math.min(CONTEXT_PERCENT_MAX, snapped));
-    }
-
-    function contextSizeForPercent(modelMaximum, percent) {
-        var maximum = normalizedModelContextMaximum(modelMaximum);
-        var normalizedPercent = normalizedContextPercent(percent);
-        if (!maximum || !normalizedPercent) return null;
-        if (normalizedPercent === CONTEXT_PERCENT_MAX) return maximum;
-        return Math.max(256, Math.min(maximum, Math.floor(maximum * normalizedPercent / 100)));
-    }
-
-    function contextPercentFromLegacySize(value, modelMaximum) {
-        var maximum = normalizedModelContextMaximum(modelMaximum);
-        if (!maximum) return null;
-        var size = normalizedContextSize(value, maximum);
-        return normalizedContextPercent((size / maximum) * 100) || CONTEXT_PERCENT_MIN;
-    }
-
-    function samplerContextSelection(node) {
-        if (!node.params || typeof node.params !== 'object') node.params = {};
-        var modelId = connectedModelId(node);
-        var record = inventoryModelRecord(modelId);
-        var modelMaximum = normalizedModelContextMaximum(record && record.contextLength);
-        var legacyValue = node.params.contextSize !== undefined ? node.params.contextSize : node.params.maxTokens;
-        var percent = normalizedContextPercent(node.params.contextPercent);
-        if (modelMaximum) {
-            if (!percent) percent = contextPercentFromLegacySize(legacyValue, modelMaximum);
-            node.params.contextPercent = percent;
-            node.params.contextSize = contextSizeForPercent(modelMaximum, percent);
-        } else {
-            node.params.contextSize = normalizedContextSize(legacyValue, null);
-            if (percent) node.params.contextPercent = percent;
-        }
-        // maxTokens was historically wired to llama.cpp max_tokens even though this
-        // control is the local model context-length contract. Migrate it once and
-        // keep output budgeting internal instead of preserving two meanings.
-        if (Object.prototype.hasOwnProperty.call(node.params, 'maxTokens')) delete node.params.maxTokens;
-        return {
-            modelId: modelId,
-            modelMaximum: modelMaximum,
-            percent: percent,
-            contextSize: node.params.contextSize
-        };
-    }
-
-    function samplerContextSize(node) {
-        return samplerContextSelection(node).contextSize;
-    }
-
-    function formatContextTokens(value) {
-        var parsed = Number(value);
-        return Number.isFinite(parsed) ? Math.trunc(parsed).toLocaleString('en-US') : '';
-    }
-
-    function samplerContextDisplay(node) {
-        var selection = samplerContextSelection(node);
-        if (!selection.modelMaximum) {
-            return selection.modelId ? 'Context limit unavailable' : 'Select model';
-        }
-        return selection.percent + '% · ' + formatContextTokens(selection.contextSize);
-    }
-
-    function contextSliderHTML(node) {
-        var selection = samplerContextSelection(node);
-        var escape = controls.escapeHtml;
-        var available = Boolean(selection.modelMaximum);
-        var sliderValue = available ? selection.percent : CONTEXT_PERCENT_MIN;
-        var display = samplerContextDisplay(node);
-        var disabled = available ? '' : ' disabled';
-        var maximumText = available ? ' data-model-context-maximum="' + escape(selection.modelMaximum) + '"' : '';
-        return '<div class="node-param node-context-size-control"><div class="node-param-label"><span>Context size</span><span class="node-param-value">' + escape(display) + '</span></div>' +
-            '<input type="range" class="node-slider node-context-size-slider" min="' + CONTEXT_PERCENT_MIN + '" max="' + CONTEXT_PERCENT_MAX + '" step="' + CONTEXT_PERCENT_STEP + '" value="' + escape(sliderValue) + '"' + disabled +
-            ' data-node-id="' + escape(node.id) + '" data-param="contextPercent" data-param-kind="number"' + maximumText + ' aria-label="Context size" aria-valuetext="' + escape(display) + '"></div>';
-    }
+    var contextBuilder = nodes.contextBuilder;
+    var controlPolicy = nodes.orchestrationControl;
+    if (!contextBuilder || typeof contextBuilder.buildMessages !== 'function') throw new Error('Orchestrator context builder is unavailable.');
+    if (!controlPolicy || typeof controlPolicy.runtimeControl !== 'function') throw new Error('Orchestrator control policy is unavailable.');
 
     function safeReasoningValue(value) {
         var normalized = String(value || '').trim();
@@ -4705,168 +5398,119 @@ function unregisterGenerationSession(session) {
         var mode = requested.toLowerCase();
         if (capability && capability.type === 'effort' && Array.isArray(capability.efforts) && capability.efforts.length >= 2) {
             if (mode === 'auto') return 'auto';
-            if (mode === 'on') {
-                return capability.efforts.indexOf(capability.defaultEffort) >= 0 ? capability.defaultEffort : 'auto';
-            }
+            if (mode === 'on') return capability.efforts.indexOf(capability.defaultEffort) >= 0 ? capability.defaultEffort : 'auto';
             if (mode === 'off') return 'auto';
-            var exact = capability.efforts.find(function(effort) {
-                return String(effort).toLowerCase() === mode;
-            });
+            var exact = capability.efforts.find(function(effort) { return String(effort).toLowerCase() === mode; });
             return exact || 'auto';
         }
         return ['auto', 'on', 'off'].indexOf(mode) >= 0 ? mode : 'auto';
     }
 
-    function reasoningEffortLabel(value) {
-        var normalized = String(value || '').trim();
-        if (normalized.toLowerCase() === 'xhigh') return 'X-High';
-        return normalized.split(/[._-]+/).filter(Boolean).map(function(part) {
-            return part.charAt(0).toUpperCase() + part.slice(1);
-        }).join(' ') || normalized;
+    function samplingConfigFromInput(value, fallbackModel) {
+        if (!value || typeof value !== 'object') throw new Error('Orchestrator: LM Sampler input is not connected.');
+        var model = value.model && typeof value.model === 'object' ? value.model : null;
+        if ((!model || !model.id) && fallbackModel && typeof fallbackModel === 'object') model = fallbackModel;
+        if (!model || !model.id) throw new Error('Orchestrator: LM Sampler does not include a Language Model.');
+        return { model: model, sampling: value };
     }
 
-    function reasoningOptions(capability) {
-        if (capability && capability.type === 'effort' && Array.isArray(capability.efforts) && capability.efforts.length >= 2) {
-            var defaultEffort = capability.efforts.indexOf(capability.defaultEffort) >= 0 ? capability.defaultEffort : '';
-            return [{
-                value: 'auto',
-                label: defaultEffort ? 'Auto (model default: ' + reasoningEffortLabel(defaultEffort) + ')' : 'Auto (model default)'
-            }].concat(capability.efforts.map(function(effort) {
-                return { value: effort, label: reasoningEffortLabel(effort) };
-            }));
-        }
-        return [
-            { value: 'auto', label: 'Auto (model default)' },
-            { value: 'on', label: 'On' },
-            { value: 'off', label: 'Off' }
-        ];
+    var ORCHESTRATOR_UI_WIDTH = 720;
+
+    function contextContainsImages(messages) {
+        return Array.isArray(messages) && messages.some(function(message) {
+            return Array.isArray(message && message.content) && message.content.some(function(part) {
+                return part && part.type === 'image_url' && part.image_url && part.image_url.url;
+            });
+        });
+    }
+
+    function normalizeOrchestrationParams(node) {
+        if (!node.params || typeof node.params !== 'object') node.params = {};
+        var contextParams = contextBuilder.normalizeParams(node.params);
+        var controlParams = controlPolicy.normalizeParams(node.params);
+        node.params.systemPrompt = contextParams.systemPrompt;
+        node.params.includeHistory = contextParams.includeHistory;
+        node.params.nameConversations = controlParams.nameConversations;
+        node.params.autoCompact = controlParams.autoCompact;
+        node.params.modelIdleUnloadEnabled = controlParams.modelIdleUnloadEnabled;
+        node.params.dynamicVramEnabled = controlParams.dynamicVramEnabled;
+        node.params.negativePromptEnabled = controlParams.negativePromptEnabled;
+        node.params.imageCountOverride = controlPolicy.normalizeImageCountOverride(node.params.imageCountOverride);
+        return node.params;
+    }
+
+    function freshOrchestrationParams() {
+        return Object.assign({}, contextBuilder.normalizeParams(null), controlPolicy.normalizeParams(null), { imageCountOverride: controlPolicy.minImageCountOverride });
     }
 
     var definition = {
         id: 'sampler',
-        title: 'Autoregressive Sampler',
+        title: 'Orchestrator',
         badge: 'OUTPUT',
         outputNode: true,
         inputs: [
-            { name: 'model', label: 'model', type: types.MODEL, required: true },
-            { name: 'text', label: 'text', type: types.TEXT, required: true },
-            { name: 'image', label: 'image', type: types.IMAGE, required: false },
+            { name: 'samplerParameters', label: 'LM Sampler', type: types.SAMPLER_PARAMETERS, required: true },
+            { name: 'dmSampler', label: 'DM Sampler', type: types.DM_SAMPLER, required: false },
             { name: 'skills', label: 'Skills', type: types.SKILLS, required: false },
-            { name: 'tools', label: 'Tools', type: types.TOOLS, required: false },
-            { name: 'while', label: 'While', type: types.CONTROL, required: true }
+            { name: 'tools', label: 'Tools', type: types.TOOLS, required: false }
         ],
         outputs: [],
         factory: function(nodeId, x, y) {
             return common.baseNode(definition, nodeId, x, y, {
-                params: {
-                    reasoning: 'auto',
-                    seed: -1,
-                    contextSize: 4096,
-                    temperature: 0.8,
-                    topK: 40,
-                    topP: 0.95,
-                    minP: 0.05,
-                    typicalP: 1.0,
-                    repeatPenalty: 1.1,
-                    repeatLastN: 64,
-                    presencePenalty: 0,
-                    frequencyPenalty: 0,
-                    dryMultiplier: 0,
-                    dryBase: 1.75,
-                    dryAllowedLength: 2,
-                    dryPenaltyLastN: 0,
-                    mirostat: '0',
-                    mirostatTau: 5,
-                    mirostatEta: 0.1,
-                    samplers: 'dry;top_k;typ_p;top_p;min_p;xtc;temperature',
-                    stop: '',
-                    cachePrompt: true,
-                    ignoreEos: false
-                }
+                uiWidth: ORCHESTRATOR_UI_WIDTH,
+                params: freshOrchestrationParams()
             });
         },
         normalizeNode: function(node) {
-            if (!node.params || typeof node.params !== 'object') node.params = {};
-            node.params.reasoning = safeReasoningValue(node.params.reasoning);
-            samplerContextSize(node);
-            var dryLastN = Number(node.params.dryPenaltyLastN);
-            node.params.dryPenaltyLastN = Number.isFinite(dryLastN)
-                ? Math.min(2147483647, Math.max(0, Math.trunc(dryLastN)))
-                : 0;
+            node.uiWidth = ORCHESTRATOR_UI_WIDTH;
+            normalizeOrchestrationParams(node);
+            var savedTitle = String(node && node.title ? node.title : '').trim();
+            if (!savedTitle || savedTitle === 'Autoregressive Sampler') node.title = definition.title;
+            node.inputs = definition.inputs.map(function(input) { return Object.assign({}, input); });
+            node.outputs = [];
+            // Legacy local-pipeline parameters remain temporarily available during
+            // restore so workflow migration can move them into their canonical
+            // LlamaCPP Server or L_Sampler owners before obsolete keys are removed.
         },
         onParameterChange: function(node, param) {
-            if (param !== 'contextPercent') return;
-            node.params.contextPercent = normalizedContextPercent(node.params.contextPercent) || CONTEXT_PERCENT_MIN;
-            samplerContextSize(node);
+            normalizeOrchestrationParams(node);
+            if (param === 'modelIdleUnloadEnabled') {
+                controlPolicy.applyIdleUnloadPolicy(node.params.modelIdleUnloadEnabled ? controlPolicy.fixedIdleUnloadSeconds : 0);
+            }
             node.status = 'idle';
             node.statusMessage = '';
         },
-        getParameterDisplayValue: function(node, param) {
-            return param === 'contextPercent' ? samplerContextDisplay(node) : undefined;
-        },
         buildContentHTML: function(node) {
             definition.normalizeNode(node);
-            var p = node.params;
-            var capability = modelReasoningCapability(node);
-            var displayedReasoning = normalizedReasoningForCapability(p.reasoning, capability);
-            if (displayedReasoning !== p.reasoning) p.reasoning = displayedReasoning;
-            var primaryControls =
-                controls.select('Reasoning', displayedReasoning, node.id, 'reasoning', reasoningOptions(capability)) +
-                controls.numberInput('Seed (-1 = random)', p.seed, node.id, 'seed', { min: -1, max: 2147483647, step: 1 }) +
-                contextSliderHTML(node) +
-                controls.slider('Temperature', p.temperature, 0, 2, 0.01, 2, node.id, 'temperature') +
-                controls.numberInput('Top K', p.topK, node.id, 'topK', { min: 0, max: 100000, step: 1 }) +
-                controls.slider('Top P', p.topP, 0, 1, 0.01, 2, node.id, 'topP') +
-                controls.slider('Min P', p.minP, 0, 1, 0.01, 2, node.id, 'minP') +
-                controls.slider('Typical P', p.typicalP, 0, 1, 0.01, 2, node.id, 'typicalP') +
-                controls.slider('Repeat penalty', p.repeatPenalty, 0, 2, 0.01, 2, node.id, 'repeatPenalty') +
-                controls.numberInput('Repeat last N', p.repeatLastN, node.id, 'repeatLastN', { min: -1, max: 1048576, step: 1 }) +
-                controls.slider('Presence penalty', p.presencePenalty, -2, 2, 0.01, 2, node.id, 'presencePenalty') +
-                controls.slider('Frequency penalty', p.frequencyPenalty, -2, 2, 0.01, 2, node.id, 'frequencyPenalty');
-
-            var advancedControls =
-                controls.slider('DRY multiplier', p.dryMultiplier, 0, 5, 0.01, 2, node.id, 'dryMultiplier') +
-                controls.slider('DRY base', p.dryBase, 1, 4, 0.01, 2, node.id, 'dryBase') +
-                controls.numberInput('DRY allowed length', p.dryAllowedLength, node.id, 'dryAllowedLength', { min: 0, max: 10000, step: 1 }) +
-                controls.numberInput('DRY last N', p.dryPenaltyLastN, node.id, 'dryPenaltyLastN', { min: 0, max: 1048576, step: 1 }) +
-                controls.select('Mirostat', p.mirostat, node.id, 'mirostat', ['0', '1', '2']) +
-                controls.slider('Mirostat tau', p.mirostatTau, 0, 10, 0.1, 1, node.id, 'mirostatTau') +
-                controls.slider('Mirostat eta', p.mirostatEta, 0, 1, 0.01, 2, node.id, 'mirostatEta') +
-                controls.textInput('Sampler chain', p.samplers, node.id, 'samplers', 'top_k;top_p;temperature') +
-                controls.textarea('Stop strings', p.stop, node.id, 'stop', 'One stop string per line') +
-                controls.booleanSelect('Reuse prompt cache', p.cachePrompt, node.id, 'cachePrompt') +
-                controls.booleanSelect('Ignore EOS', p.ignoreEos, node.id, 'ignoreEos');
-
-            return '<div class="sampler-control-grid">' +
-                '<div class="sampler-control-column">' + primaryControls + '</div>' +
-                '<div class="sampler-control-column">' + advancedControls + '</div>' +
-                '<div class="sampler-control-status">' + controls.status(node, 'Ready to sample') + '</div>' +
+            return '<div class="orchestrator-settings">' +
+                controls.group('Conversation context', 'System instructions and history included with each request.', contextBuilder.buildControls(node)) +
+                controls.group('Runtime behavior', 'Conversation lifecycle, memory pressure, and image-generation behavior.', controlPolicy.buildControls(node) + controls.slider('Image count (0 = Model)', node.params.imageCountOverride, controlPolicy.minImageCountOverride, controlPolicy.maxImageCountOverride, 1, 0, node.id, 'imageCountOverride')) +
+                '<div class="sampler-control-status">' + controls.status(node, 'Ready to orchestrate') + '</div>' +
                 '</div>';
         },
-        prepareExecution: function(node, execution) {
-            definition.normalizeNode(node);
-            if (!execution || !execution.context || typeof execution.context !== 'object') return;
-            execution.context.localModelContextSize = samplerContextSize(node);
-            execution.context.localModelContextSource = 'sampler';
-        },
         execute: async function(inputs, node, context) {
-            if (!inputs.model || !inputs.model.id) throw new Error('Autoregressive Sampler: no loaded model input.');
-            if (!Array.isArray(inputs.text) || !inputs.text.length) throw new Error('Autoregressive Sampler: no text context input.');
+            var samplerInput = samplingConfigFromInput(inputs.samplerParameters, inputs.gguf || inputs.model);
+            var model = samplerInput.model;
             node.status = 'loading';
-            node.statusMessage = 'Generating...';
+            node.statusMessage = 'Preparing context...';
             definition.normalizeNode(node);
             var p = node.params;
+            var preparedContext = contextBuilder.buildMessages(p, context, 'Orchestrator');
+            var contextMessages = preparedContext.messages;
+            if (contextContainsImages(contextMessages) && (!model.multimodal || !model.projectorPath)) {
+                throw new Error('Orchestrator: Context contains image content, but the loaded GGUF has no multimodal projector. Select a Projector in Invoke Language Model (GGUF).');
+            }
+            node.statusMessage = 'Generating...';
+            var sampling = samplerInput.sampling;
             var continuingFinalMessage = context.continueFinalMessage === true;
             var requestedContinuationMode = String(context.continueFinalMessageMode || '').toLowerCase();
             var continuationMode = continuingFinalMessage && requestedContinuationMode === 'reasoning'
                 ? 'reasoning'
                 : 'content';
             var adversaryMode = context.adversaryMode === true;
-            var reasoningCapability = inputs.model && inputs.model.reasoning && typeof inputs.model.reasoning === 'object'
-                ? inputs.model.reasoning
-                : null;
-            var selectedReasoning = normalizedReasoningForCapability(p.reasoning, reasoningCapability);
-            var runtimeControl = Object.assign({}, inputs.while || {}, {
+            var reasoningCapability = model.reasoning && typeof model.reasoning === 'object' ? model.reasoning : null;
+            var selectedReasoning = normalizedReasoningForCapability(sampling.reasoning || 'auto', reasoningCapability);
+            var runtimeControl = Object.assign({}, controlPolicy.runtimeControl(p), {
                 // Content continuation must not open a new reasoning section. When
                 // the interrupted channel itself was reasoning, keep the selected
                 // model reasoning control and continue that channel natively.
@@ -4876,15 +5520,15 @@ function unregisterGenerationSession(session) {
             if (!continuingFinalMessage && !adversaryMode && runtimeControl.nameConversations === true && typeof context.ensureConversationTitle === 'function') {
                 node.statusMessage = 'Naming conversation...';
                 await context.ensureConversationTitle({
-                    model: inputs.model,
-                    messages: inputs.text,
+                    model: model,
+                    messages: contextMessages,
                     control: runtimeControl,
                     sampler: {
-                        seed: Number(p.seed),
-                        temperature: Number(p.temperature),
-                        topK: Number(p.topK),
-                        topP: Number(p.topP),
-                        minP: Number(p.minP)
+                        seed: Number(sampling.seed),
+                        temperature: Number(sampling.temperature),
+                        topK: Number(sampling.topK),
+                        topP: Number(sampling.topP),
+                        minP: Number(sampling.minP)
                     }
                 });
                 node.statusMessage = 'Generating...';
@@ -4899,43 +5543,50 @@ function unregisterGenerationSession(session) {
                 tabId: Number(context.tabId) || 0,
                 uipScopeId: context.uipScopeId || ('project-' + String(Number(context.projectId) || 0)),
                 browserId: String(context.tabId === undefined || context.tabId === null ? '0' : context.tabId),
+                diffusion: inputs.dmSampler && typeof inputs.dmSampler === 'object'
+                    ? JSON.parse(JSON.stringify(inputs.dmSampler))
+                    : null,
+                dynamicVramEnabled: p.dynamicVramEnabled === true,
+                negativePromptEnabled: p.negativePromptEnabled === true,
+                imageCountOverride: controlPolicy.normalizeImageCountOverride(p.imageCountOverride),
+                imageEdit: preparedContext.imageEdit && typeof preparedContext.imageEdit === 'object' ? JSON.parse(JSON.stringify(preparedContext.imageEdit)) : null,
                 executionDisabled: browserContinuationBoundary
             });
             if (!chatRuntime || typeof chatRuntime.streamChat !== 'function') throw new Error('Darkstar chat runtime is unavailable.');
             var chatRequest = {
-                model: inputs.model.id,
-                messages: inputs.text,
-                seed: Number(p.seed),
-                temperature: Number(p.temperature),
-                topK: Number(p.topK),
-                topP: Number(p.topP),
-                minP: Number(p.minP),
-                typicalP: Number(p.typicalP),
-                repeatPenalty: Number(p.repeatPenalty),
-                repeatLastN: Number(p.repeatLastN),
-                presencePenalty: Number(p.presencePenalty),
-                frequencyPenalty: Number(p.frequencyPenalty),
-                dryMultiplier: Number(p.dryMultiplier),
-                dryBase: Number(p.dryBase),
-                dryAllowedLength: Number(p.dryAllowedLength),
-                dryPenaltyLastN: Number(p.dryPenaltyLastN),
-                mirostat: Number(p.mirostat),
-                mirostatTau: Number(p.mirostatTau),
-                mirostatEta: Number(p.mirostatEta),
-                samplers: String(p.samplers || '').split(/[;,]/).map(function(value) { return value.trim(); }).filter(Boolean),
-                stop: String(p.stop || '').split('\n').map(function(value) { return value.trim(); }).filter(Boolean),
+                model: model.id,
+                messages: contextMessages,
+                seed: Number(sampling.seed),
+                temperature: Number(sampling.temperature),
+                topK: Number(sampling.topK),
+                topP: Number(sampling.topP),
+                minP: Number(sampling.minP),
+                typicalP: Number(sampling.typicalP),
+                repeatPenalty: Number(sampling.repeatPenalty),
+                repeatLastN: Number(sampling.repeatLastN),
+                presencePenalty: Number(sampling.presencePenalty),
+                frequencyPenalty: Number(sampling.frequencyPenalty),
+                dryMultiplier: Number(sampling.dryMultiplier),
+                dryBase: Number(sampling.dryBase),
+                dryAllowedLength: Number(sampling.dryAllowedLength),
+                dryPenaltyLastN: Number(sampling.dryPenaltyLastN),
+                mirostat: Number(sampling.mirostat),
+                mirostatTau: Number(sampling.mirostatTau),
+                mirostatEta: Number(sampling.mirostatEta),
+                samplers: Array.isArray(sampling.samplers) ? sampling.samplers.slice() : [],
+                stop: String(sampling.stop || '').split('\n').map(function(value) { return value.trim(); }).filter(Boolean),
                 // Slot isolation is enforced by backend physical ownership. Cache
                 // reuse therefore remains correct with one or many slots.
-                cachePrompt: continuingFinalMessage || context.kvCacheReuseRequired === true || p.cachePrompt !== false,
+                cachePrompt: continuingFinalMessage || context.kvCacheReuseRequired === true || sampling.cachePrompt !== false,
                 cacheIdentity: String(context.kvCacheIdentity || ''),
-                ignoreEos: p.ignoreEos === true,
+                ignoreEos: sampling.ignoreEos === true,
                 continueFinalMessage: continuingFinalMessage ? continuationMode : undefined,
                 skills: inputs.skills || { skills: [] },
                 tools: toolConfiguration,
                 control: runtimeControl,
                 vision: {
-                    enabled: Boolean(inputs.model.multimodal && inputs.model.projectorPath),
-                    projectorPath: inputs.model.projectorPath || null
+                    enabled: Boolean(model.multimodal && model.projectorPath),
+                    projectorPath: model.projectorPath || null
                 }
             };
             if (runtimeControl.autoCompact === true && typeof context.preflightAutoCompact === 'function') {
@@ -4969,10 +5620,12 @@ function unregisterGenerationSession(session) {
                 usage: result.usage,
                 contextUsage: result.contextUsage || null,
                 finishReason: result.finishReason,
-                stopDetails: result.stopDetails && typeof result.stopDetails === 'object' ? structuredClone(result.stopDetails) : null, browserCompartmentActivated: result.browserCompartmentActivated === true,
+                stopDetails: result.stopDetails && typeof result.stopDetails === 'object' ? structuredClone(result.stopDetails) : null,
+                browserCompartmentActivated: result.browserCompartmentActivated === true,
                 working: Array.isArray(result.working) ? result.working : [],
                 toolMessages: Array.isArray(result.toolMessages) ? result.toolMessages : [],
                 agentTimeline: Array.isArray(result.agentTimeline) ? result.agentTimeline : [],
+                presentedImageIds: Array.isArray(result.presentedImageIds) ? result.presentedImageIds.map(String) : [],
                 agentRounds: result.agentRounds || 1,
                 toolRounds: result.toolRounds || 0
             };
@@ -4991,6 +5644,25 @@ function unregisterGenerationSession(session) {
     if (root.window && root.window !== root) root.window.Darkstar = namespace;
     var nodes = namespace.nodes = namespace.nodes || {};
     var loadPromise = null;
+    var customDefinitionOwners = Object.create(null);
+
+    function definitionIds() {
+        if (typeof nodes.listNodeDefinitions !== 'function') return [];
+        return nodes.listNodeDefinitions().map(function(definition) { return String(definition.id || ''); });
+    }
+
+    function tagPluginDefinitions(plugin, beforeIds) {
+        var before = Object.create(null);
+        beforeIds.forEach(function(id) { before[id] = true; });
+        definitionIds().forEach(function(id) {
+            if (!id || before[id]) return;
+            customDefinitionOwners[id] = {
+                pluginId: String(plugin && plugin.id || ''),
+                pluginName: String(plugin && plugin.name || 'Custom node'),
+                version: String(plugin && plugin.version || '')
+            };
+        });
+    }
 
     function loadScript(url) {
         if (String(url || '').startsWith('darkstar-internal:')) {
@@ -5025,7 +5697,9 @@ function unregisterGenerationSession(session) {
             var diagnostics = Array.isArray(response.diagnostics) ? response.diagnostics.slice() : [];
             for (var i = 0; i < plugins.length; i++) {
                 try {
+                    var beforeIds = definitionIds();
                     await loadScript(plugins[i].rendererUrl);
+                    tagPluginDefinitions(plugins[i], beforeIds);
                 } catch (error) {
                     diagnostics.push({ plugin: plugins[i].id, success: false, error: error.message });
                 }
@@ -5036,6 +5710,12 @@ function unregisterGenerationSession(session) {
     }
 
     nodes.loadCustomNodes = loadCustomNodes;
+    nodes.isCustomNodeDefinition = function isCustomNodeDefinition(type) {
+        return Object.prototype.hasOwnProperty.call(customDefinitionOwners, String(type || ''));
+    };
+    nodes.customNodeDefinitionOwner = function customNodeDefinitionOwner(type) {
+        return customDefinitionOwners[String(type || '')] || null;
+    };
     nodes.invokeBackend = async function invokeBackend(pluginId, operation, payload) {
         var hostWindow = root.window || root;
         if (!hostWindow.darkstar || !hostWindow.darkstar.customNodes) throw new Error('Custom-node backend bridge is unavailable.');
@@ -5112,7 +5792,7 @@ let nodeEditorState = {
     panStartX: 0, panStartY: 0,
     draggingNode: null, dragOffsetX: 0, dragOffsetY: 0,
     connectingFrom: null, selectedNode: null, initialized: false,
-    searchPanelOpen: false, searchPanelPos: { x: 0, y: 0 },
+    searchPanelOpen: false, searchCustomOnly: false, searchPanelPos: { x: 0, y: 0 },
     lastNodeSearchGestureAt: 0,
     graphDataInitialized: false,
     executingNodeId: null,
@@ -5164,28 +5844,11 @@ function initNodeEditor() {
     var canvas = document.getElementById('gridCanvas');
     if (!canvas) return;
     if (typeof bindNodeControlEvents === 'function') bindNodeControlEvents();
+    if (typeof bindWorkflowSectionScrollbar === 'function') bindWorkflowSectionScrollbar();
+    // The workflow is presented as a normal scrollable execution document. Graph
+    // gestures remain backend concepts only; wheel input must always scroll the
+    // section stack instead of panning, zooming, rewiring, or moving nodes.
     canvas.addEventListener('mousedown', onGridMouseDown);
-    canvas.addEventListener('mousemove', onGridMouseMove);
-    canvas.addEventListener('mouseup', onGridMouseUp);
-    canvas.addEventListener('mouseleave', onGridMouseUp);
-    canvas.addEventListener('contextmenu', onGridContextMenu);
-    var view = document.getElementById('settingsView');
-    if (view) {
-        // Capture the second press as well as dblclick so transparent graph layers and panning cannot swallow the gesture.
-        view.addEventListener('mousedown', onGridDoubleClickMouseDown, true);
-        view.addEventListener('dblclick', onGridDoubleClick, true);
-        view.addEventListener('wheel', function(e) {
-            e.preventDefault(); e.stopPropagation(); e.returnValue = false;
-            var dir = e.deltaY > 0 ? -1 : 1;
-            var oldZoom = Number(nodeEditorState.zoom) || 1;
-            var newZoom = Math.max(0.3, Math.min(3.0, oldZoom + dir * 0.1));
-            var changed = typeof zoomNodeEditorAtScreenPoint === 'function'
-                ? zoomNodeEditorAtScreenPoint(e.clientX, e.clientY, newZoom)
-                : false;
-            if (changed && typeof scheduleWorkflowSessionSave === 'function') scheduleWorkflowSessionSave();
-            return false;
-        }, { passive: false, capture: true });
-    }
     document.addEventListener('click', function(e) {
         var cm = document.querySelector('.node-context-menu');
         if (cm && !cm.contains(e.target)) cm.remove();
@@ -5195,13 +5858,15 @@ function initNodeEditor() {
     window.addEventListener('resize', function() {
         if (!nodeEditorState.initialized) return;
         renderConnections();
+        if (typeof updateWorkflowSectionScrollbar === 'function') updateWorkflowSectionScrollbar();
     });
     document.addEventListener('keydown', function(e) {
         if ((e.key === 'Delete' || e.key === 'Backspace') && nodeEditorState.selectedNode !== null) {
             var active = document.activeElement;
             if (active && (active.tagName === 'INPUT' || active.tagName === 'SELECT' || active.tagName === 'TEXTAREA')) return;
-            removeNode(nodeEditorState.selectedNode);
-            nodeEditorState.selectedNode = null;
+            var selected = nodeEditorState.nodes.find(function(node) { return node.id === nodeEditorState.selectedNode; });
+            if (isWorkflowCustomSection(selected)) removeWorkflowCustomSection(nodeEditorState.selectedNode);
+            else { removeNode(nodeEditorState.selectedNode); nodeEditorState.selectedNode = null; }
         }
     });
     if (!nodeEditorState.nodes.length) {
@@ -5209,12 +5874,8 @@ function initNodeEditor() {
     } else {
         syncHiddenModelSelectFromNode({ rerender: false });
         renderAllNodes();
-        if (nodeEditorState.defaultLayoutPending) {
-            arrangeDefaultNodePipeline(60, 22, 52);
-            nodeEditorState.defaultLayoutPending = false;
-        }
+        nodeEditorState.defaultLayoutPending = false;
         renderConnections();
-        updateGridTransform();
     }
 }
 
@@ -5223,23 +5884,16 @@ function createDefaultNodePipeline(startX, startY) {
     var baseY = Number(startY) || 0;
 
     // Temporary positions are replaced with measured positions after rendering.
-    // Measuring the actual node widths prevents overlap when labels or controls
-    // change while preserving the established left-to-right top-row layout.
-    var server = createNode('loadServer', baseX, baseY);
-    var loader = createNode('modelLoader', baseX + 380, baseY);
-    var context = createNode('context', baseX + 850, baseY + 340);
-    var skills = createNode('skills', baseX + 850, baseY + 680);
-    var tools = createNode('tools', baseX + 850, baseY + 1020);
-    var control = createNode('control', baseX + 850, baseY + 1610);
-    var sampler = createNode('sampler', baseX + 1450, baseY + 650);
-    addConnection(server.id, 'server', loader.id, 'server');
-    addConnection(loader.id, 'model', context.id, 'model');
-    addConnection(loader.id, 'model', sampler.id, 'model');
-    addConnection(context.id, 'text', sampler.id, 'text');
-    addConnection(context.id, 'image', sampler.id, 'image');
-    addConnection(skills.id, 'skills', sampler.id, 'skills');
-    addConnection(tools.id, 'tools', sampler.id, 'tools');
-    addConnection(control.id, 'control', sampler.id, 'control');
+    var modelLoader = createNode('modelLoader', baseX, baseY);
+    var server = createNode('loadServer', baseX + 500, baseY);
+    var localSampler = createNode('localSampler', baseX + 500, baseY + 760);
+    var loader = createNode('tools', baseX + 1180, baseY + 460);
+    var sampler = createNode('sampler', baseX + 1780, baseY + 520);
+    addConnection(modelLoader.id, 'model', server.id, 'model');
+    addConnection(server.id, 'gguf', localSampler.id, 'gguf');
+    addConnection(localSampler.id, 'samplerParameters', sampler.id, 'samplerParameters');
+    addConnection(loader.id, 'skills', sampler.id, 'skills');
+    addConnection(loader.id, 'tools', sampler.id, 'tools');
     nodeEditorState.defaultLayoutPending = true;
 }
 
@@ -5266,10 +5920,8 @@ async function resetNodeGraph() {
     createDefaultNodePipeline(60, 22);
     syncHiddenModelSelectFromNode({ allowDefault: true, rerender: false });
     renderAllNodes();
-    arrangeDefaultNodePipeline(60, 22, 52);
     nodeEditorState.defaultLayoutPending = false;
     renderConnections();
-    updateGridTransform();
     if (typeof scheduleWorkflowSessionSave === 'function') scheduleWorkflowSessionSave();
     return false;
 }
@@ -5291,10 +5943,121 @@ function addNodeEditorNode(type, x, y) {
         if (x === undefined) x = center.x - 130 + (Math.random() * 60 - 30);
         if (y === undefined) y = center.y - 80 + (Math.random() * 60 - 30);
     }
-    createNode(type, x, y);
+    var node = createNode(type, x, y);
     renderAllNodes();
     renderConnections();
     if (typeof scheduleWorkflowSessionSave === 'function') scheduleWorkflowSessionSave();
+    return node;
+}
+
+function sectionInsertionCoordinates() {
+    var rightmost = 0;
+    var lowest = 0;
+    nodeEditorState.nodes.forEach(function(node) {
+        rightmost = Math.max(rightmost, Number(node.x) || 0);
+        lowest = Math.max(lowest, Number(node.y) || 0);
+    });
+    return { x: rightmost + 640, y: lowest + 220 };
+}
+
+function socketTypesCompatible(output, input) {
+    return Boolean(output && input && (!output.type || !input.type || output.type === input.type));
+}
+
+function connectionWouldCycle(fromNodeId, toNodeId) {
+    var dependents = Object.create(null);
+    nodeEditorState.nodes.forEach(function(node) { dependents[node.id] = []; });
+    nodeEditorState.connections.forEach(function(connection) {
+        if (dependents[connection.fromNode]) dependents[connection.fromNode].push(connection.toNode);
+    });
+    var stack = [toNodeId];
+    var seen = Object.create(null);
+    while (stack.length) {
+        var current = stack.pop();
+        if (current === fromNodeId) return true;
+        if (seen[current]) continue;
+        seen[current] = true;
+        (dependents[current] || []).forEach(function(next) { stack.push(next); });
+    }
+    return false;
+}
+
+function preferredUniqueSocketCandidate(candidates, socketName) {
+    if (!candidates.length) return null;
+    var exact = candidates.filter(function(candidate) { return candidate.socket.name === socketName; });
+    if (exact.length === 1) return exact[0];
+    return candidates.length === 1 ? candidates[0] : null;
+}
+
+function autoConnectWorkflowSection(node) {
+    if (!node) return 0;
+    var connected = 0;
+    var others = nodeEditorState.nodes.filter(function(candidate) { return candidate.id !== node.id; });
+
+    (node.inputs || []).forEach(function(input) {
+        if (hasInputConnection(node.id, input.name)) return;
+        var candidates = [];
+        others.forEach(function(sourceNode) {
+            (sourceNode.outputs || []).forEach(function(output) {
+                if (!socketTypesCompatible(output, input) || connectionWouldCycle(sourceNode.id, node.id)) return;
+                candidates.push({ node: sourceNode, socket: output });
+            });
+        });
+        var selected = preferredUniqueSocketCandidate(candidates, input.name);
+        if (selected && addConnection(selected.node.id, selected.socket.name, node.id, input.name)) connected++;
+    });
+
+    (node.outputs || []).forEach(function(output) {
+        var candidates = [];
+        others.forEach(function(targetNode) {
+            (targetNode.inputs || []).forEach(function(input) {
+                if (hasInputConnection(targetNode.id, input.name) || !socketTypesCompatible(output, input) || connectionWouldCycle(node.id, targetNode.id)) return;
+                candidates.push({ node: targetNode, socket: input });
+            });
+        });
+        var selected = preferredUniqueSocketCandidate(candidates, output.name);
+        if (selected && addConnection(node.id, output.name, selected.node.id, selected.socket.name)) connected++;
+    });
+    return connected;
+}
+
+function addWorkflowSection(type) {
+    var position = sectionInsertionCoordinates();
+    var node = createNode(type, position.x, position.y);
+    if (!node) return null;
+    var connectionCount = autoConnectWorkflowSection(node);
+    renderAllNodes();
+    renderConnections();
+    if (typeof activateWorkflowSectionTab === 'function') activateWorkflowSectionTab(node.id, { focus: true });
+    if (typeof scheduleWorkflowSessionSave === 'function') scheduleWorkflowSessionSave();
+    if (typeof showNodeEditorToast === 'function') {
+        var message = connectionCount > 0
+            ? 'Custom section added · ' + connectionCount + ' compatible workflow link' + (connectionCount === 1 ? '' : 's') + ' connected automatically'
+            : 'Custom section added · no unambiguous workflow links were changed';
+        showNodeEditorToast(message, connectionCount > 0 ? 'success' : 'warning', 3600);
+    }
+    return node;
+}
+
+function isWorkflowCustomSection(node) {
+    return Boolean(node && Darkstar.nodes && typeof Darkstar.nodes.isCustomNodeDefinition === 'function' && Darkstar.nodes.isCustomNodeDefinition(node.type));
+}
+
+function removeWorkflowCustomSection(nodeId) {
+    var target = nodeEditorState.nodes.find(function(node) { return node.id === nodeId; });
+    if (!isWorkflowCustomSection(target)) return false;
+    if (nodeEditorState.executingNodeId !== null) {
+        if (typeof showNodeEditorToast === 'function') showNodeEditorToast('Finish the active workflow before removing a custom section', 'warning', 2600);
+        return false;
+    }
+    nodeEditorState.nodes = nodeEditorState.nodes.filter(function(node) { return node.id !== nodeId; });
+    nodeEditorState.connections = nodeEditorState.connections.filter(function(connection) { return connection.fromNode !== nodeId && connection.toNode !== nodeId; });
+    if (nodeEditorState.selectedNode === nodeId) nodeEditorState.selectedNode = null;
+    renderAllNodes();
+    renderConnections();
+    if (typeof scheduleWorkflowSessionSave === 'function') scheduleWorkflowSessionSave();
+    if (typeof showNodeEditorToast === 'function') showNodeEditorToast('Custom section removed', 'success', 1800);
+    return true;
 }
 
 function removeNode(nodeId) {
@@ -5361,24 +6124,23 @@ function arrangeDefaultNodePipeline(startX, startY, gap) {
     var connectionCorridor = 220;
     var baseX = Number(startX) || 60;
     var baseY = Number(startY) || 40;
-    var server = measuredNodeEntry(layer, 'loadServer', 300, 640);
-    var loader = measuredNodeEntry(layer, 'modelLoader', 330, 250);
-    var context = measuredNodeEntry(layer, 'context', 330, 260);
-    var skills = measuredNodeEntry(layer, 'skills', 330, 260);
-    var tools = measuredNodeEntry(layer, 'tools', 360, 520);
-    var control = measuredNodeEntry(layer, 'control', 300, 210);
-    var sampler = measuredNodeEntry(layer, 'sampler', 340, 780);
-    var sources = [context, skills, tools, control].filter(Boolean);
+    var modelLoader = measuredNodeEntry(layer, 'modelLoader', 330, 250);
+    var server = measuredNodeEntry(layer, 'loadServer', 760, 760);
+    var localSampler = measuredNodeEntry(layer, 'localSampler', 660, 760);
+    var loader = measuredNodeEntry(layer, 'tools', 420, 620);
+    var sampler = measuredNodeEntry(layer, 'sampler', 520, 560);
+    var sources = [loader].filter(Boolean);
 
-    placeDefaultEntry(server, baseX, baseY);
-    var loaderX = baseX + (server ? server.width : 300) + horizontalGap;
-    placeDefaultEntry(loader, loaderX, baseY);
+    placeDefaultEntry(modelLoader, baseX, baseY);
+    var serverX = baseX + (modelLoader ? modelLoader.width : 330) + horizontalGap;
+    placeDefaultEntry(server, serverX, baseY);
 
-    // Start the fan-in column below the model row. This leaves a clear upper
-    // route for the Model → Sampler connection instead of drawing it through
-    // the Context node.
-    var sourceX = loaderX + (loader ? loader.width : 330) + horizontalGap + 52;
-    var sourceY = baseY + Math.max((loader ? loader.height : 250) + 92, 340);
+    // Keep the direct GGUF → Orchestrator route across the upper corridor.
+    // Agent sources fan in from the next column, while L_Sampler sits beneath
+    // LlamaCPP Server so its parameter edge remains visually independent. Context
+    // and strategic controls are owned directly by Orchestrator.
+    var sourceX = serverX + (server ? server.width : 760) + horizontalGap + 52;
+    var sourceY = baseY + 340;
     var widestSource = 0;
     sources.forEach(function(entry) {
         placeDefaultEntry(entry, sourceX, sourceY);
@@ -5386,15 +6148,22 @@ function arrangeDefaultNodePipeline(startX, startY, gap) {
         sourceY += entry.height + verticalGap;
     });
 
+    if (localSampler) {
+        placeDefaultEntry(localSampler, serverX, baseY + (server ? server.height : 1120) + verticalGap);
+    }
+
     var stackTop = sources.length ? sources[0].node.y : baseY + 340;
     var stackBottom = sources.length ? sources[sources.length - 1].node.y + sources[sources.length - 1].height : stackTop + 500;
+    if (localSampler) {
+        stackBottom = Math.max(stackBottom, localSampler.node.y + localSampler.height);
+    }
     var samplerX = sourceX + widestSource + connectionCorridor;
     var samplerHeight = sampler ? sampler.height : 780;
     var centeredSamplerY = Math.round((stackTop + stackBottom - samplerHeight) / 2);
     var samplerY = Math.max(baseY + 250, centeredSamplerY);
     placeDefaultEntry(sampler, samplerX, samplerY);
 
-    fitDefaultNodePipeline(layer, [server, loader, context, skills, tools, control, sampler], 82);
+    fitDefaultNodePipeline(layer, [modelLoader, server, localSampler, loader, sampler], 82);
 }
 
 // === GENERAL GRAPH AUTO-LAYOUT ===
@@ -5702,19 +6471,79 @@ function cancelNodeLayoutGestures() {
     if (typeof closeNodeDropdowns === 'function') closeNodeDropdowns();
 }
 
+var workflowSectionScrollbarBound = false;
+var workflowSectionScrollbarResizeObserver = null;
+var workflowSectionScrollbarDrag = null;
+
+function updateWorkflowSectionScrollbar() {
+    var scroller = document.getElementById('workflowSectionsScroll');
+    var track = document.getElementById('workflowOverlayScrollbar');
+    var thumb = document.getElementById('workflowOverlayScrollbarThumb');
+    if (!scroller || !track || !thumb) return;
+    var viewportHeight = Math.max(0, Number(scroller.clientHeight) || 0);
+    var contentHeight = Math.max(viewportHeight, Number(scroller.scrollHeight) || 0);
+    var needsScrollbar = viewportHeight > 0 && contentHeight > viewportHeight + 1;
+    track.hidden = !needsScrollbar;
+    if (!needsScrollbar) return;
+    var trackHeight = Math.max(0, Number(track.clientHeight) || 0);
+    if (!trackHeight) return;
+    var thumbHeight = Math.min(trackHeight, Math.max(34, Math.round(trackHeight * viewportHeight / contentHeight)));
+    var maxThumbTop = Math.max(0, trackHeight - thumbHeight);
+    var maxScrollTop = Math.max(1, contentHeight - viewportHeight);
+    var thumbTop = Math.round(maxThumbTop * Math.max(0, Number(scroller.scrollTop) || 0) / maxScrollTop);
+    thumb.style.height = thumbHeight + 'px';
+    thumb.style.transform = 'translateY(' + thumbTop + 'px)';
+}
+
+function bindWorkflowSectionScrollbar() {
+    if (workflowSectionScrollbarBound) return;
+    var scroller = document.getElementById('workflowSectionsScroll');
+    var track = document.getElementById('workflowOverlayScrollbar');
+    var thumb = document.getElementById('workflowOverlayScrollbarThumb');
+    if (!scroller || !track || !thumb) return;
+    workflowSectionScrollbarBound = true;
+    scroller.addEventListener('scroll', updateWorkflowSectionScrollbar, { passive: true });
+    thumb.addEventListener('pointerdown', function(event) {
+        if (event.button !== undefined && event.button !== 0) return;
+        workflowSectionScrollbarDrag = { pointerId: event.pointerId, startY: event.clientY, startScrollTop: scroller.scrollTop };
+        thumb.classList.add('dragging');
+        if (typeof thumb.setPointerCapture === 'function') thumb.setPointerCapture(event.pointerId);
+        event.preventDefault();
+    });
+    thumb.addEventListener('pointermove', function(event) {
+        if (!workflowSectionScrollbarDrag || event.pointerId !== workflowSectionScrollbarDrag.pointerId) return;
+        var scrollRange = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        var thumbTravel = Math.max(1, track.clientHeight - thumb.offsetHeight);
+        scroller.scrollTop = workflowSectionScrollbarDrag.startScrollTop + ((event.clientY - workflowSectionScrollbarDrag.startY) / thumbTravel) * scrollRange;
+        event.preventDefault();
+    });
+    function finishDrag(event) {
+        if (!workflowSectionScrollbarDrag || event.pointerId !== workflowSectionScrollbarDrag.pointerId) return;
+        workflowSectionScrollbarDrag = null;
+        thumb.classList.remove('dragging');
+        if (typeof thumb.releasePointerCapture === 'function' && thumb.hasPointerCapture && thumb.hasPointerCapture(event.pointerId)) thumb.releasePointerCapture(event.pointerId);
+    }
+    thumb.addEventListener('pointerup', finishDrag);
+    thumb.addEventListener('pointercancel', finishDrag);
+    if (typeof ResizeObserver === 'function') {
+        workflowSectionScrollbarResizeObserver = new ResizeObserver(updateWorkflowSectionScrollbar);
+        workflowSectionScrollbarResizeObserver.observe(scroller);
+        var layer = document.getElementById('nodesLayer');
+        if (layer) workflowSectionScrollbarResizeObserver.observe(layer);
+    }
+    updateWorkflowSectionScrollbar();
+}
+
 function autoArrangeNodeGraph() {
     if (!nodeEditorState.nodes.length) {
-        if (typeof showNodeEditorToast === 'function') showNodeEditorToast('No nodes to arrange', 'warning', 2200);
+        if (typeof showNodeEditorToast === 'function') showNodeEditorToast('No workflow sections to order', 'warning', 2200);
         return false;
     }
     cancelNodeLayoutGestures();
     if (typeof renderAllNodes === 'function') renderAllNodes();
-    var arranged = arrangeNodeGraph(60, 40, AUTO_LAYOUT_HORIZONTAL_GAP, AUTO_LAYOUT_VERTICAL_GAP);
-    if (!arranged) return false;
-    if (typeof updateGridTransform === 'function') updateGridTransform();
-    else if (typeof renderConnections === 'function') renderConnections();
-    if (typeof scheduleWorkflowSessionSave === 'function') scheduleWorkflowSessionSave();
-    if (typeof showNodeEditorToast === 'function') showNodeEditorToast('Nodes arranged', 'success', 1800);
+    var scroller = document.getElementById('workflowSectionsScroll');
+    if (scroller && typeof scroller.scrollTo === 'function') scroller.scrollTo({ top: 0, behavior: 'smooth' });
+    if (typeof showNodeEditorToast === 'function') showNodeEditorToast('Workflow sections ordered by execution', 'success', 1800);
     return true;
 }
     // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/editor/layout.js">
@@ -5735,6 +6564,230 @@ function notifyNodeMounted(element, node) {
         node.statusMessage = error && error.message ? error.message : String(error);
         if (typeof rerenderNode === 'function') rerenderNode(node.id);
     });
+}
+
+function workflowSectionNodeCompare(left, right) {
+    var leftX = Number(left && left.x) || 0;
+    var rightX = Number(right && right.x) || 0;
+    if (leftX !== rightX) return leftX - rightX;
+    var leftY = Number(left && left.y) || 0;
+    var rightY = Number(right && right.y) || 0;
+    if (leftY !== rightY) return leftY - rightY;
+    return (Number(left && left.id) || 0) - (Number(right && right.id) || 0);
+}
+
+function orderedWorkflowSectionNodes() {
+    var nodes = nodeEditorState.nodes.slice();
+    var byId = Object.create(null);
+    var dependents = Object.create(null);
+    var inDegree = Object.create(null);
+    nodes.forEach(function(node) {
+        byId[node.id] = node;
+        dependents[node.id] = [];
+        inDegree[node.id] = 0;
+    });
+    var seenEdges = Object.create(null);
+    nodeEditorState.connections.forEach(function(connection) {
+        if (!byId[connection.fromNode] || !byId[connection.toNode]) return;
+        var key = connection.fromNode + '>' + connection.toNode;
+        if (seenEdges[key]) return;
+        seenEdges[key] = true;
+        dependents[connection.fromNode].push(connection.toNode);
+        inDegree[connection.toNode]++;
+    });
+    var ready = nodes.filter(function(node) { return inDegree[node.id] === 0; }).sort(workflowSectionNodeCompare);
+    var ordered = [];
+    while (ready.length) {
+        var current = ready.shift();
+        ordered.push(current);
+        dependents[current.id].forEach(function(nodeId) {
+            inDegree[nodeId]--;
+            if (inDegree[nodeId] === 0) {
+                ready.push(byId[nodeId]);
+                ready.sort(workflowSectionNodeCompare);
+            }
+        });
+    }
+    if (ordered.length !== nodes.length) {
+        var included = Object.create(null);
+        ordered.forEach(function(node) { included[node.id] = true; });
+        nodes.filter(function(node) { return !included[node.id]; }).sort(workflowSectionNodeCompare).forEach(function(node) { ordered.push(node); });
+    }
+    return ordered;
+}
+
+function applyWorkflowSectionOrder(layer) {
+    if (!layer) return;
+    orderedWorkflowSectionNodes().forEach(function(node, index) {
+        var element = layer.querySelector('.node-editor-node[data-node-id="' + node.id + '"]');
+        if (!element) return;
+        element.dataset.executionIndex = String(index);
+        layer.appendChild(element);
+    });
+}
+
+var activeWorkflowSectionTabId = null;
+var workflowPropertyTabsBound = false;
+
+function workflowPropertyTabId(nodeId) { return 'settingsPropertyTab-' + String(nodeId); }
+function workflowPropertyPanelId(nodeId) { return 'settingsPropertyPanel-' + String(nodeId); }
+function workflowPropertyTabLabel(node) {
+    var title = workflowSectionDisplayTitle(node);
+    return typeof isWorkflowCustomSection === 'function' && isWorkflowCustomSection(node)
+        ? title.replace(/^\[ Custom \]\s*/u, '')
+        : title;
+}
+
+function activeWorkflowSectionNode(orderedNodes) {
+    var nodes = Array.isArray(orderedNodes) ? orderedNodes : orderedWorkflowSectionNodes();
+    if (!nodes.length) { activeWorkflowSectionTabId = null; return null; }
+    var active = nodes.find(function(node) { return String(node.id) === String(activeWorkflowSectionTabId); });
+    if (!active) { active = nodes[0]; activeWorkflowSectionTabId = active.id; }
+    return active;
+}
+
+function ensureWorkflowPropertyTabVisible(tablist, tab) {
+    if (!tablist || !tab) return;
+    var left = Number(tab.offsetLeft) || 0;
+    var right = left + (Number(tab.offsetWidth) || 0);
+    var viewportLeft = Number(tablist.scrollLeft) || 0;
+    var viewportRight = viewportLeft + (Number(tablist.clientWidth) || 0);
+    if (left < viewportLeft) tablist.scrollLeft = left;
+    else if (right > viewportRight) tablist.scrollLeft = Math.max(0, right - tablist.clientWidth);
+}
+
+function syncWorkflowPropertyTabs(orderedNodes) {
+    var tablist = document.getElementById('settingsPropertyTabs');
+    var layer = document.getElementById('nodesLayer');
+    if (!tablist || !layer) return;
+    var nodes = Array.isArray(orderedNodes) ? orderedNodes : orderedWorkflowSectionNodes();
+    var active = activeWorkflowSectionNode(nodes);
+    var activeId = active ? String(active.id) : '';
+    var expected = Object.create(null);
+
+    nodes.forEach(function(node) {
+        var key = String(node.id);
+        expected[key] = true;
+        var tab = tablist.querySelector('.settings-property-tab[data-workflow-tab-node="' + key + '"]');
+        if (!tab) {
+            tab = document.createElement('button');
+            tab.type = 'button';
+            tab.className = 'settings-property-tab';
+            tab.dataset.workflowTabNode = key;
+            tab.setAttribute('role', 'tab');
+            tablist.appendChild(tab);
+        }
+        var title = workflowSectionDisplayTitle(node);
+        var custom = typeof isWorkflowCustomSection === 'function' && isWorkflowCustomSection(node);
+        tab.id = workflowPropertyTabId(node.id);
+        tab.textContent = workflowPropertyTabLabel(node);
+        tab.title = title + ' — ' + workflowSectionDescription(node);
+        tab.setAttribute('aria-label', custom ? 'Custom section: ' + tab.textContent : tab.textContent);
+        tab.setAttribute('aria-controls', workflowPropertyPanelId(node.id));
+        tab.setAttribute('aria-selected', key === activeId ? 'true' : 'false');
+        tab.tabIndex = key === activeId ? 0 : -1;
+        tab.classList.toggle('custom', typeof isWorkflowCustomSection === 'function' && isWorkflowCustomSection(node));
+        tablist.appendChild(tab);
+
+        var panel = layer.querySelector('.node-editor-node[data-node-id="' + key + '"]');
+        if (!panel) return;
+        panel.id = workflowPropertyPanelId(node.id);
+        panel.setAttribute('role', 'tabpanel');
+        panel.setAttribute('aria-labelledby', tab.id);
+        panel.tabIndex = 0;
+        panel.hidden = key !== activeId;
+    });
+
+    var tabs = tablist.querySelectorAll('.settings-property-tab[data-workflow-tab-node]');
+    for (var index = tabs.length - 1; index >= 0; index--) {
+        if (!expected[String(tabs[index].dataset.workflowTabNode)]) tabs[index].remove();
+    }
+}
+
+function activateWorkflowSectionTab(nodeId, options) {
+    var nodes = orderedWorkflowSectionNodes();
+    var target = nodes.find(function(node) { return String(node.id) === String(nodeId); });
+    if (!target) return false;
+    activeWorkflowSectionTabId = target.id;
+    syncWorkflowPropertyTabs(nodes);
+    if (typeof closeNodeDropdowns === 'function') closeNodeDropdowns();
+    var tablist = document.getElementById('settingsPropertyTabs');
+    var tab = document.getElementById(workflowPropertyTabId(target.id));
+    ensureWorkflowPropertyTabVisible(tablist, tab);
+    if (options && options.focus === true && tab && typeof tab.focus === 'function') tab.focus();
+    if (!options || options.preserveScroll !== true) {
+        var scroller = document.getElementById('workflowSectionsScroll');
+        var shell = tablist && tablist.parentElement;
+        if (scroller && shell && typeof scroller.getBoundingClientRect === 'function' && typeof shell.getBoundingClientRect === 'function') {
+            var scrollerRect = scroller.getBoundingClientRect();
+            var shellRect = shell.getBoundingClientRect();
+            scroller.scrollTop = Math.max(0, scroller.scrollTop + shellRect.top - scrollerRect.top);
+        }
+    }
+    return true;
+}
+
+function bindWorkflowPropertyTabs() {
+    if (workflowPropertyTabsBound) return;
+    var tablist = document.getElementById('settingsPropertyTabs');
+    if (!tablist) return;
+    workflowPropertyTabsBound = true;
+    tablist.addEventListener('click', function(event) {
+        var tab = event.target && event.target.closest ? event.target.closest('.settings-property-tab[data-workflow-tab-node]') : null;
+        if (tab) activateWorkflowSectionTab(tab.dataset.workflowTabNode, { focus: false });
+    });
+    tablist.addEventListener('keydown', function(event) {
+        var current = event.target && event.target.closest ? event.target.closest('.settings-property-tab[data-workflow-tab-node]') : null;
+        if (!current) return;
+        var tabs = Array.prototype.slice.call(tablist.querySelectorAll('.settings-property-tab[data-workflow-tab-node]'));
+        var index = tabs.indexOf(current);
+        var next = null;
+        if (event.key === 'ArrowRight') next = tabs[(index + 1) % tabs.length];
+        else if (event.key === 'ArrowLeft') next = tabs[(index - 1 + tabs.length) % tabs.length];
+        else if (event.key === 'Home') next = tabs[0];
+        else if (event.key === 'End') next = tabs[tabs.length - 1];
+        if (!next) return;
+        event.preventDefault();
+        activateWorkflowSectionTab(next.dataset.workflowTabNode, { focus: true });
+    });
+}
+
+function workflowSectionDisplayTitle(node) {
+    var type = String(node && node.type || '');
+    var titles = {
+        modelLoader: 'Language Model',
+        loadServer: 'Inference',
+        localSampler: 'Text Generation',
+        tools: 'Tools & Skills',
+        sampler: 'Conversation',
+        context: 'Conversation Context',
+        control: 'Runtime Behavior',
+        'com.darkstar.diffusion-backend-gguf.setter': '[ Custom ] Image Model',
+        'com.darkstar.dm-sampler': '[ Custom ] Image Generation',
+        'com.darkstar.api-model.loader': '[ Custom ] API Model',
+        'com.darkstar.api-model.sampler': '[ Custom ] API Generation'
+    };
+    return titles[type] || String(node && node.title || 'Settings').trim() || 'Settings';
+}
+
+function workflowSectionDescription(node) {
+    var type = String(node && node.type || '');
+    var descriptions = {
+        modelLoader: 'Choose the local language model and optional multimodal projector.',
+        loadServer: 'Configure inference, memory, acceleration, and performance.',
+        localSampler: 'Tune reasoning, sampling, and repetition behavior for text generation.',
+        tools: 'Choose the tools and reusable skills available to the assistant.',
+        sampler: 'Configure conversation context, lifecycle, and runtime behavior.',
+        context: 'Control the conversation context supplied to downstream workflows.',
+        control: 'Control conversation lifecycle and runtime behavior.',
+        'com.darkstar.diffusion-backend-gguf.setter': 'Choose the image model and any required encoder or VAE components.',
+        'com.darkstar.dm-sampler': 'Tune image-generation quality, guidance, scheduling, and compute behavior.',
+        'com.darkstar.api-model.loader': 'Choose a remote provider, model, and connection settings.',
+        'com.darkstar.api-model.sampler': 'Configure generation behavior for remote language models.'
+    };
+    if (descriptions[type]) return descriptions[type];
+    if (typeof isWorkflowCustomSection === 'function' && isWorkflowCustomSection(node)) return 'Extension-provided settings for this workflow.';
+    return 'Workflow settings.';
 }
 
 function updateSocketConnectionClasses(element, node) {
@@ -5797,9 +6850,9 @@ function captureDefinitionStableNodeWidth(element, node) {
 }
 
 function updateNodeElement(element, node) {
-    element.style.left = node.x + 'px';
-    element.style.top = node.y + 'px';
-    applyStableNodeWidth(element, node);
+    element.style.removeProperty('left');
+    element.style.removeProperty('top');
+    element.style.removeProperty('width');
     element.classList.toggle('selected', nodeEditorState.selectedNode === node.id);
     element.classList.toggle('error-state', node.status === 'error');
     element.classList.toggle('unrecognized-node', node.isUnrecognized === true || !getNodeDef(node.type));
@@ -5811,9 +6864,10 @@ function renderAllNodes() {
     var layer = document.getElementById('nodesLayer');
     if (!layer) return;
     var expected = Object.create(null);
+    var orderedNodes = orderedWorkflowSectionNodes();
 
-    for (var index = 0; index < nodeEditorState.nodes.length; index++) {
-        var node = nodeEditorState.nodes[index];
+    for (var index = 0; index < orderedNodes.length; index++) {
+        var node = orderedNodes[index];
         var key = String(node.id);
         expected[key] = true;
         var element = layer.querySelector('.node-editor-node[data-node-id="' + key + '"]');
@@ -5824,17 +6878,18 @@ function renderAllNodes() {
             created = true;
         }
         updateNodeElement(element, node);
-        if (created) {
-            captureDefinitionStableNodeWidth(element, node);
-            notifyNodeMounted(element, node);
-        }
+        if (created) notifyNodeMounted(element, node);
     }
 
     var rendered = layer.querySelectorAll('.node-editor-node[data-node-id]');
     for (var renderedIndex = 0; renderedIndex < rendered.length; renderedIndex++) {
         if (!expected[String(rendered[renderedIndex].dataset.nodeId)]) rendered[renderedIndex].remove();
     }
+    applyWorkflowSectionOrder(layer);
+    bindWorkflowPropertyTabs();
+    syncWorkflowPropertyTabs(orderedNodes);
     refreshNodeUI();
+    if (typeof updateWorkflowSectionScrollbar === 'function') updateWorkflowSectionScrollbar();
 }
 
 function rerenderNode(nodeId) {
@@ -5846,7 +6901,11 @@ function rerenderNode(nodeId) {
     if (current && current.parentNode) current.parentNode.replaceChild(replacement, current);
     else layer.appendChild(replacement);
     updateNodeElement(replacement, node);
+    applyWorkflowSectionOrder(layer);
+    bindWorkflowPropertyTabs();
+    syncWorkflowPropertyTabs();
     refreshNodeUI();
+    if (typeof updateWorkflowSectionScrollbar === 'function') updateWorkflowSectionScrollbar();
 }
 
 var NODE_UI_REFRESH_MS = 100;
@@ -5895,6 +6954,8 @@ function refreshNodeUI() {
         element.classList.toggle('error-state', node.status === 'error');
         element.classList.toggle('unrecognized-node', node.isUnrecognized === true || !getNodeDef(node.type));
         element.classList.toggle('executing', nodeEditorState.executingNodeId === node.id);
+        var removeSectionButton = element.querySelector('.workflow-section-remove');
+        if (removeSectionButton) removeSectionButton.disabled = nodeEditorState.executingNodeId !== null;
 
         runNodeLiveRefresh(node, element, now);
 
@@ -5927,58 +6988,30 @@ function getSocketLabelWidth(sockets) {
 function buildNodeDOM(node) {
     var def = getNodeDef(node.type);
     var isUnrecognized = node.isUnrecognized === true || !def;
-    var div = document.createElement('div');
-    var classes = 'node-editor-node';
+    var div = document.createElement('section');
+    var classes = 'node-editor-node workflow-section';
     if (nodeEditorState.selectedNode === node.id) classes += ' selected';
-    if (node.isAnchor) {
-        classes += ' anchor-node';
-        classes += ' ' + node.type + '-node';
-    }
+    if (node.isAnchor) classes += ' anchor-node ' + node.type + '-node';
     if (node.status === 'error') classes += ' error-state';
     if (isUnrecognized) classes += ' unrecognized-node';
+    var removableCustomSection = typeof isWorkflowCustomSection === 'function' && isWorkflowCustomSection(node);
+    if (removableCustomSection) classes += ' custom-workflow-section';
     div.className = classes;
     div.dataset.nodeId = node.id;
-    div.style.left = node.x + 'px';
-    div.style.top = node.y + 'px';
-    var leftPorts = '', rightPorts = '';
-    var inputs = Array.isArray(node.inputs) ? node.inputs : [];
-    var outputs = Array.isArray(node.outputs) ? node.outputs : [];
-    if (!Array.isArray(node.inputs)) node.inputs = inputs;
-    if (!Array.isArray(node.outputs)) node.outputs = outputs;
-    var sharedLabelWidth = getSocketLabelWidth(inputs.concat(outputs));
-    var leftLabelWidth = sharedLabelWidth;
-    var rightLabelWidth = sharedLabelWidth;
-    var SOCKET_SPACING = 28;
-    var SOCKET_TOP_OFFSET = 14;
+    div.dataset.nodeType = String(node.type || '');
+    var titleId = 'workflowSectionTitle-' + String(node.id);
+    div.setAttribute('aria-labelledby', titleId);
     var inputFooterHTML = def && typeof def.buildInputFooterHTML === 'function' ? def.buildInputFooterHTML(node) : '';
-    var inputFooterRows = inputFooterHTML ? Math.max(1, Number(def.inputFooterRows) || 1) : 0;
-    var maxSocketRows = Math.max(node.inputs.length + inputFooterRows, node.outputs.length, 2);
-    var bodyHeight = SOCKET_TOP_OFFSET + maxSocketRows * SOCKET_SPACING + 14;
-    for (var i = 0; i < inputs.length; i++) {
-        var inp = inputs[i];
-        var connected = hasInputConnection(node.id, inp.name);
-        var topPos = SOCKET_TOP_OFFSET + i * SOCKET_SPACING;
-        leftPorts += '<div class="socket-item" style="top:' + topPos + 'px"><div class="socket-point' + (connected ? ' connected' : '') + '" data-node-id="' + escapeNodeHTML(node.id) + '" data-socket-type="input" data-socket-name="' + escapeNodeHTML(inp.name) + '"></div><span class="socket-label">' + escapeNodeHTML(inp.label) + '</span></div>';
-    }
-    if (inputFooterHTML) {
-        var inputFooterTop = SOCKET_TOP_OFFSET + node.inputs.length * SOCKET_SPACING;
-        leftPorts += '<div class="node-input-footer" style="top:' + inputFooterTop + 'px">' + inputFooterHTML + '</div>';
-    }
-    for (var j = 0; j < outputs.length; j++) {
-        var out = outputs[j];
-        var connected = hasOutputConnection(node.id, out.name);
-        var topPos = SOCKET_TOP_OFFSET + j * SOCKET_SPACING;
-        rightPorts += '<div class="socket-item" style="top:' + topPos + 'px"><span class="socket-label">' + escapeNodeHTML(out.label) + '</span><div class="socket-point' + (connected ? ' connected' : '') + '" data-node-id="' + escapeNodeHTML(node.id) + '" data-socket-type="output" data-socket-name="' + escapeNodeHTML(out.name) + '"></div></div>';
-    }
     var contentHTML = isUnrecognized
-        ? '<div class="unrecognized-node-content"><div class="unrecognized-node-title">Unrecognized node</div><div class="unrecognized-node-type">' + escapeNodeHTML(node.type || 'unknown') + '</div><div class="unrecognized-node-help">The node type is not installed. Its saved data, sockets, connections, and position are preserved.</div></div>'
+        ? '<div class="unrecognized-node-content"><div class="unrecognized-node-title">Unrecognized section</div><div class="unrecognized-node-type">' + escapeNodeHTML(node.type || 'unknown') + '</div><div class="unrecognized-node-help">This node type is not installed. Its saved data and backend graph links are preserved.</div></div>'
         : def.buildContentHTML(node);
-    div.innerHTML = '<div class="node-title-bar"><span class="node-title-text">' + escapeNodeHTML(node.title) + '</span><span class="node-type-badge">' + escapeNodeHTML(node.badge) + '</span></div>' +
-        '<div class="node-body" style="min-height:' + bodyHeight + 'px">' +
-        (leftPorts ? '<div class="node-ports-left" style="--socket-label-width:' + leftLabelWidth + '">' + leftPorts + '</div>' : '') +
-        '<div class="node-content">' + contentHTML + '</div>' +
-        (rightPorts ? '<div class="node-ports-right" style="--socket-label-width:' + rightLabelWidth + '">' + rightPorts + '</div>' : '') +
-        '</div>';
+    var removeButtonHTML = removableCustomSection
+        ? '<button class="workflow-section-remove" type="button" data-workflow-remove-section="' + String(node.id) + '" aria-label="Remove ' + escapeNodeHTML(workflowSectionDisplayTitle(node)) + ' section" title="Remove section"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16"/><path d="M9 7V4h6v3"/><path d="M7 7l1 13h8l1-13"/><path d="M10 11v5M14 11v5"/></svg></button>'
+        : '';
+    div.innerHTML = '<div class="settings-section-inner"><div class="node-title-bar"><div class="settings-section-heading"><h2 class="node-title-text" id="' + titleId + '">' + escapeNodeHTML(workflowSectionDisplayTitle(node)) + '</h2><p class="settings-section-description">' + escapeNodeHTML(workflowSectionDescription(node)) + '</p></div>' + removeButtonHTML + '</div>' +
+        '<div class="node-body"><div class="node-content">' + contentHTML + '</div>' +
+        (inputFooterHTML ? '<div class="workflow-section-footer">' + inputFooterHTML + '</div>' : '') +
+        '</div></div>';
     return div;
 }
     // <DARKSTAR_SOURCE_END path="backend/renderer/nodes/editor/renderer.js">
@@ -6031,12 +7064,7 @@ function disconnectSocket(nodeId, socketType, socketName) {
 
 function renderConnections() {
     var svg = document.getElementById('connectionsSvg');
-    if (!svg) return;
-    svg.setAttribute('width', window.innerWidth);
-    svg.setAttribute('height', window.innerHeight);
-    svg.setAttribute('viewBox', '0 0 ' + window.innerWidth + ' ' + window.innerHeight);
-    svg.innerHTML = '';
-    for (var i = 0; i < nodeEditorState.connections.length; i++) drawConnectionLine(svg, nodeEditorState.connections[i]);
+    if (svg) svg.innerHTML = '';
 }
 
 function drawConnectionLine(svg, conn) {
@@ -6085,21 +7113,9 @@ function isNodeControlTarget(target) {
 
 function onGridMouseDown(e) {
     if (isNodeControlTarget(e.target)) return;
-    if (e.target.classList.contains('socket-point')) { startConnectionDrag(e, e.target); return; }
-    var nodeEl = e.target.closest('.node-editor-node');
-    if (nodeEl) { selectNode(parseInt(nodeEl.dataset.nodeId)); return; }
-    if (nodeEditorState.searchPanelOpen) {
-        closeNodeSearch();
-        return;
-    }
-    if (e.button === 0) {
-        e.preventDefault();
-        e.stopPropagation();
-        nodeEditorState.isPanning = true;
-        nodeEditorState.panStartX = e.clientX - nodeEditorState.panX;
-        nodeEditorState.panStartY = e.clientY - nodeEditorState.panY;
-        document.getElementById('gridCanvas').classList.add('panning');
-    }
+    var nodeEl = e.target && typeof e.target.closest === 'function' ? e.target.closest('.node-editor-node') : null;
+    if (nodeEl) { selectNode(parseInt(nodeEl.dataset.nodeId, 10)); return; }
+    if (nodeEditorState.searchPanelOpen) closeNodeSearch();
 }
 
 function onGridMouseMove(e) {
@@ -6153,6 +7169,7 @@ function startConnectionDrag(e, socketEl) {
 function selectNode(nodeId) {
     var target = nodeEditorState.nodes.find(function(n) { return n.id === nodeId; });
     if (target && target.isAnchor) return;
+    if (nodeEditorState.selectedNode === nodeId) return;
     nodeEditorState.selectedNode = nodeId;
     renderAllNodes();
 }
@@ -6189,30 +7206,25 @@ function onGridDoubleClick(e) {
     openNodeSearch(e.clientX, e.clientY);
 }
 
-function openNodeSearch(screenX, screenY) {
+function openNodeSearch(screenX, screenY, options) {
     var panel = document.getElementById('nodeSearchPanel');
     if (!panel) return;
-
-    var graphPoint = screenToGraphPoint(screenX, screenY);
+    options = options || {};
     nodeEditorState.searchPanelOpen = true;
-    nodeEditorState.searchPanelPos = {
-        screenX: screenX,
-        screenY: screenY,
-        graphX: graphPoint.x,
-        graphY: graphPoint.y
-    };
+    nodeEditorState.searchCustomOnly = options.customOnly === true;
+    nodeEditorState.searchPanelPos = { screenX: screenX, screenY: screenY };
 
     panel.style.display = 'flex';
     panel.style.visibility = 'hidden';
     renderNodeSearchResults('');
 
     var margin = 12;
-    var panelWidth = panel.offsetWidth || 300;
-    var panelHeight = panel.offsetHeight || 260;
+    var panelWidth = panel.offsetWidth || 340;
+    var panelHeight = panel.offsetHeight || 300;
     var viewportWidth = window.innerWidth || document.documentElement.clientWidth || panelWidth;
     var viewportHeight = window.innerHeight || document.documentElement.clientHeight || panelHeight;
     var left = Math.max(margin, Math.min(screenX, viewportWidth - panelWidth - margin));
-    var top = Math.max(margin, Math.min(screenY, viewportHeight - panelHeight - margin));
+    var top = Math.max(margin, Math.min(screenY - panelHeight, viewportHeight - panelHeight - margin));
     panel.style.left = left + 'px';
     panel.style.top = top + 'px';
     panel.style.visibility = 'visible';
@@ -6225,8 +7237,16 @@ function openNodeSearch(screenX, screenY) {
     }
 }
 
+function openWorkflowSectionSearch() {
+    var button = document.getElementById('workflowAddSectionButton');
+    if (!button || typeof button.getBoundingClientRect !== 'function') return;
+    var rect = button.getBoundingClientRect();
+    openNodeSearch(rect.left, rect.top - 8, { customOnly: true });
+}
+
 function closeNodeSearch() {
     nodeEditorState.searchPanelOpen = false;
+    nodeEditorState.searchCustomOnly = false;
     var panel = document.getElementById('nodeSearchPanel');
     if (panel) panel.style.display = 'none';
 }
@@ -6239,7 +7259,11 @@ function renderNodeSearchResults(query) {
     var list = document.getElementById('nodeSearchList');
     if (!list) return;
     list.innerHTML = '';
-    var allTypes = getAllUserNodeTypes().filter(function(definition) { return definition.hiddenFromSearch !== true; });
+    var allTypes = getAllUserNodeTypes().filter(function(definition) {
+        if (definition.hiddenFromSearch === true) return false;
+        if (nodeEditorState.searchCustomOnly !== true) return true;
+        return Boolean(Darkstar.nodes && typeof Darkstar.nodes.isCustomNodeDefinition === 'function' && Darkstar.nodes.isCustomNodeDefinition(definition.id));
+    });
     var q = query.toLowerCase().trim();
     var filtered = allTypes;
     if (q) {
@@ -6250,7 +7274,7 @@ function renderNodeSearchResults(query) {
         });
     }
     if (filtered.length === 0) {
-        list.innerHTML = '<div class="node-search-empty">No nodes found</div>';
+        list.innerHTML = '<div class="node-search-empty">No matching custom sections found</div>';
         return;
     }
     for (var i = 0; i < filtered.length; i++) {
@@ -6267,8 +7291,8 @@ function renderNodeSearchResults(query) {
         item.appendChild(badge);
         item.addEventListener('click', (function(type) {
             return function() {
-                var pos = nodeEditorState.searchPanelPos;
-                addNodeEditorNode(type, pos.graphX - 130, pos.graphY - 40);
+                if (nodeEditorState.searchCustomOnly === true && typeof addWorkflowSection === 'function') addWorkflowSection(type);
+                else addNodeEditorNode(type);
                 closeNodeSearch();
             };
         })(def.id));
@@ -6296,23 +7320,12 @@ function onNodeSearchKeydown(e) {
 // --- NODE TITLE BAR DRAGGING ---
 
 document.addEventListener('mousedown', function(e) {
-    var tb = e.target.closest('.node-title-bar');
+    if (e.target && typeof e.target.closest === 'function' && e.target.closest('.workflow-section-remove')) return;
+    var tb = e.target && typeof e.target.closest === 'function' ? e.target.closest('.node-title-bar') : null;
     if (!tb) return;
-    var ne = tb.closest('.node-editor-node');
-    if (!ne) return;
-    e.stopPropagation();
-    var nid = parseInt(ne.dataset.nodeId);
-    var node = nodeEditorState.nodes.find(function(n) { return n.id === nid; });
-    if (node) {
-        // Absolutely positioned auto-width boxes use a position-dependent
-        // shrink-to-fit calculation. Freeze the node at the width the user
-        // actually grabbed so moving it across the canvas cannot reflow it.
-        if (typeof captureStableNodeWidth === 'function') captureStableNodeWidth(ne, node);
-        selectNode(nid);
-        nodeEditorState.draggingNode = nid;
-        nodeEditorState.dragOffsetX = (e.clientX - nodeEditorState.panX) / nodeEditorState.zoom - node.x;
-        nodeEditorState.dragOffsetY = (e.clientY - nodeEditorState.panY) / nodeEditorState.zoom - node.y;
-    }
+    var section = tb.closest('.node-editor-node');
+    if (!section) return;
+    selectNode(parseInt(section.dataset.nodeId, 10));
 });
 
 
@@ -6477,6 +7490,21 @@ function bindNodeControlEvents() {
     });
 
     target.addEventListener('click', function(event) {
+        var numberStepButton = event.target && event.target.closest ? event.target.closest('.node-number-stepper-button[data-number-step]') : null;
+        if (numberStepButton) {
+            event.preventDefault();
+            event.stopPropagation();
+            var controls = window.Darkstar && window.Darkstar.nodes ? window.Darkstar.nodes.controls : null;
+            if (controls && typeof controls.stepNumberInput === 'function') controls.stepNumberInput(numberStepButton);
+            return;
+        }
+        var removeSectionButton = event.target && event.target.closest ? event.target.closest('.workflow-section-remove[data-workflow-remove-section]') : null;
+        if (removeSectionButton) {
+            event.preventDefault();
+            event.stopPropagation();
+            removeWorkflowCustomSection(parseInt(removeSectionButton.dataset.workflowRemoveSection, 10));
+            return;
+        }
         var trigger = event.target && event.target.closest ? event.target.closest('.node-dropdown-trigger') : null;
         if (trigger) {
             toggleNodeDropdown(event, trigger);
@@ -6636,9 +7664,10 @@ function onNodeDropdownOptionKeydown(event, option) {
 
 function refreshModelDependentNodeControls(options) {
     var namespace = typeof window !== 'undefined' && window.Darkstar ? window.Darkstar.nodes : null;
-    if (!namespace || typeof namespace.refreshLoadServerGpuLayerLimits !== 'function') return;
-    Promise.resolve(namespace.refreshLoadServerGpuLayerLimits(options || null)).catch(function(error) {
+    if (!namespace || typeof namespace.refreshLoadServerGpuLayerLimits !== 'function') return Promise.resolve(false);
+    return Promise.resolve(namespace.refreshLoadServerGpuLayerLimits(options || null)).catch(function(error) {
         console.error('[Nodes] Could not refresh model-dependent controls:', error);
+        return false;
     });
 }
 
@@ -6663,7 +7692,8 @@ function setNodeParamValue(nodeId, param, kind, rawValue) {
             noteNodeRuntimeConfigMutation(node, runtimeSignatureBefore);
         }
     }
-    if (typeof scheduleWorkflowSessionSave === 'function') scheduleWorkflowSessionSave();
+    if (typeof scheduleWorkflowNodeSessionSave === 'function') scheduleWorkflowNodeSessionSave(nodeId);
+    else if (typeof scheduleWorkflowSessionSave === 'function') scheduleWorkflowSessionSave();
     return true;
 }
 
@@ -6686,7 +7716,8 @@ function setNodeModelValue(nodeId, value) {
         changedLoaderId: nodeId,
         previousModelId: previousModelId,
         modelId: node.selectedModel,
-        resetGpuLayers: previousModelId !== node.selectedModel
+        resetGpuLayers: previousModelId !== node.selectedModel,
+        queryModelMetadata: previousModelId !== node.selectedModel
     });
     if (previousModelId !== node.selectedModel && typeof rerenderModelReasoningNodes === 'function') {
         rerenderModelReasoningNodes();
@@ -6716,14 +7747,26 @@ async function browseNodeLocalFilesystem(event, button) {
     if (!node || !common) return;
     button.disabled = true;
     try {
-        if (browserKind === 'model') {
-            var modelBrowser = window.Darkstar && window.Darkstar.modelFiles;
-            if (!modelBrowser || typeof modelBrowser.open !== 'function') throw new Error('Local model browsing is unavailable in this build.');
-            var selected = String(node.selectedModel || '');
+        if (browserKind === 'model' || browserKind === 'diffusion') {
+            var modelBrowser = window.Darkstar && (browserKind === 'diffusion' ? window.Darkstar.diffusionModelFiles : window.Darkstar.modelFiles);
+            if (!modelBrowser || typeof modelBrowser.open !== 'function') throw new Error(browserKind === 'diffusion' ? 'Local diffusion-model browsing is unavailable in this build.' : 'Local model browsing is unavailable in this build.');
+            var selected = browserKind === 'model'
+                ? String(node.selectedModel || '')
+                : String(node.params && node.params.diffusionModelPath || '');
             var result = await modelBrowser.open({ initialPath: common.isAbsoluteModelPath(selected) ? selected : '' });
             if (!result || !result.path) return;
-            if (result.model) common.cacheModelRecord(result.model);
-            if (setNodeModelValue(nodeId, result.path) && typeof rerenderNode === 'function') rerenderNode(nodeId);
+            if (browserKind === 'model' && result.model) common.cacheModelRecord(result.model);
+            if (browserKind === 'model') {
+                if (setNodeModelValue(nodeId, result.path) && typeof rerenderNode === 'function') rerenderNode(nodeId);
+                return;
+            }
+            var definition = typeof getNodeDef === 'function' ? getNodeDef(node.type) : null;
+            if (!definition || definition.localGgufBrowseParam !== 'diffusionModelPath') {
+                throw new Error('This node does not expose a shared diffusion GGUF picker.');
+            }
+            if (!setNodeParamValue(nodeId, 'diffusionModelPath', 'string', result.path)) return;
+            if (typeof definition.onLocalGgufBrowse === 'function') await definition.onLocalGgufBrowse(node, result);
+            if (typeof rerenderNode === 'function') rerenderNode(nodeId);
             return;
         }
         if (browserKind !== 'projector') return;
@@ -6869,6 +7912,467 @@ function onNodeParamChange(el) {
     // --------------------------------------------------------------------------
     // [9500] WORKFLOW + GRAPH EXECUTION :: persistence, validation and runtime graph
     // --------------------------------------------------------------------------
+    // RENDERER MODULE :: backend/renderer/workflow-local-pipeline-migration.js
+    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/workflow-local-pipeline-migration.js">
+(function initializeWorkflowLocalPipelineMigration(root) {
+    'use strict';
+
+    var namespace = root.Darkstar = root.Darkstar || {};
+
+    function normalizeReasoningMode(value) {
+        var mode = String(value || '').trim();
+        return /^(?:auto|on|off)$/i.test(mode) ? mode.toLowerCase() : (/^[A-Za-z][A-Za-z0-9_.-]{0,31}$/.test(mode) ? mode : null);
+    }
+
+    function migrate(request) {
+        request = request && typeof request === 'object' ? request : {};
+        var nodes = Array.isArray(request.nodes) ? request.nodes : [];
+        var connections = Array.isArray(request.connections) ? request.connections : [];
+        var legacyControlReasoning = request.legacyControlReasoning instanceof Map ? request.legacyControlReasoning : new Map();
+        var clone = typeof request.clone === 'function' ? request.clone : function(value) { return value; };
+        var getDefinition = typeof request.getNodeDef === 'function' ? request.getNodeDef : function() { return null; };
+        var byId = new Map(nodes.map(function(node) { return [node.id, node]; }));
+        var serverDefinition = getDefinition('loadServer');
+        var loaderDefinition = getDefinition('modelLoader');
+        var contextDefinition = getDefinition('context');
+        var orchestratorDefinition = getDefinition('sampler');
+        var localSamplerDefinition = getDefinition('localSampler');
+        var apiSamplerDefinition = getDefinition('apiSampler');
+        var controlDefinition = getDefinition('control');
+        var samplingKeys = localSamplerDefinition && Array.isArray(localSamplerDefinition.samplingParamKeys) ? localSamplerDefinition.samplingParamKeys.slice() : [];
+        var servers = nodes.filter(function(node) { return node.type === 'loadServer'; });
+        var loaders = nodes.filter(function(node) { return node.type === 'modelLoader'; });
+        var contexts = nodes.filter(function(node) { return node.type === 'context'; });
+        var orchestrators = nodes.filter(function(node) { return node.type === 'sampler'; });
+        var localSamplers = nodes.filter(function(node) { return node.type === 'localSampler'; });
+        var apiSamplers = nodes.filter(function(node) { return node.type === 'apiSampler'; });
+        var controls = nodes.filter(function(node) { return node.type === 'control'; });
+        var absorbedContextIds = new Set();
+        var absorbedControlIds = new Set();
+
+        function replacePorts(node, definition) {
+            if (!node || !definition) return;
+            node.inputs = clone(definition.inputs || []);
+            node.outputs = clone(definition.outputs || []);
+            node.title = definition.title;
+            node.badge = definition.badge || node.badge;
+        }
+
+        servers.forEach(function(node) { replacePorts(node, serverDefinition); });
+        loaders.forEach(function(node) { replacePorts(node, loaderDefinition); });
+        contexts.forEach(function(node) { replacePorts(node, contextDefinition); });
+        orchestrators.forEach(function(node) { replacePorts(node, orchestratorDefinition); });
+        localSamplers.forEach(function(node) { replacePorts(node, localSamplerDefinition); });
+        apiSamplers.forEach(function(node) { replacePorts(node, apiSamplerDefinition); });
+        controls.forEach(function(node) { replacePorts(node, controlDefinition); });
+
+        function oldLoaderForOrchestrator(orchestrator) {
+            var edge = connections.find(function(connection) {
+                return connection.toNode === orchestrator.id && connection.toSocket === 'model';
+            });
+            var loader = edge ? byId.get(edge.fromNode) : null;
+            return loader && loader.type === 'modelLoader' ? loader : (loaders.length === 1 ? loaders[0] : null);
+        }
+
+        function oldServerForLoader(loader) {
+            if (!loader) return servers.length === 1 ? servers[0] : null;
+            var edge = connections.find(function(connection) {
+                return connection.toNode === loader.id && connection.toSocket === 'server' && connection.fromSocket === 'server';
+            });
+            var server = edge ? byId.get(edge.fromNode) : null;
+            return server && server.type === 'loadServer' ? server : (servers.length === 1 ? servers[0] : null);
+        }
+
+        function loaderForServer(server) {
+            if (!server) return loaders.length === 1 ? loaders[0] : null;
+            var edge = connections.find(function(connection) {
+                return connection.toNode === server.id && connection.toSocket === 'model' && connection.fromSocket === 'model';
+            });
+            var loader = edge ? byId.get(edge.fromNode) : null;
+            return loader && loader.type === 'modelLoader' ? loader : (loaders.length === 1 ? loaders[0] : null);
+        }
+
+        function serverForOrchestrator(orchestrator) {
+            var edge = connections.find(function(connection) {
+                return connection.toNode === orchestrator.id && (connection.toSocket === 'gguf' || connection.toSocket === 'model')
+                    && connection.fromSocket === 'gguf';
+            });
+            var direct = edge ? byId.get(edge.fromNode) : null;
+            if (direct && direct.type === 'loadServer') return direct;
+            return oldServerForLoader(oldLoaderForOrchestrator(orchestrator));
+        }
+
+        function contextForOrchestrator(orchestrator) {
+            var edge = connections.find(function(connection) {
+                if (connection.toNode !== orchestrator.id) return false;
+                if (connection.toSocket !== 'context' && connection.toSocket !== 'text' && connection.toSocket !== 'image') return false;
+                var source = byId.get(connection.fromNode);
+                return source && source.type === 'context';
+            });
+            var direct = edge ? byId.get(edge.fromNode) : null;
+            return direct && direct.type === 'context' ? direct : (contexts.length === 1 ? contexts[0] : null);
+        }
+
+        function controlForOrchestrator(orchestrator) {
+            var edge = connections.find(function(connection) {
+                if (connection.toNode !== orchestrator.id) return false;
+                if (connection.toSocket !== 'control' && connection.toSocket !== 'while') return false;
+                var source = byId.get(connection.fromNode);
+                return source && source.type === 'control';
+            });
+            var direct = edge ? byId.get(edge.fromNode) : null;
+            return direct && direct.type === 'control' ? direct : (controls.length === 1 ? controls[0] : null);
+        }
+
+        function ensureLocalSampler(orchestrator, server) {
+            var edge = connections.find(function(connection) {
+                return connection.toNode === orchestrator.id && connection.toSocket === 'samplerParameters';
+            });
+            var existing = edge ? byId.get(edge.fromNode) : null;
+            if (existing && existing.type === 'localSampler') return existing;
+            if (server) {
+                var serverEdge = connections.find(function(connection) {
+                    return connection.toNode !== orchestrator.id
+                        && connection.toSocket === 'gguf'
+                        && connection.fromNode === server.id;
+                });
+                var serverTarget = serverEdge ? byId.get(serverEdge.toNode) : null;
+                if (serverTarget && serverTarget.type === 'localSampler') return serverTarget;
+            }
+            if (localSamplers.length === 1) return localSamplers[0];
+            if (!localSamplerDefinition) return null;
+            var nextId = nodes.reduce(function(maximum, node) { return Math.max(maximum, Number(node.id) || 0); }, 0) + 1;
+            var created = localSamplerDefinition.factory(nextId,
+                Number(orchestrator && orchestrator.x || server && server.x || 0) - 520,
+                Number(orchestrator && orchestrator.y || server && server.y || 0) + 280);
+            nodes.push(created);
+            byId.set(created.id, created);
+            localSamplers.push(created);
+            return created;
+        }
+
+        orchestrators.forEach(function(orchestrator) {
+            orchestrator.params = orchestrator.params && typeof orchestrator.params === 'object' ? orchestrator.params : {};
+            var server = serverForOrchestrator(orchestrator) || (servers.length === 1 ? servers[0] : null);
+            if (!server) return;
+            var contextNode = contextForOrchestrator(orchestrator);
+            var legacyControl = controlForOrchestrator(orchestrator);
+            var loader = oldLoaderForOrchestrator(orchestrator) || loaderForServer(server);
+            server.params = server.params && typeof server.params === 'object' ? server.params : {};
+
+            var localSampler = ensureLocalSampler(orchestrator, server);
+            if (localSampler) {
+                localSampler.params = localSampler.params && typeof localSampler.params === 'object' ? localSampler.params : {};
+                var migratedReasoning = false;
+
+                if (Object.prototype.hasOwnProperty.call(orchestrator.params, 'reasoning')) {
+                    localSampler.params.reasoning = clone(orchestrator.params.reasoning);
+                    migratedReasoning = true;
+                } else if (Object.prototype.hasOwnProperty.call(server.params, 'reasoning')) {
+                    localSampler.params.reasoning = clone(server.params.reasoning);
+                    migratedReasoning = true;
+                }
+
+                // Context sizing belongs to llama.cpp runtime allocation, so migrate
+                // any legacy L_Sampler/Orchestrator copy back to LlamaCPP Server.
+                var hasLegacyContextPercent = Object.prototype.hasOwnProperty.call(localSampler.params, 'contextPercent');
+                var hasLegacyContextSize = Object.prototype.hasOwnProperty.call(localSampler.params, 'contextSize');
+                var hasOrchestratorContextPercent = Object.prototype.hasOwnProperty.call(orchestrator.params, 'contextPercent');
+                var hasOrchestratorContextSize = Object.prototype.hasOwnProperty.call(orchestrator.params, 'contextSize');
+                if (hasLegacyContextPercent) server.params.contextPercent = clone(localSampler.params.contextPercent);
+                else if (hasOrchestratorContextPercent) server.params.contextPercent = clone(orchestrator.params.contextPercent);
+                if (hasLegacyContextSize) server.params.contextSize = clone(localSampler.params.contextSize);
+                else if (hasOrchestratorContextSize) server.params.contextSize = clone(orchestrator.params.contextSize);
+                else if (Object.prototype.hasOwnProperty.call(orchestrator.params, 'maxTokens')) server.params.contextSize = clone(orchestrator.params.maxTokens);
+                if (!hasLegacyContextPercent && !hasOrchestratorContextPercent
+                    && (hasLegacyContextSize || hasOrchestratorContextSize || Object.prototype.hasOwnProperty.call(orchestrator.params, 'maxTokens'))) {
+                    delete server.params.contextPercent;
+                }
+                delete localSampler.params.contextPercent;
+                delete localSampler.params.contextSize;
+
+                samplingKeys.forEach(function(key) {
+                    if (Object.prototype.hasOwnProperty.call(server.params, key)) {
+                        localSampler.params[key] = clone(server.params[key]);
+                        delete server.params[key];
+                    } else if (Object.prototype.hasOwnProperty.call(orchestrator.params, key)) {
+                        localSampler.params[key] = clone(orchestrator.params[key]);
+                        delete orchestrator.params[key];
+                    }
+                });
+
+                if (!migratedReasoning && legacyControl) {
+                    var legacyMode = normalizeReasoningMode(legacyControlReasoning.get(legacyControl.id));
+                    if (legacyMode) localSampler.params.reasoning = legacyMode;
+                }
+
+                if (typeof localSamplerDefinition.normalizeNode === 'function') localSamplerDefinition.normalizeNode(localSampler);
+            }
+
+            if (contextNode && contextNode.params && typeof contextNode.params === 'object') {
+                orchestrator.params.systemPrompt = typeof contextNode.params.systemPrompt === 'string' ? clone(contextNode.params.systemPrompt) : '';
+                orchestrator.params.includeHistory = typeof contextNode.params.includeHistory === 'boolean' ? contextNode.params.includeHistory : true;
+                absorbedContextIds.add(contextNode.id);
+            }
+            if (legacyControl && legacyControl.params && typeof legacyControl.params === 'object') {
+                orchestrator.params.nameConversations = typeof legacyControl.params.nameConversations === 'boolean' ? legacyControl.params.nameConversations : true;
+                orchestrator.params.autoCompact = typeof legacyControl.params.autoCompact === 'boolean' ? legacyControl.params.autoCompact : false;
+                orchestrator.params.modelIdleUnloadEnabled = typeof legacyControl.params.modelIdleUnloadEnabled === 'boolean'
+                    ? legacyControl.params.modelIdleUnloadEnabled
+                    : Number(legacyControl.params.modelIdleUnloadSeconds) > 0;
+                absorbedControlIds.add(legacyControl.id);
+            }
+
+            delete orchestrator.params.reasoning;
+            delete orchestrator.params.contextPercent;
+            delete orchestrator.params.contextSize;
+            delete orchestrator.params.maxTokens;
+            samplingKeys.forEach(function(key) { delete orchestrator.params[key]; });
+            delete server.params.reasoning;
+
+            if (serverDefinition && typeof serverDefinition.normalizeNode === 'function') serverDefinition.normalizeNode(server);
+            if (orchestratorDefinition && typeof orchestratorDefinition.normalizeNode === 'function') orchestratorDefinition.normalizeNode(orchestrator);
+
+            var kept = connections.filter(function(connection) {
+                if (connection.toNode === orchestrator.id && (connection.toSocket === 'model' || connection.toSocket === 'gguf' || connection.toSocket === 'samplerParameters'
+                    || connection.toSocket === 'context' || connection.toSocket === 'text' || connection.toSocket === 'image'
+                    || connection.toSocket === 'control' || connection.toSocket === 'while')) return false;
+                if (loader && connection.toNode === loader.id && connection.toSocket === 'server') return false;
+                if (connection.toNode === server.id && (connection.toSocket === 'model' || connection.toSocket === 'samplerParameters')) return false;
+                if (localSampler && connection.toNode === localSampler.id && connection.toSocket === 'gguf') return false;
+                return true;
+            });
+            connections.length = 0;
+            Array.prototype.push.apply(connections, kept);
+            if (loader) connections.push({ fromNode: loader.id, fromSocket: 'model', toNode: server.id, toSocket: 'model' });
+            if (localSampler) connections.push({ fromNode: server.id, fromSocket: 'gguf', toNode: localSampler.id, toSocket: 'gguf' });
+            if (localSampler) connections.push({ fromNode: localSampler.id, fromSocket: 'samplerParameters', toNode: orchestrator.id, toSocket: 'samplerParameters' });
+        });
+
+        contexts.forEach(function(contextNode) {
+            for (var index = connections.length - 1; index >= 0; index--) {
+                if (connections[index].toNode === contextNode.id && connections[index].toSocket === 'model') connections.splice(index, 1);
+            }
+        });
+
+        apiSamplers.forEach(function(apiSampler) {
+            for (var index = connections.length - 1; index >= 0; index--) {
+                var connection = connections[index];
+                if (connection.toNode !== apiSampler.id) continue;
+                if (connection.toSocket === 'image') {
+                    connections.splice(index, 1);
+                    continue;
+                }
+                if (connection.toSocket === 'text') connection.toSocket = 'context';
+                var source = byId.get(connection.fromNode);
+                if (source && source.type === 'context' && connection.fromSocket === 'text') connection.fromSocket = 'context';
+            }
+        });
+
+        // Context/Control instances absorbed by local Orchestrator disappear when
+        // they are no longer referenced. If a custom/API graph still uses the same
+        // node, its remaining edge keeps that node alive and its contract untouched.
+        var retainedNodeIds = new Set();
+        connections.forEach(function(connection) {
+            retainedNodeIds.add(connection.fromNode);
+            retainedNodeIds.add(connection.toNode);
+        });
+        for (var nodeIndex = nodes.length - 1; nodeIndex >= 0; nodeIndex--) {
+            var candidate = nodes[nodeIndex];
+            var absorbed = candidate && ((candidate.type === 'context' && absorbedContextIds.has(candidate.id))
+                || (candidate.type === 'control' && absorbedControlIds.has(candidate.id)));
+            if (absorbed && !retainedNodeIds.has(candidate.id)) {
+                byId.delete(candidate.id);
+                nodes.splice(nodeIndex, 1);
+            }
+        }
+
+        var seen = new Set();
+        for (var connectionIndex = connections.length - 1; connectionIndex >= 0; connectionIndex--) {
+            var connection = connections[connectionIndex];
+            var key = [connection.fromNode, connection.fromSocket, connection.toNode, connection.toSocket].join('|');
+            if (seen.has(key)) connections.splice(connectionIndex, 1);
+            else seen.add(key);
+        }
+        return nodes.reduce(function(maximum, node) { return Math.max(maximum, Number(node.id) || 0); }, 0) + 1;
+    }
+
+    function normalizedAssetPath(value) {
+        return String(value || '').replace(/\\/g, '/').toLowerCase();
+    }
+
+    function migrateAssets(request) {
+        request = request && typeof request === 'object' ? request : {};
+        var nodes = Array.isArray(request.nodes) ? request.nodes : [];
+        var connections = Array.isArray(request.connections) ? request.connections : [];
+        var getDefinition = typeof request.getNodeDef === 'function' ? request.getNodeDef : function() { return null; };
+        var loaderDefinition = getDefinition('tools');
+        if (!loaderDefinition) return { nodes: nodes, connections: connections };
+        var byId = new Map(nodes.map(function(node) { return [node.id, node]; }));
+        var removedNodeIds = new Set();
+        var consumedConnections = new Set();
+        var redirectedSkillOwners = new Map();
+
+        function addUnique(list, candidate) {
+            if (!candidate || !candidate.path) return;
+            var key = normalizedAssetPath(candidate.path);
+            if (list.some(function(existing) { return normalizedAssetPath(existing.path) === key; })) return;
+            list.push(candidate);
+        }
+
+        function ensureLoaderCollections(node) {
+            if (!node.params || typeof node.params !== 'object') node.params = {};
+            if (!Array.isArray(node.params.providers)) node.params.providers = [];
+            if (!Array.isArray(node.params.skills)) node.params.skills = [];
+            return node;
+        }
+
+        function skillCandidate(value) {
+            if (!value || typeof value !== 'object') return null;
+            var skillPath = String(value.path || '').trim();
+            if (!skillPath) return null;
+            return {
+                path: skillPath,
+                name: String(value.name || value.skillName || 'Skill'),
+                description: String(value.description || ''),
+                compatible: value.compatible !== false
+            };
+        }
+
+        function providerCandidate(value) {
+            if (!value || typeof value !== 'object') return null;
+            var providerPath = String(value.path || '').trim();
+            if (!providerPath) return null;
+            return {
+                kind: String(value.kind || 'python'), path: providerPath,
+                name: String(value.name || value.providerName || 'Python tool file'),
+                toolCount: Math.max(0, Number.parseInt(value.toolCount, 10) || 0)
+            };
+        }
+
+        var toolNodes = nodes.filter(function(node) { return node.type === 'tools'; }).map(ensureLoaderCollections);
+        nodes.filter(function(node) { return node.type === 'skills'; }).forEach(function(skillNode) {
+            var outgoing = connections.filter(function(connection) {
+                return connection.fromNode === skillNode.id && connection.fromSocket === 'skills';
+            });
+            var targetIds = new Set(outgoing.map(function(connection) { return connection.toNode; }));
+            var targetLoader = toolNodes.find(function(loaderNode) {
+                return connections.some(function(connection) {
+                    return connection.fromNode === loaderNode.id && connection.fromSocket === 'tools' && targetIds.has(connection.toNode);
+                });
+            }) || null;
+            var legacySkills = Array.isArray(skillNode.params && skillNode.params.skills)
+                ? skillNode.params.skills
+                : (Array.isArray(skillNode.params && skillNode.params.skillFiles) ? skillNode.params.skillFiles : []);
+            if (targetLoader) {
+                legacySkills.map(skillCandidate).filter(Boolean).forEach(function(skill) { addUnique(targetLoader.params.skills, skill); });
+                redirectedSkillOwners.set(skillNode.id, targetLoader.id);
+                removedNodeIds.add(skillNode.id);
+                return;
+            }
+            var replacement = loaderDefinition.factory(skillNode.id, skillNode.x, skillNode.y);
+            replacement.params.providers = [];
+            replacement.params.skills = legacySkills.map(skillCandidate).filter(Boolean);
+            replacement.params.browserControlToolMigrationVersion = 1;
+            replacement.params.timeoutToolMigrationVersion = 1;
+            replacement.params.askUserYesNoToolMigrationVersion = 1;
+            replacement.params.generateImageToolMigrationVersion = 1;
+            replacement.params.maxRoundsMigrationVersion = 2;
+            replacement.uiWidth = skillNode.uiWidth;
+            replacement.title = 'Loader';
+            if (typeof loaderDefinition.normalizeNode === 'function') loaderDefinition.normalizeNode(replacement);
+            var index = nodes.indexOf(skillNode);
+            nodes[index] = replacement;
+            byId.set(replacement.id, replacement);
+            toolNodes.push(replacement);
+        });
+
+        connections.forEach(function(connection) {
+            var source = byId.get(connection.fromNode);
+            var targetId = redirectedSkillOwners.get(connection.toNode) || connection.toNode;
+            var target = byId.get(targetId);
+            if (!source || !target || target.type !== 'tools') return;
+            ensureLoaderCollections(target);
+            var loaderPath = String(source.params && source.params.path || '').trim();
+            if (!loaderPath) return;
+            if (source.type === 'loadTool') {
+                addUnique(target.params.providers, providerCandidate({
+                    path: loaderPath,
+                    name: String(source.params && source.params.providerName || 'Python tool file')
+                }));
+                consumedConnections.add(connection);
+            } else if (source.type === 'loadSkill') {
+                addUnique(target.params.skills, skillCandidate({
+                    path: loaderPath,
+                    name: String(source.params && source.params.skillName || 'Skill')
+                }));
+                consumedConnections.add(connection);
+            }
+        });
+
+        var connectedAssetLoaders = new Set(Array.from(consumedConnections).map(function(connection) { return connection.fromNode; }));
+        connectedAssetLoaders.forEach(function(loaderId) {
+            var outgoing = connections.filter(function(connection) { return connection.fromNode === loaderId; });
+            if (outgoing.length && outgoing.every(function(connection) { return consumedConnections.has(connection); })) removedNodeIds.add(loaderId);
+        });
+
+        nodes.forEach(function(node, index) {
+            if (node.type !== 'loadSkill' || removedNodeIds.has(node.id)) return;
+            var replacement = loaderDefinition.factory(node.id, node.x, node.y);
+            replacement.params.providers = [];
+            var loaderPath = String(node.params && node.params.path || '').trim();
+            replacement.params.skills = loaderPath ? [skillCandidate({
+                path: loaderPath,
+                name: String(node.params && node.params.skillName || 'Skill')
+            })] : [];
+            replacement.params.browserControlToolMigrationVersion = 1;
+            replacement.params.timeoutToolMigrationVersion = 1;
+            replacement.params.askUserYesNoToolMigrationVersion = 1;
+            replacement.params.generateImageToolMigrationVersion = 1;
+            replacement.params.maxRoundsMigrationVersion = 2;
+            replacement.uiWidth = node.uiWidth;
+            replacement.title = 'Loader';
+            if (typeof loaderDefinition.normalizeNode === 'function') loaderDefinition.normalizeNode(replacement);
+            nodes[index] = replacement;
+            byId.set(replacement.id, replacement);
+        });
+
+        toolNodes.forEach(function(node) {
+            if (removedNodeIds.has(node.id)) return;
+            if (typeof loaderDefinition.normalizeNode === 'function') loaderDefinition.normalizeNode(node);
+        });
+
+        var migratedNodes = nodes.filter(function(node) { return !removedNodeIds.has(node.id); });
+        var migratedById = new Map(migratedNodes.map(function(node) { return [node.id, node]; }));
+        var connectionKeys = new Set();
+        var migratedConnections = [];
+        connections.forEach(function(connection) {
+            if (consumedConnections.has(connection)) return;
+            var fromNodeId = redirectedSkillOwners.get(connection.fromNode) || connection.fromNode;
+            var toNodeId = redirectedSkillOwners.get(connection.toNode) || connection.toNode;
+            if (!migratedById.has(fromNodeId) || !migratedById.has(toNodeId)) return;
+            var migrated = Object.assign({}, connection, { fromNode: fromNodeId, toNode: toNodeId });
+            if (redirectedSkillOwners.has(connection.fromNode)) migrated.fromSocket = 'skills';
+            var fromNode = migratedById.get(migrated.fromNode);
+            var toNode = migratedById.get(migrated.toNode);
+            if (!(fromNode.outputs || []).some(function(socket) { return socket.name === migrated.fromSocket; })) return;
+            if (!(toNode.inputs || []).some(function(socket) { return socket.name === migrated.toSocket; })) return;
+            var key = [migrated.fromNode, migrated.fromSocket, migrated.toNode, migrated.toSocket].join(':');
+            if (connectionKeys.has(key)) return;
+            connectionKeys.add(key);
+            migratedConnections.push(migrated);
+        });
+        return { nodes: migratedNodes, connections: migratedConnections };
+    }
+
+
+    namespace.workflowLocalPipelineMigration = Object.freeze({
+        migrate: migrate,
+        migrateAssets: migrateAssets,
+        normalizeReasoningMode: normalizeReasoningMode
+    });
+})(globalThis);
+    // <DARKSTAR_SOURCE_END path="backend/renderer/workflow-local-pipeline-migration.js">
     // RENDERER MODULE :: backend/renderer/workflow.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/workflow.js">
 // === WORKFLOW.JS ===
@@ -6918,6 +8422,12 @@ function onNodeParamChange(el) {
     var workflowRevision = 0;
     var savedWorkflowRevision = -1;
     var workflowSessionSaveInFlight = null;
+    var workflowFullSaveRequired = false;
+    var pendingWorkflowNodeSaveIds = new Set();
+    var localPipelineMigration = root.Darkstar && root.Darkstar.workflowLocalPipelineMigration;
+    if (!localPipelineMigration || typeof localPipelineMigration.migrate !== 'function') {
+        throw new Error('Local workflow pipeline migration service is unavailable.');
+    }
 
     function persistentClone(value, seen) {
         if (value === null || value === undefined) return value;
@@ -7097,140 +8607,6 @@ function onNodeParamChange(el) {
         return normalizedSockets(saved === null ? defaults : saved, direction === 'inputs' ? 'input' : 'output');
     }
 
-    function normalizedAssetPath(value) {
-        return String(value || '').replace(/\\/g, '/').toLowerCase();
-    }
-
-    function migrateLegacyAssetLoaderNodes(nodes, connections) {
-        var byId = new Map(nodes.map(function(node) { return [node.id, node]; }));
-        var migratedConnections = new Set();
-        var connectedLoaders = new Set();
-
-        function addUnique(list, candidate) {
-            if (!candidate || !candidate.path) return;
-            var key = normalizedAssetPath(candidate.path);
-            if (list.some(function(existing) { return normalizedAssetPath(existing.path) === key; })) return;
-            list.push(candidate);
-        }
-
-        nodes.forEach(function(node) {
-            if (node.type !== 'tools' && node.type !== 'skills') return;
-            if (!node.params || typeof node.params !== 'object') node.params = {};
-            var incoming = connections.filter(function(connection) { return connection.toNode === node.id; });
-            if (node.type === 'tools') {
-                if (!Array.isArray(node.params.providers)) node.params.providers = [];
-                incoming.forEach(function(connection) {
-                    var loader = byId.get(connection.fromNode);
-                    if (!loader || loader.type !== 'loadTool') return;
-                    var loaderPath = String(loader.params && loader.params.path || '').trim();
-                    if (!loaderPath) return;
-                    addUnique(node.params.providers, {
-                        kind: 'python', path: loaderPath,
-                        name: String(loader.params && loader.params.providerName || 'Python tool file'), toolCount: 0
-                    });
-                    migratedConnections.add(connection);
-                    connectedLoaders.add(loader.id);
-                });
-            } else {
-                if (!Array.isArray(node.params.skills)) node.params.skills = [];
-                incoming.forEach(function(connection) {
-                    var loader = byId.get(connection.fromNode);
-                    if (!loader || loader.type !== 'loadSkill') return;
-                    var loaderPath = String(loader.params && loader.params.path || '').trim();
-                    if (!loaderPath) return;
-                    addUnique(node.params.skills, {
-                        path: loaderPath, name: String(loader.params && loader.params.skillName || 'Skill'),
-                        description: '', compatible: true
-                    });
-                    migratedConnections.add(connection);
-                    connectedLoaders.add(loader.id);
-                });
-            }
-            var definition = typeof getNodeDef === 'function' ? getNodeDef(node.type) : null;
-            node.inputs = normalizedSockets(definition ? definition.inputs : [], 'input');
-            if (definition && typeof definition.normalizeNode === 'function') definition.normalizeNode(node);
-        });
-
-        var removableLoaders = new Set();
-        connectedLoaders.forEach(function(loaderId) {
-            var outgoing = connections.filter(function(connection) { return connection.fromNode === loaderId; });
-            if (outgoing.length && outgoing.every(function(connection) { return migratedConnections.has(connection); })) removableLoaders.add(loaderId);
-        });
-        var skillsDefinition = typeof getNodeDef === 'function' ? getNodeDef('skills') : null;
-        var migratedNodes = nodes.filter(function(node) { return !removableLoaders.has(node.id); }).map(function(node) {
-            if (node.type !== 'loadSkill' || !skillsDefinition) return node;
-            var replacement = skillsDefinition.factory(node.id, node.x, node.y);
-            var loaderPath = String(node.params && node.params.path || '').trim();
-            replacement.params.skills = loaderPath ? [{
-                path: loaderPath,
-                name: String(node.params && node.params.skillName || 'Skill'),
-                description: '',
-                compatible: true
-            }] : [];
-            replacement.uiWidth = node.uiWidth;
-            if (typeof skillsDefinition.normalizeNode === 'function') skillsDefinition.normalizeNode(replacement);
-            return replacement;
-        });
-        var migratedById = new Map(migratedNodes.map(function(node) { return [node.id, node]; }));
-        var remainingNodeIds = new Set(migratedNodes.map(function(node) { return node.id; }));
-        var migratedGraphConnections = connections.filter(function(connection) {
-            if (migratedConnections.has(connection)) return false;
-            if (!remainingNodeIds.has(connection.fromNode) || !remainingNodeIds.has(connection.toNode)) return false;
-            var fromNode = migratedById.get(connection.fromNode);
-            var toNode = migratedById.get(connection.toNode);
-            var outputExists = fromNode && (fromNode.outputs || []).some(function(socket) { return socket.name === connection.fromSocket; });
-            var inputExists = toNode && (toNode.inputs || []).some(function(socket) { return socket.name === connection.toSocket; });
-            return outputExists && inputExists;
-        });
-        return { nodes: migratedNodes, connections: migratedGraphConnections };
-    }
-
-    function normalizedReasoningMode(value) {
-        var mode = String(value || '').trim();
-        return /^(?:auto|on|off)$/i.test(mode) ? mode.toLowerCase() : (/^[A-Za-z][A-Za-z0-9_.-]{0,31}$/.test(mode) ? mode : null);
-    }
-
-    function migrateControlSamplerInterface(nodes, connections, legacyControlReasoning, storedSamplerReasoning) {
-        var byId = new Map(nodes.map(function(node) { return [node.id, node]; }));
-        var controlNodes = nodes.filter(function(node) { return node.type === 'control'; });
-        var samplerNodes = nodes.filter(function(node) { return node.type === 'sampler'; });
-        var migratedSamplerIds = new Set();
-
-        function renameSocket(socket) {
-            if (!socket || (socket.name !== 'control' && socket.name !== 'while')) return socket;
-            return Object.assign({}, socket, { name: 'while', label: 'While' });
-        }
-
-        controlNodes.forEach(function(node) {
-            node.outputs = (Array.isArray(node.outputs) ? node.outputs : []).map(renameSocket);
-        });
-        samplerNodes.forEach(function(node) {
-            node.inputs = (Array.isArray(node.inputs) ? node.inputs : []).map(renameSocket);
-        });
-
-        connections.forEach(function(connection) {
-            var source = byId.get(connection.fromNode);
-            var target = byId.get(connection.toNode);
-            if (!source || !target || source.type !== 'control' || target.type !== 'sampler') return;
-            if (connection.fromSocket === 'control' || connection.fromSocket === 'while') connection.fromSocket = 'while';
-            if (connection.toSocket === 'control' || connection.toSocket === 'while') connection.toSocket = 'while';
-            if (storedSamplerReasoning.has(target.id)) return;
-            var legacyMode = normalizedReasoningMode(legacyControlReasoning.get(source.id));
-            if (!legacyMode) return;
-            target.params.reasoning = legacyMode;
-            migratedSamplerIds.add(target.id);
-        });
-
-        var unmigratedSamplers = samplerNodes.filter(function(node) {
-            return !storedSamplerReasoning.has(node.id) && !migratedSamplerIds.has(node.id);
-        });
-        var controlsWithLegacyReasoning = controlNodes.filter(function(node) {
-            return normalizedReasoningMode(legacyControlReasoning.get(node.id)) !== null;
-        });
-        if (unmigratedSamplers.length === 1 && controlsWithLegacyReasoning.length === 1) {
-            unmigratedSamplers[0].params.reasoning = normalizedReasoningMode(legacyControlReasoning.get(controlsWithLegacyReasoning[0].id));
-        }
-    }
 
     function displayNameForUnknown(rawNode) {
         if (rawNode && rawNode.title) return String(rawNode.title);
@@ -7250,7 +8626,6 @@ function onNodeParamChange(el) {
         var restoredNodes = [];
         var unrecognizedNames = [];
         var legacyControlReasoning = new Map();
-        var storedSamplerReasoning = new Set();
         var nextId = 1;
 
         rawNodes.forEach(function(rawNode, index) {
@@ -7264,9 +8639,8 @@ function onNodeParamChange(el) {
 
             var saved = persistentClone(rawNode);
             var type = String(saved.type || 'unknown');
-            var savedReasoning = normalizedReasoningMode(saved.params && saved.params.reasoning);
+            var savedReasoning = localPipelineMigration.normalizeReasoningMode(saved.params && saved.params.reasoning);
             if (type === 'control' && savedReasoning) legacyControlReasoning.set(id, savedReasoning);
-            if (type === 'sampler' && savedReasoning) storedSamplerReasoning.add(id);
             var definition = typeof getNodeDef === 'function' ? getNodeDef(type) : null;
             var x = normalizeNumber(saved.x, 0);
             var y = normalizeNumber(saved.y, 0);
@@ -7307,7 +8681,7 @@ function onNodeParamChange(el) {
                 node.status = 'unrecognized';
                 node.statusMessage = 'Node type is not installed';
                 node.isUnrecognized = true;
-                if (type !== 'loadSkill') unrecognizedNames.push(displayNameForUnknown(saved));
+                if (type !== 'loadSkill' && type !== 'skills') unrecognizedNames.push(displayNameForUnknown(saved));
             }
             restoredNodes.push(node);
         });
@@ -7335,8 +8709,8 @@ function onNodeParamChange(el) {
             return connection;
         }).filter(Boolean);
 
-        migrateControlSamplerInterface(restoredNodes, restoredConnections, legacyControlReasoning, storedSamplerReasoning);
-        var migratedGraph = migrateLegacyAssetLoaderNodes(restoredNodes, restoredConnections);
+        nextId = Math.max(nextId, localPipelineMigration.migrate({ nodes: restoredNodes, connections: restoredConnections, legacyControlReasoning: legacyControlReasoning, clone: persistentClone, getNodeDef: typeof getNodeDef === 'function' ? getNodeDef : null }));
+        var migratedGraph = localPipelineMigration.migrateAssets({ nodes: restoredNodes, connections: restoredConnections, getNodeDef: typeof getNodeDef === 'function' ? getNodeDef : null });
         restoredNodes = migratedGraph.nodes;
         restoredConnections = migratedGraph.connections;
 
@@ -7434,19 +8808,27 @@ function onNodeParamChange(el) {
     async function saveWorkflowSessionNow(options) {
         options = options || {};
         if (!workflowSessionReady) return false;
-        if (!options.force && workflowRevision === savedWorkflowRevision) return true;
+        if (!options.force && workflowRevision === savedWorkflowRevision && !workflowFullSaveRequired) return true;
         var bridge = workflowBridge();
         if (!bridge) return false;
 
         if (options.sync !== true && workflowSessionSaveInFlight) {
             await workflowSessionSaveInFlight;
-            if (!options.force && workflowRevision === savedWorkflowRevision) return true;
+            if (!options.force && workflowRevision === savedWorkflowRevision && !workflowFullSaveRequired) return true;
         }
 
         var revisionToSave = workflowRevision;
+        var fullSaveWasRequired = workflowFullSaveRequired;
+        var nodeIdsCoveredBySnapshot = Array.from(pendingWorkflowNodeSaveIds);
+        workflowFullSaveRequired = false;
+        pendingWorkflowNodeSaveIds.clear();
         var snapshot;
         try { snapshot = createWorkflowSnapshot(); }
-        catch (_error) { return false; }
+        catch (_error) {
+            workflowFullSaveRequired = workflowFullSaveRequired || fullSaveWasRequired;
+            nodeIdsCoveredBySnapshot.forEach(function(id) { pendingWorkflowNodeSaveIds.add(id); });
+            return false;
+        }
 
         if (options.sync === true) {
             try {
@@ -7456,6 +8838,8 @@ function onNodeParamChange(el) {
                 savedWorkflowRevision = revisionToSave;
                 return true;
             } catch (_error) {
+                workflowFullSaveRequired = workflowFullSaveRequired || fullSaveWasRequired;
+                nodeIdsCoveredBySnapshot.forEach(function(id) { pendingWorkflowNodeSaveIds.add(id); });
                 return false;
             }
         }
@@ -7474,20 +8858,92 @@ function onNodeParamChange(el) {
         workflowSessionSaveInFlight = operation;
         try {
             var saved = await operation;
-            if (saved && workflowRevision !== savedWorkflowRevision) scheduleWorkflowSessionSave(0, false);
-            return saved;
+            if (!saved) {
+                workflowFullSaveRequired = workflowFullSaveRequired || fullSaveWasRequired;
+                nodeIdsCoveredBySnapshot.forEach(function(id) { pendingWorkflowNodeSaveIds.add(id); });
+                return false;
+            }
+            if (workflowRevision !== savedWorkflowRevision) {
+                if (workflowFullSaveRequired) scheduleWorkflowSessionSave(0, false);
+                else scheduleWorkflowNodeSessionSave(null, 0, false);
+            }
+            return true;
         } finally {
             if (workflowSessionSaveInFlight === operation) workflowSessionSaveInFlight = null;
         }
     }
 
+    async function saveWorkflowNodeSessionNow() {
+        if (!workflowSessionReady) return false;
+        if (workflowFullSaveRequired) return saveWorkflowSessionNow();
+        var bridge = workflowBridge();
+        if (!bridge || typeof bridge.patchSession !== 'function') {
+            workflowFullSaveRequired = true;
+            return saveWorkflowSessionNow({ force: true });
+        }
+        if (workflowSessionSaveInFlight) {
+            await workflowSessionSaveInFlight;
+            if (workflowFullSaveRequired) return saveWorkflowSessionNow();
+        }
+
+        var ids = Array.from(pendingWorkflowNodeSaveIds);
+        if (!ids.length) return true;
+        ids.forEach(function(id) { pendingWorkflowNodeSaveIds.delete(id); });
+        var revisionToSave = workflowRevision;
+        var nodes = ids.map(function(id) {
+            var node = nodeEditorState.nodes.find(function(candidate) { return candidate.id === id; });
+            return node ? snapshotNode(node) : null;
+        }).filter(Boolean);
+        if (!nodes.length) return true;
+
+        var operation = (async function() {
+            try { return await bridge.patchSession({ nodes: nodes }); }
+            catch (_error) { return null; }
+        })();
+        workflowSessionSaveInFlight = operation;
+        var response;
+        try { response = await operation; }
+        finally { if (workflowSessionSaveInFlight === operation) workflowSessionSaveInFlight = null; }
+
+        if (response && response.needsSnapshot === true) {
+            ids.forEach(function(id) { pendingWorkflowNodeSaveIds.add(id); });
+            workflowFullSaveRequired = true;
+            return saveWorkflowSessionNow({ force: true });
+        }
+        if (!response || response.success !== true) {
+            ids.forEach(function(id) { pendingWorkflowNodeSaveIds.add(id); });
+            return false;
+        }
+        savedWorkflowRevision = Math.max(savedWorkflowRevision, revisionToSave);
+        if (workflowRevision !== savedWorkflowRevision) {
+            if (workflowFullSaveRequired) scheduleWorkflowSessionSave(0, false);
+            else scheduleWorkflowNodeSessionSave(null, 0, false);
+        }
+        return true;
+    }
+
     function scheduleWorkflowSessionSave(delayMs, markChanged) {
         if (markChanged !== false) workflowRevision++;
+        workflowFullSaveRequired = true;
         if (!workflowSessionReady) return;
         root.clearTimeout(workflowSessionSaveTimer);
         workflowSessionSaveTimer = root.setTimeout(function() {
             workflowSessionSaveTimer = null;
             Darkstar.async.runBestEffort(function() { return saveWorkflowSessionNow(); }, 'WORKFLOW');
+        }, Number.isFinite(Number(delayMs)) ? Math.max(0, Number(delayMs)) : 180);
+    }
+
+    function scheduleWorkflowNodeSessionSave(nodeId, delayMs, markChanged) {
+        if (markChanged !== false) workflowRevision++;
+        var parsedNodeId = Number.parseInt(nodeId, 10);
+        if (Number.isFinite(parsedNodeId) && parsedNodeId > 0) pendingWorkflowNodeSaveIds.add(parsedNodeId);
+        if (!workflowSessionReady) return;
+        root.clearTimeout(workflowSessionSaveTimer);
+        workflowSessionSaveTimer = root.setTimeout(function() {
+            workflowSessionSaveTimer = null;
+            Darkstar.async.runBestEffort(function() {
+                return workflowFullSaveRequired ? saveWorkflowSessionNow() : saveWorkflowNodeSessionNow();
+            }, 'WORKFLOW');
         }, Number.isFinite(Number(delayMs)) ? Math.max(0, Number(delayMs)) : 180);
     }
 
@@ -7579,6 +9035,7 @@ function onNodeParamChange(el) {
     root.restoreWorkflowDocument = restoreWorkflowDocument;
     root.restoreWorkflowSession = restoreWorkflowSession;
     root.scheduleWorkflowSessionSave = scheduleWorkflowSessionSave;
+    root.scheduleWorkflowNodeSessionSave = scheduleWorkflowNodeSessionSave;
     root.saveWorkflowSessionNow = saveWorkflowSessionNow;
     root.saveNodeWorkflow = saveNodeWorkflow;
     root.loadNodeWorkflow = loadNodeWorkflow;
@@ -7619,7 +9076,7 @@ function onNodeParamChange(el) {
     }
 
     function isFilesystemMode() {
-        return mode === 'model' || mode === 'projector' || mode === 'tool' || mode === 'skill' || mode === 'image';
+        return mode === 'model' || mode === 'diffusion' || mode === 'projector' || mode === 'tool' || mode === 'skill' || mode === 'image';
     }
 
     function isFilesystemMultiMode() {
@@ -8049,7 +9506,7 @@ function onNodeParamChange(el) {
         coordinator.blockBackground(false);
         coordinator.setNativeOverlayBlocked(false);
         coordinator.restoreFocus(focusTarget);
-        if (typeof resolver === 'function') resolver(['model', 'projector', 'tool', 'skill', 'image'].indexOf(closingMode) >= 0 ? result : result === true);
+        if (typeof resolver === 'function') resolver(['model', 'diffusion', 'projector', 'tool', 'skill', 'image'].indexOf(closingMode) >= 0 ? result : result === true);
         return true;
     }
 
@@ -8111,6 +9568,13 @@ function onNodeParamChange(el) {
                     close({ path: String(validated.selectedPath), fileName: String(validated.selectedPath).split(/[\\/]/).pop() || String(validated.selectedPath) });
                     return true;
                 }
+                if (mode === 'diffusion') {
+                    if (!modelApi || typeof modelApi.browseModelFiles !== 'function') throw new Error('Local diffusion GGUF validation is unavailable in this build.');
+                    var diffusionValidation = await modelApi.browseModelFiles({ kind: 'diffusion', path: selectedPath });
+                    if (!diffusionValidation || diffusionValidation.success !== true || !diffusionValidation.selectedPath) throw new Error(diffusionValidation && diffusionValidation.error ? diffusionValidation.error : 'The selected diffusion GGUF could not be validated.');
+                    close({ path: String(diffusionValidation.selectedPath), fileName: String(diffusionValidation.selectedPath).split(/[\/]/).pop() || String(diffusionValidation.selectedPath) });
+                    return true;
+                }
                 if (!modelApi || typeof modelApi.inspectModel !== 'function') throw new Error('Local GGUF validation is unavailable in this build.');
                 var inspected = await modelApi.inspectModel(selectedPath);
                 if (!inspected || inspected.success !== true || !inspected.model) throw new Error(inspected && inspected.error ? inspected.error : 'The selected GGUF model could not be validated.');
@@ -8155,7 +9619,7 @@ function onNodeParamChange(el) {
             root.showNodeEditorToast('Workflow dialog is unavailable in this build.', 'error', 5600);
             return Promise.resolve(false);
         }
-        mode = ['model', 'projector', 'tool', 'skill', 'image'].indexOf(requestedMode) >= 0 ? requestedMode : requestedMode === 'load' ? 'load' : 'save';
+        mode = ['model', 'diffusion', 'projector', 'tool', 'skill', 'image'].indexOf(requestedMode) >= 0 ? requestedMode : requestedMode === 'load' ? 'load' : 'save';
         selectedName = '';
         selectedLocalPath = '';
         selectedLocalPaths = [];
@@ -8193,6 +9657,15 @@ function onNodeParamChange(el) {
             if (ui.pickerLabel) ui.pickerLabel.textContent = 'Available workflows';
             ui.commitButton.textContent = 'Load';
             ui.abortButton.textContent = 'Abort';
+        } else if (mode === 'diffusion') {
+            ui.title.textContent = 'Browse Local Filesystem';
+            if (ui.subtitle) ui.subtitle.textContent = 'Choose a local diffusion .gguf using Darkstar’s filesystem browser.';
+            if (ui.nameSection) ui.nameSection.hidden = false;
+            if (ui.nameInput) ui.nameInput.value = '';
+            setFieldCopy('Location', 'Folders and diffusion .gguf files only. Enter an absolute path and press Enter to navigate.', 'Absolute path');
+            if (ui.pickerLabel) ui.pickerLabel.textContent = 'Folders and diffusion GGUF models';
+            ui.commitButton.textContent = 'Select Diffusion Model';
+            ui.abortButton.textContent = 'Cancel';
         } else if (mode === 'projector') {
             ui.title.textContent = 'Browse Local Filesystem';
             if (ui.subtitle) ui.subtitle.textContent = 'Choose a local projector using Darkstar’s filesystem browser. No native file dialog is opened.';
@@ -8322,6 +9795,10 @@ function onNodeParamChange(el) {
     root.Darkstar.modelFiles = Object.freeze({
         isActive: isActive,
         open: function(options) { return open('model', options || {}); }
+    });
+    root.Darkstar.diffusionModelFiles = Object.freeze({
+        isActive: isActive,
+        open: function(options) { return open('diffusion', options || {}); }
     });
     root.Darkstar.projectorFiles = Object.freeze({
         isActive: isActive,
@@ -8460,11 +9937,11 @@ function onNodeParamChange(el) {
             var definition = registry.get(node.type);
             return definition && definition.outputNode === true;
         });
-        if (!outputNodes.length) return { valid: false, error: 'No output node is present. Add an Autoregressive Sampler.', errorNode: null };
+        if (!outputNodes.length) return { valid: false, error: 'No output node is present. Add an Orchestrator.', errorNode: null };
         if (outputNodes.length > 1) {
             return {
                 valid: false,
-                error: 'More than one output node is present. Keep exactly one local or API Autoregressive Sampler.',
+                error: 'More than one output node is present. Keep exactly one local Orchestrator or API Autoregressive Sampler.',
                 errorNode: outputNodes[1].id
             };
         }
@@ -8561,28 +10038,6 @@ function onNodeParamChange(el) {
 
         var executionOrder = trace.executionOrder;
         var primaryOutputNodeIds = trace.outputNodeIds;
-        // Output nodes may publish execution-wide contracts needed by upstream
-        // infrastructure before topological execution begins. This is deliberately
-        // a preflight hook: a Sampler-owned context length must reach Load Server
-        // even when execution is targeted only as far as Load Model (for example
-        // /compact cold-start preparation).
-        for (var prepareIndex = 0; prepareIndex < trace.outputNodeIds.length; prepareIndex++) {
-            var prepareNodeId = trace.outputNodeIds[prepareIndex];
-            var prepareNode = this.graphCore.nodeById(graphNodes, prepareNodeId);
-            var prepareDefinition = prepareNode ? this.registry.get(prepareNode.type) : null;
-            if (!prepareNode || !prepareDefinition || typeof prepareDefinition.prepareExecution !== 'function') continue;
-            try {
-                await prepareDefinition.prepareExecution(prepareNode, {
-                    nodes: graphNodes,
-                    connections: connections,
-                    trace: trace,
-                    context: context
-                });
-            } catch (error) {
-                if (error && error.name === 'AbortError') throw error;
-                throw new GraphExecutionError(error && error.message ? error.message : String(error), prepareNodeId, error);
-            }
-        }
         if (Array.isArray(options.targetNodeIds) && options.targetNodeIds.length) {
             var targetNodeIds = options.targetNodeIds.map(function(nodeId) { return Number(nodeId); });
             var invalidTarget = targetNodeIds.find(function(nodeId) { return !trace.required[nodeId]; });
@@ -8712,7 +10167,13 @@ function adaptPrimaryOutput(nodeId, output, graphNodes) {
     var node = Array.isArray(graphNodes) ? graphCore().nodeById(graphNodes, nodeId) : graphNodeById(nodeId);
     var definition = node ? getNodeDef(node.type) : null;
     if (definition && typeof definition.resultAdapter === 'function') {
-        return definition.resultAdapter(output, node);
+        var adapted = definition.resultAdapter(output, node);
+        if (!adapted || typeof adapted !== 'object') return adapted;
+        return Object.assign({}, adapted, {
+            presentedImageIds: Array.isArray(adapted.presentedImageIds)
+                ? adapted.presentedImageIds.map(String)
+                : (Array.isArray(output.presentedImageIds) ? output.presentedImageIds.map(String) : [])
+        });
     }
     if (typeof output.text === 'string') {
         return {
@@ -8725,6 +10186,7 @@ function adaptPrimaryOutput(nodeId, output, graphNodes) {
             working: Array.isArray(output.working) ? output.working : [],
             toolMessages: Array.isArray(output.toolMessages) ? output.toolMessages : [],
             agentTimeline: Array.isArray(output.agentTimeline) ? output.agentTimeline : [],
+            presentedImageIds: Array.isArray(output.presentedImageIds) ? output.presentedImageIds.map(String) : [],
             agentRounds: output.agentRounds || 1,
             toolRounds: output.toolRounds || 0
         };
@@ -9011,7 +10473,7 @@ async function ensureCompactionModelLoaded(options) {
     var modelId = await currentModelId();
     if (modelId) return modelId;
     if (options.auto === true) throw new Error('No model is loaded. Load a model before compacting context.');
-    var prepared = await executeGraphToNodeType('modelLoader', { tabId: options.tabId, command: 'compact' });
+    var prepared = await executeGraphToNodeType('loadServer', { tabId: options.tabId, command: 'compact' });
     if (!prepared || prepared.success !== true) {
         throw new Error(prepared && prepared.error ? prepared.error : 'Could not load the configured model for compaction.');
     }
@@ -9598,8 +11060,9 @@ function activeProjectHasWorkspace() { return projectWorkspaceReady(activeProjec
 }
 var projectFilesystemSyncPromise = null;
 var projectFilesystemSyncTimer = null;
-function projectFilesystemNameKey(value) { return String(value || '').trim().toLocaleLowerCase();
-}
+function projectFilesystemNameKey(value) { return String(value || '').trim().toLocaleLowerCase(); }
+function projectFilesystemPathKey(value) { return String(value || '').replace(/\\/gu, '/').replace(/\/+$/u, '').toLocaleLowerCase(); }
+function projectRootIsManaged(rootPath, projectsRootPath) { var rootKey = projectFilesystemPathKey(rootPath), projectsKey = projectFilesystemPathKey(projectsRootPath); if (!rootKey || !projectsKey || rootKey === projectsKey) return false; return rootKey.slice(0, rootKey.lastIndexOf('/')) === projectsKey; }
 async function attachDiscoveredProjectRoot(project, descriptor) { if (!project || !descriptor || !descriptor.path || typeof workspaceBridge !== 'function' || typeof workspaceStateForProject !== 'function') return false;
     var bridge = workspaceBridge();
     if (!bridge || typeof bridge.restoreFolder !== 'function') return false;
@@ -9629,6 +11092,8 @@ async function synchronizeProjectsFromFilesystem(options) { options = options ||
         var removedProjectIds = new Set();
         (Array.isArray(projects) ? projects.slice() : []).forEach(function(project) { if (!project || descriptorByName.has(projectFilesystemNameKey(project.title))) return;
             if (projectHasRunningGeneration(project.id)) return;
+            var projectRoot = typeof getProjectWorkspaceRoot === 'function' ? getProjectWorkspaceRoot(project.id) : '';
+            if (projectRoot && !projectRootIsManaged(projectRoot, response.rootPath)) return;
             removedProjectIds.add(Number(project.id));
         });
         if (removedProjectIds.size) { var removedTabs = (Array.isArray(tabs) ? tabs : []).filter(function(tab) { return removedProjectIds.has(Number(tab && tab.projectId)); });
@@ -9987,6 +11452,8 @@ async function deleteProject(projectId) { var id = Number(projectId);
     return true;
 }
 function clearComposerForProjectSwitch() {
+    var activeTab = typeof getActiveTab === 'function' ? getActiveTab() : null;
+    if (typeof restoreComposerDraftForTab === 'function' && activeTab) { restoreComposerDraftForTab(activeTab); return; }
     var input = document.getElementById('messageInput');
     if (input) {
         input.value = '';
@@ -10002,7 +11469,7 @@ function ensureProjectHasTab(project) {
     if (owned.length) return owned[0];
     var id = nextTabId++;
     var tab = {
-        id: id, projectId: project.id, title: nextDefaultChatTitle(project.id), history: [], tokens: 0, tokensExact: false, tokensPerSecond: 0, scheduled: [], conversationNameState: 'idle', userScrolledUp: false, welcomeQuote: ''
+        id: id, projectId: project.id, title: nextDefaultChatTitle(project.id), history: [], tokens: 0, tokensExact: false, tokensPerSecond: 0, scheduled: [], conversationNameState: 'idle', userScrolledUp: false, welcomeQuote: '', composerDraft: { text: '', image: null }
     };
     if (typeof ensureWelcomeQuoteForTab === 'function') ensureWelcomeQuoteForTab(tab);
     tabs.push(tab);
@@ -10018,7 +11485,7 @@ function switchProject(projectId) {
     if (typeof editModalIsActive === 'function' && editModalIsActive() && typeof closeEditModal === 'function') {
         closeEditModal({ restoreFocus: false });
     }
-    if (typeof saveActiveTabScrollState === 'function') saveActiveTabScrollState();
+    if (typeof saveActiveTabScrollState === 'function') saveActiveTabScrollState(); if (typeof captureActiveComposerDraft === 'function') captureActiveComposerDraft();
     var current = getActiveProject();
     if (current) current.activeTabId = activeTabId;
     if (typeof collapseScheduledQueueUi === 'function') collapseScheduledQueueUi();
@@ -10048,7 +11515,7 @@ function createNewProject() {
     if (typeof editModalIsActive === 'function' && editModalIsActive() && typeof closeEditModal === 'function') {
         closeEditModal({ restoreFocus: false });
     }
-    if (typeof saveActiveTabScrollState === 'function') saveActiveTabScrollState();
+    if (typeof saveActiveTabScrollState === 'function') saveActiveTabScrollState(); if (typeof captureActiveComposerDraft === 'function') captureActiveComposerDraft();
     var current = getActiveProject();
     if (current) current.activeTabId = activeTabId;
     if (typeof collapseScheduledQueueUi === 'function') collapseScheduledQueueUi();
@@ -10056,7 +11523,7 @@ function createNewProject() {
     var tabId = nextTabId++;
     var project = { id: projectId, title: nextDefaultProjectTitle(), activeTabId: tabId };
     var tab = {
-        id: tabId, projectId: projectId, title: 'Chat 1', history: [], tokens: 0, tokensExact: false, tokensPerSecond: 0, scheduled: [], conversationNameState: 'idle', userScrolledUp: false, welcomeQuote: ''
+        id: tabId, projectId: projectId, title: 'Chat 1', history: [], tokens: 0, tokensExact: false, tokensPerSecond: 0, scheduled: [], conversationNameState: 'idle', userScrolledUp: false, welcomeQuote: '', composerDraft: { text: '', image: null }
     };
     if (typeof ensureWelcomeQuoteForTab === 'function') ensureWelcomeQuoteForTab(tab);
     projects.push(project);
@@ -11609,11 +13076,172 @@ async function initializeAgentAttention() {
     root.disconnectUipTarget = disconnectTarget;
 })(window);
     // <DARKSTAR_SOURCE_END path="backend/renderer/uip.js">
+    // RENDERER MODULE :: backend/renderer/chat-session-snapshot.js
+    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/chat-session-snapshot.js">
+(function initializeChatSessionSnapshot(root) {
+    'use strict';
+
+    var namespace = root.Darkstar = root.Darkstar || {};
+
+    function requiredFunction(options, key) {
+        if (!options || typeof options[key] !== 'function') throw new Error('Chat-session snapshot builder requires ' + key + '().');
+        return options[key];
+    }
+
+    function createBuilder(options) {
+        options = options || {};
+        var format = String(options.format || 'darkstar-chat-session');
+        var version = Number(options.version) || 1;
+        var maxProjects = Math.max(1, Number(options.maxProjects) || 50);
+        var maxTabs = Math.max(1, Number(options.maxTabs) || 500);
+        var sliceMs = Math.max(1, Number(options.sliceMs) || 8);
+        var finiteInteger = requiredFunction(options, 'finiteInteger');
+        var normalizedImage = requiredFunction(options, 'normalizedImage');
+        var normalizedMessage = requiredFunction(options, 'normalizedMessage');
+        var normalizedScheduledEntry = requiredFunction(options, 'normalizedScheduledEntry');
+        var interruptedGenerationMessage = requiredFunction(options, 'interruptedGenerationMessage');
+        var snapshotWorkspaceForProject = requiredFunction(options, 'snapshotWorkspaceForProject');
+        var prepare = requiredFunction(options, 'prepare');
+        var getState = requiredFunction(options, 'getState');
+
+        function clockNow() {
+            return root.performance && typeof root.performance.now === 'function' ? root.performance.now() : Date.now();
+        }
+
+        function yieldRendererTurn() {
+            return new Promise(function(resolve) { root.setTimeout(resolve, 0); });
+        }
+
+        async function mapItems(items, mapper) {
+            var values = Array.isArray(items) ? items : [];
+            var output = [];
+            var sliceStartedAt = clockNow();
+            for (var index = 0; index < values.length; index += 1) {
+                var mapped = mapper(values[index], index);
+                if (mapped !== null && mapped !== undefined) output.push(mapped);
+                if (clockNow() - sliceStartedAt >= sliceMs && index + 1 < values.length) {
+                    await yieldRendererTurn();
+                    sliceStartedAt = clockNow();
+                }
+            }
+            return output;
+        }
+
+        function snapshotTabBase(tab, history, scheduled) {
+            return {
+                id: finiteInteger(tab.id, 0, 0),
+                projectId: finiteInteger(tab.projectId, 0, 0),
+                title: String(tab.title || ('Chat ' + (Number(tab.id) + 1))),
+                history: history,
+                tokens: finiteInteger(tab.tokens, 0, 0),
+                tokensExact: tab.tokensExact === true,
+                tokensPerSecond: 0,
+                scheduled: scheduled,
+                conversationNameState: tab.conversationNameState === 'complete' ? 'complete' : 'idle',
+                userScrolledUp: tab.userScrolledUp === true,
+                welcomeQuote: String(tab.welcomeQuote || ''),
+                composerDraft: {
+                    text: String((tab.composerDraft && tab.composerDraft.text) || ''),
+                    image: normalizedImage(tab.composerDraft && tab.composerDraft.image)
+                }
+            };
+        }
+
+        function mergeInterrupted(tab, history) {
+            var interrupted = interruptedGenerationMessage(tab);
+            if (!interrupted) return history;
+            var interruptedIndex = history.findIndex(function(message) { return message && message.id === interrupted.id; });
+            if (interruptedIndex >= 0) history[interruptedIndex] = interrupted;
+            else history.push(interrupted);
+            return history;
+        }
+
+        function snapshotTab(tab) {
+            var history = mergeInterrupted(tab, Array.isArray(tab.history) ? tab.history.map(normalizedMessage).filter(Boolean) : []);
+            var scheduled = Array.isArray(tab.scheduled)
+                ? tab.scheduled.map(function(entry, index) { return normalizedScheduledEntry(entry, Number(tab.id), index + 1); }).filter(Boolean)
+                : [];
+            return snapshotTabBase(tab, history, scheduled);
+        }
+
+        async function snapshotTabAsync(tab) {
+            var history = mergeInterrupted(tab, await mapItems(Array.isArray(tab.history) ? tab.history : [], normalizedMessage));
+            var scheduled = await mapItems(Array.isArray(tab.scheduled) ? tab.scheduled : [], function(entry, index) {
+                return normalizedScheduledEntry(entry, Number(tab.id), index + 1);
+            });
+            return snapshotTabBase(tab, history, scheduled);
+        }
+
+        function snapshotProject(project) {
+            return {
+                id: finiteInteger(project.id, 0, 0),
+                title: String(project.title || ('Project ' + (Number(project.id) + 1))),
+                activeTabId: finiteInteger(project.activeTabId, 0, 0),
+                workspace: snapshotWorkspaceForProject(project.id)
+            };
+        }
+
+        function envelope(state, projectSnapshots, tabSnapshots) {
+            return {
+                format: format,
+                version: version,
+                savedAt: new Date().toISOString(),
+                activeProjectId: Number(state.activeProjectId || 0),
+                nextProjectId: Number(state.nextProjectId || 1),
+                activeTabId: Number(state.activeTabId || 0),
+                nextTabId: Number(state.nextTabId || 1),
+                scheduledMessageSequence: Number(state.scheduledMessageSequence || 0),
+                messageIdentitySequence: Number(state.messageIdentitySequence || 0),
+                workspaceSidebarCollapsed: state.workspaceSidebarCollapsed === true,
+                composer: state.composer || null,
+                projects: projectSnapshots,
+                tabs: tabSnapshots
+            };
+        }
+
+        function sourceState() {
+            var state = getState() || {};
+            state.projects = Array.isArray(state.projects) ? state.projects.slice(0, maxProjects) : [];
+            state.tabs = Array.isArray(state.tabs)
+                ? state.tabs.filter(function(tab) { return tab && tab._closing !== true; }).slice(0, maxTabs)
+                : [];
+            return state;
+        }
+
+        function createSync() {
+            prepare();
+            var state = sourceState();
+            return envelope(state, state.projects.map(snapshotProject), state.tabs.map(snapshotTab));
+        }
+
+        async function createAsync() {
+            prepare();
+            var state = sourceState();
+            var projectSnapshots = await mapItems(state.projects, snapshotProject);
+            var tabSnapshots = [];
+            var sliceStartedAt = clockNow();
+            for (var index = 0; index < state.tabs.length; index += 1) {
+                tabSnapshots.push(await snapshotTabAsync(state.tabs[index]));
+                if (clockNow() - sliceStartedAt >= sliceMs && index + 1 < state.tabs.length) {
+                    await yieldRendererTurn();
+                    sliceStartedAt = clockNow();
+                }
+            }
+            return envelope(state, projectSnapshots, tabSnapshots);
+        }
+
+        return Object.freeze({ createAsync: createAsync, createSync: createSync });
+    }
+
+    namespace.chatSessionSnapshot = Object.freeze({ createBuilder: createBuilder });
+})(globalThis);
+// <DARKSTAR_SOURCE_END path="backend/renderer/chat-session-snapshot.js">
     // RENDERER MODULE :: backend/renderer/chat-session.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/chat-session.js">
 // === CHAT-SESSION.JS ===
-// Separate, opt-in persistence for chat tabs. This does not read or write the
-// workflow autosave file and does not alter node-workflow autosave behavior.
+// Project-owned persistence for chat tabs. Each project carries its own chat
+// session under its reserved .darkstar metadata directory; workflow autosave
+// remains an independent persistence system.
 (function initializeChatSessionPersistence(root) {
     'use strict';
     var CHAT_AUTOSAVE_KEY = 'darkstar.chat.autosave.enabled';
@@ -11636,7 +13264,7 @@ async function initializeAgentAttention() {
     var restoredComposerState = null;
     function readStoredAutosaveSetting() {
         try {
-            if (!root.localStorage) return false;
+            if (!root.localStorage) return true;
             var stored = root.localStorage.getItem(CHAT_AUTOSAVE_KEY);
             if (stored === null) {
                 stored = root.localStorage.getItem(LEGACY_CHAT_AUTOSAVE_KEY);
@@ -11645,9 +13273,11 @@ async function initializeAgentAttention() {
                     root.localStorage.removeItem(LEGACY_CHAT_AUTOSAVE_KEY);
                 }
             }
-            return stored === 'true';
+            // A missing renderer-local preference must never disable project chat
+            // durability merely because the application moved to a new file:// URL.
+            return stored === null ? true : stored === 'true';
         } catch (_error) {
-            return false;
+            return true;
         }
     }
     function writeStoredAutosaveSetting(enabled) {
@@ -11675,20 +13305,37 @@ async function initializeAgentAttention() {
         if (Number.isFinite(maximum)) number = Math.min(maximum, number);
         return number;
     }
-
+    function normalizedPersistentImageEdit(edit) {
+        if (!edit || typeof edit !== 'object' || Number(edit.version) !== 1) return null;
+        var mode = String(edit.mode || '').trim().toLowerCase();
+        var sourceBase64 = String(edit.sourceBase64 || '').trim();
+        var sourceWidth = Math.floor(Number(edit.sourceWidth)), sourceHeight = Math.floor(Number(edit.sourceHeight));
+        var region = edit.region && typeof edit.region === 'object' ? {
+            x: Math.floor(Number(edit.region.x)), y: Math.floor(Number(edit.region.y)), width: Math.floor(Number(edit.region.width)), height: Math.floor(Number(edit.region.height))
+        } : null;
+        if ((mode !== 'selection' && mode !== 'brush') || !sourceBase64 || !region
+            || ![sourceWidth, sourceHeight, region.x, region.y, region.width, region.height].every(Number.isFinite)
+            || sourceWidth < 1 || sourceHeight < 1 || region.x < 0 || region.y < 0 || region.width < 1 || region.height < 1
+            || region.x + region.width > sourceWidth || region.y + region.height > sourceHeight || (mode === 'brush' && region.width !== region.height)) return null;
+        return { version: 1, mode: mode, sourceBase64: sourceBase64, sourceWidth: sourceWidth, sourceHeight: sourceHeight, region: region };
+    }
     function normalizedImage(image) {
         if (!image || typeof image !== 'object') return null;
         var normalizedSource = root.Darkstar.imageData.normalizeSource(image, 'image/png');
         if (!normalizedSource) return null;
+        var edit = normalizedPersistentImageEdit(image.edit);
+        // Persist one canonical image payload. data: URLs are derived presentation
+        // values and duplicate the complete base64 string, so keeping both in every
+        // chat checkpoint doubles IPC/clone/serialization pressure for no durability
+        // benefit. Darkstar.imageData.safeDataUrl() reconstructs the URL on demand.
         return {
             base64: normalizedSource.base64,
-            dataUrl: normalizedSource.dataUrl,
             name: String(image.name || 'image.png'),
             mimeType: normalizedSource.mimeType,
-            size: Number.isFinite(Number(image.size)) && Number(image.size) >= 0 ? Number(image.size) : 0
+            size: Number.isFinite(Number(image.size)) && Number(image.size) >= 0 ? Number(image.size) : 0,
+            ...(edit ? { edit: edit } : {})
         };
     }
-
     function normalizedMessage(message) {
         if (!message || typeof message !== 'object' || Array.isArray(message)) return null;
         var cloned = clonePersistentValue(message);
@@ -11700,7 +13347,6 @@ async function initializeAgentAttention() {
         if (typeof ensureMessageIdentity === 'function') ensureMessageIdentity(cloned);
         return cloned;
     }
-
     function interruptedAssistantHasContinuationMaterial(message) {
         if (!message || (message.role !== 'assistant' && message.adversary !== true) || message.interruptionBoundary === true) return false;
         if (String(message.content || '').length || String(message.reasoning || '').length) return true;
@@ -11708,7 +13354,6 @@ async function initializeAgentAttention() {
             || (Array.isArray(message.toolContext) && message.toolContext.length > 0)
             || (Array.isArray(message.agentTimeline) && message.agentTimeline.length > 0);
     }
-
     function normalizedScheduledEntry(entry, tabId, fallbackOrder) {
         var source = entry && typeof entry === 'object' ? entry : { text: entry };
         var text = String(source.text || '');
@@ -11723,7 +13368,6 @@ async function initializeAgentAttention() {
             tabId: tabId
         };
     }
-
     function snapshotWorkspaceForProject(projectId) {
         if (typeof workspaceExplorerStates === 'undefined' || !workspaceExplorerStates || typeof workspaceExplorerStates.get !== 'function') return null;
         var state = workspaceExplorerStates.get(Number(projectId));
@@ -11734,7 +13378,6 @@ async function initializeAgentAttention() {
             selectedPath: state.selectedPath === null || state.selectedPath === undefined ? null : String(state.selectedPath)
         };
     }
-
     function interruptedGenerationMessage(tab) {
         var session = typeof generationSessionForTab === 'function'
             ? generationSessionForTab(tab.id)
@@ -11743,7 +13386,7 @@ async function initializeAgentAttention() {
         var responseText = String(session.responseText || '');
         var timeline = Array.isArray(session.agentTimeline) ? clonePersistentValue(session.agentTimeline) : [];
         var working = Array.isArray(session.working) ? clonePersistentValue(session.working) : [];
-        var toolContext = Array.isArray(session.toolContext) ? clonePersistentValue(session.toolContext) : [];
+        var toolContext = Array.isArray(session.toolContext) ? clonePersistentValue(session.toolContext) : []; var presentedImageIds = Array.isArray(session.presentedImageIds) ? session.presentedImageIds.map(String) : [];
         var continuationMessageId = String(session.continuationMessageId || '');
         if (continuationMessageId && Array.isArray(tab.history)) {
             var continuationIndex = tab.history.findIndex(function(message) {
@@ -11755,7 +13398,7 @@ async function initializeAgentAttention() {
                 continued.content = responseText || String(continued.content || '');
                 if (timeline && timeline.length) continued.agentTimeline = timeline;
                 if (working && working.length) continued.working = working;
-                if (toolContext && toolContext.length) continued.toolContext = toolContext;
+                if (toolContext && toolContext.length) continued.toolContext = toolContext; if (presentedImageIds.length) continued.presentedImageIds = Array.from(new Set((Array.isArray(continued.presentedImageIds) ? continued.presentedImageIds : []).concat(presentedImageIds)));
                 if (typeof enforceAtomicToolState === 'function') enforceAtomicToolState(continued);
                 continued.interrupted = true;
                 continued.continuable = interruptedAssistantHasContinuationMaterial(continued);
@@ -11777,7 +13420,7 @@ async function initializeAgentAttention() {
         if (typeof enforceAtomicToolState === 'function') enforceAtomicToolState(atomicState);
         timeline = atomicState.agentTimeline || []; working = atomicState.working || []; toolContext = atomicState.toolContext || [];
         var reasoning = typeof interruptedReasoningText === 'function' ? interruptedReasoningText(timeline || []) : '';
-        var hasContent = Boolean(responseText || reasoning || timeline.length || working.length || toolContext.length);
+        var hasContent = Boolean(responseText || reasoning || timeline.length || working.length || toolContext.length || presentedImageIds.length);
         if (!hasContent) return null;
         var message = {
             id: 'restart-interrupted-' + String(session.id || Date.now()),
@@ -11786,7 +13429,7 @@ async function initializeAgentAttention() {
             reasoning: reasoning,
             working: working || [],
             toolContext: toolContext || [],
-            agentTimeline: timeline || [],
+            agentTimeline: timeline || [], presentedImageIds: presentedImageIds,
             interrupted: true,
             continuable: true,
             ...(typeof continuationModeAfterGeneration === 'function'
@@ -11809,44 +13452,6 @@ async function initializeAgentAttention() {
         }
         return normalizedMessage(message);
     }
-
-    function snapshotTab(tab) {
-        var history = Array.isArray(tab.history) ? tab.history.map(normalizedMessage).filter(Boolean) : [];
-        var interrupted = interruptedGenerationMessage(tab);
-        if (interrupted) {
-            var interruptedIndex = history.findIndex(function(message) { return message && message.id === interrupted.id; });
-            if (interruptedIndex >= 0) history[interruptedIndex] = interrupted;
-            else history.push(interrupted);
-        }
-        var scheduled = Array.isArray(tab.scheduled)
-            ? tab.scheduled.map(function(entry, index) {
-                return normalizedScheduledEntry(entry, Number(tab.id), index + 1);
-            }).filter(Boolean)
-            : [];
-        return {
-            id: finiteInteger(tab.id, 0, 0),
-            projectId: finiteInteger(tab.projectId, 0, 0),
-            title: String(tab.title || ('Chat ' + (Number(tab.id) + 1))),
-            history: history,
-            tokens: finiteInteger(tab.tokens, 0, 0),
-            tokensExact: tab.tokensExact === true,
-            tokensPerSecond: 0,
-            scheduled: scheduled,
-            conversationNameState: tab.conversationNameState === 'complete' ? 'complete' : 'idle',
-            userScrolledUp: tab.userScrolledUp === true,
-            welcomeQuote: String(tab.welcomeQuote || '')
-        };
-    }
-
-    function snapshotProject(project) {
-        return {
-            id: finiteInteger(project.id, 0, 0),
-            title: String(project.title || ('Project ' + (Number(project.id) + 1))),
-            activeTabId: finiteInteger(project.activeTabId, 0, 0),
-            workspace: snapshotWorkspaceForProject(project.id)
-        };
-    }
-
     function currentComposerSnapshot() {
         var input = document.getElementById('messageInput');
         return {
@@ -11855,34 +13460,42 @@ async function initializeAgentAttention() {
             image: normalizedImage(typeof pendingImage !== 'undefined' ? pendingImage : null)
         };
     }
-
-    function createChatSessionSnapshot() {
-        if (typeof saveActiveTabScrollState === 'function') saveActiveTabScrollState();
-        var sidebar = document.getElementById('workspaceSidebar');
-        return {
-            format: CHAT_SESSION_FORMAT,
-            version: CHAT_SESSION_VERSION,
-            savedAt: new Date().toISOString(),
-            activeProjectId: typeof activeProjectId === 'undefined' ? 0 : Number(activeProjectId),
-            nextProjectId: typeof nextProjectId === 'undefined' ? 1 : Number(nextProjectId),
-            activeTabId: typeof activeTabId === 'undefined' ? 0 : Number(activeTabId),
-            nextTabId: typeof nextTabId === 'undefined' ? 1 : Number(nextTabId),
-            scheduledMessageSequence: typeof scheduledMessageSequence === 'undefined' ? 0 : Number(scheduledMessageSequence),
-            messageIdentitySequence: typeof messageIdentitySequence === 'undefined' ? 0 : Number(messageIdentitySequence),
-            workspaceSidebarCollapsed: Boolean(sidebar && sidebar.classList.contains('collapsed')),
-            composer: currentComposerSnapshot(),
-            projects: Array.isArray(projects)
-                ? projects.slice(0, MAX_RESTORED_PROJECTS).map(snapshotProject)
-                : [],
-            tabs: Array.isArray(tabs)
-                ? tabs.filter(function(tab) { return tab && tab._closing !== true; }).slice(0, MAX_RESTORED_TABS).map(snapshotTab)
-                : []
-        };
-    }
-
+    var snapshotBuilder = root.Darkstar.chatSessionSnapshot.createBuilder({
+        format: CHAT_SESSION_FORMAT,
+        version: CHAT_SESSION_VERSION,
+        maxProjects: MAX_RESTORED_PROJECTS,
+        maxTabs: MAX_RESTORED_TABS,
+        sliceMs: 8,
+        finiteInteger: finiteInteger,
+        normalizedImage: normalizedImage,
+        normalizedMessage: normalizedMessage,
+        normalizedScheduledEntry: normalizedScheduledEntry,
+        interruptedGenerationMessage: interruptedGenerationMessage,
+        snapshotWorkspaceForProject: snapshotWorkspaceForProject,
+        prepare: function() {
+            if (typeof saveActiveTabScrollState === 'function') saveActiveTabScrollState();
+            if (typeof captureActiveComposerDraft === 'function') captureActiveComposerDraft();
+        },
+        getState: function() {
+            var sidebar = document.getElementById('workspaceSidebar');
+            return {
+                activeProjectId: typeof activeProjectId === 'undefined' ? 0 : Number(activeProjectId),
+                nextProjectId: typeof nextProjectId === 'undefined' ? 1 : Number(nextProjectId),
+                activeTabId: typeof activeTabId === 'undefined' ? 0 : Number(activeTabId),
+                nextTabId: typeof nextTabId === 'undefined' ? 1 : Number(nextTabId),
+                scheduledMessageSequence: typeof scheduledMessageSequence === 'undefined' ? 0 : Number(scheduledMessageSequence),
+                messageIdentitySequence: typeof messageIdentitySequence === 'undefined' ? 0 : Number(messageIdentitySequence),
+                workspaceSidebarCollapsed: Boolean(sidebar && sidebar.classList.contains('collapsed')),
+                composer: currentComposerSnapshot(),
+                projects: typeof projects !== 'undefined' ? projects : [],
+                tabs: typeof tabs !== 'undefined' ? tabs : []
+            };
+        }
+    });
+    function createChatSessionSnapshot() { return snapshotBuilder.createSync(); }
+    function createChatSessionSnapshotAsync() { return snapshotBuilder.createAsync(); }
     function normalizeRestoredHistory(rawHistory) { var seen = new Set();
         return (Array.isArray(rawHistory) ? rawHistory : []).map(normalizedMessage).filter(Boolean).map(function(message) { var id = String(message.id || ''); while (!id || seen.has(id)) { delete message.id; ensureMessageIdentity(message); id = String(message.id || ''); } seen.add(id); return message; }); }
-
     function normalizeRestoredTab(rawTab, usedIds, fallbackId, fallbackProjectId) {
         if (!rawTab || typeof rawTab !== 'object' || Array.isArray(rawTab)) return null;
         var id = finiteInteger(rawTab.id, fallbackId, 0);
@@ -11902,11 +13515,10 @@ async function initializeAgentAttention() {
             scheduled: scheduled,
             conversationNameState: rawTab.conversationNameState === 'complete' ? 'complete' : 'idle',
             userScrolledUp: rawTab.userScrolledUp === true,
-            welcomeQuote: String(rawTab.welcomeQuote || ''),
+            welcomeQuote: String(rawTab.welcomeQuote || ''), composerDraft: { text: String(rawTab.composerDraft && rawTab.composerDraft.text || ''), image: normalizedImage(rawTab.composerDraft && rawTab.composerDraft.image) },
             _restoredWorkspace: rawTab.workspace && typeof rawTab.workspace === 'object' ? clonePersistentValue(rawTab.workspace) : null
         };
     }
-
     function normalizeRestoredProject(rawProject, usedIds, fallbackId) {
         if (!rawProject || typeof rawProject !== 'object' || Array.isArray(rawProject)) return null;
         var id = finiteInteger(rawProject.id, fallbackId, 0);
@@ -11919,12 +13531,10 @@ async function initializeAgentAttention() {
             _restoredWorkspace: rawProject.workspace && typeof rawProject.workspace === 'object' ? clonePersistentValue(rawProject.workspace) : null
         };
     }
-
     function workspaceNameFromPath(rootPath, fallback) {
         var parts = String(rootPath || '').split(/[\\/]+/u).filter(Boolean);
         return parts.length ? parts[parts.length - 1] : fallback;
     }
-
     function migrateLegacyTabsToProjects(restoredTabs, requestedActiveTabId) {
         var groups = [];
         var byWorkspace = Object.create(null);
@@ -11947,7 +13557,6 @@ async function initializeAgentAttention() {
                 group.workspace = saved;
             }
         });
-
         var usedTitles = Object.create(null);
         var migratedProjects = groups.map(function(group, index) {
             var baseTitle = group.rootPath ? workspaceNameFromPath(group.rootPath, 'Project ' + (index + 1)) : 'Project ' + (index + 1);
@@ -11969,7 +13578,6 @@ async function initializeAgentAttention() {
         });
         return migratedProjects;
     }
-
     function applyWorkspaceSidebarState(collapsed) {
         var sidebar = document.getElementById('workspaceSidebar');
         var main = document.querySelector('.main-content');
@@ -11979,7 +13587,6 @@ async function initializeAgentAttention() {
         if (main) main.classList.toggle('sidebar-collapsed', collapsed === true);
         if (tabBar) tabBar.style.left = collapsed === true ? '28px' : (typeof currentWorkspaceSidebarWidth === 'function' ? currentWorkspaceSidebarWidth() : 280) + 'px';
     }
-
     async function restoreSavedWorkspaces(restoredProjects) {
         var bridge = root.darkstar && root.darkstar.workspace ? root.darkstar.workspace : null;
         if (!bridge || typeof bridge.restoreFolder !== 'function' || typeof workspaceStateForProject !== 'function') return;
@@ -12009,7 +13616,6 @@ async function initializeAgentAttention() {
             }
         }
     }
-
     function restoreChatSessionSnapshot(snapshot) {
         var version = Number(snapshot && snapshot.version);
         if (!snapshot || (snapshot.format !== CHAT_SESSION_FORMAT && snapshot.format !== LEGACY_CHAT_SESSION_FORMAT) || (version !== CHAT_SESSION_VERSION && version !== LEGACY_CHAT_SESSION_VERSION) || !Array.isArray(snapshot.tabs)) {
@@ -12020,7 +13626,6 @@ async function initializeAgentAttention() {
             return normalizeRestoredTab(tab, usedIds, index, 0);
         }).filter(Boolean);
         if (!restoredTabs.length) return { restored: false, tabs: [] };
-
         var requestedActiveId = finiteInteger(snapshot.activeTabId, restoredTabs[0].id, 0);
         var restoredProjects;
         if (version === LEGACY_CHAT_SESSION_VERSION) {
@@ -12077,9 +13682,9 @@ async function initializeAgentAttention() {
         );
         messageIdentitySequence = Math.max(messageIdentitySequence || 0, finiteInteger(snapshot.messageIdentitySequence, 0, 0));
         userScrolledUp = Boolean(getActiveTab() && getActiveTab().userScrolledUp === true);
-        restoredComposerState = snapshot.composer && Number(snapshot.composer.tabId) === activeTabId
-            ? { text: String(snapshot.composer.text || ''), image: normalizedImage(snapshot.composer.image) }
-            : null;
+        var restoredActiveTab = getActiveTab(), legacyActiveComposer = snapshot.composer && Number(snapshot.composer.tabId) === activeTabId ? { text: String(snapshot.composer.text || ''), image: normalizedImage(snapshot.composer.image) } : null;
+        if (restoredActiveTab) { restoredActiveTab.composerDraft = legacyActiveComposer || restoredActiveTab.composerDraft || { text: '', image: null }; restoredComposerState = { text: String(restoredActiveTab.composerDraft.text || ''), image: normalizedImage(restoredActiveTab.composerDraft.image) }; }
+        else restoredComposerState = legacyActiveComposer;
         applyWorkspaceSidebarState(snapshot.workspaceSidebarCollapsed === true);
         return { restored: true, tabs: restoredTabs, projects: restoredProjects };
     }
@@ -12164,7 +13769,7 @@ async function initializeAgentAttention() {
 
                 var revisionToSave = chatSessionRevision;
                 var snapshot;
-                try { snapshot = createChatSessionSnapshot(); }
+                try { snapshot = await createChatSessionSnapshotAsync(); }
                 catch (_error) { return false; }
 
                 try {
@@ -12216,13 +13821,9 @@ async function initializeAgentAttention() {
     async function restoreChatSession() {
         syncChatAutosaveControl();
         var bridge = chatSessionBridge();
-        if (!chatAutosaveEnabled) {
-            chatSessionReady = true;
-            savedChatSessionRevision = chatSessionRevision;
-            if (bridge && typeof bridge.clear === 'function') Darkstar.async.runBestEffort(function() { return bridge.clear(); }, 'CHAT_SESSION');
-            startChatSessionHeartbeat();
-            return false;
-        }
+        // Autosave controls future writes only. Persisted project chats are always
+        // eligible for restoration and are never destroyed because a preference is
+        // missing, disabled, or scoped to a different renderer file:// origin.
         if (!bridge || typeof bridge.load !== 'function') {
             chatSessionReady = true;
             savedChatSessionRevision = chatSessionRevision;
@@ -12260,8 +13861,8 @@ async function initializeAgentAttention() {
         button.setAttribute('aria-pressed', chatAutosaveEnabled ? 'true' : 'false');
         button.setAttribute('aria-label', 'Autosave Chats: ' + (chatAutosaveEnabled ? 'On' : 'Off'));
         button.setAttribute('title', chatAutosaveEnabled
-            ? 'Autosave Chats: On · Click to stop saving open chat tabs'
-            : 'Autosave Chats: Off · Click to save and restore open chat tabs');
+            ? 'Autosave Chats: On · Click to stop saving new chat changes'
+            : 'Autosave Chats: Off · Existing saved project chats are preserved · Click to resume saving');
     }
 
     async function setChatAutosaveEnabled(enabled) {
@@ -12272,12 +13873,10 @@ async function initializeAgentAttention() {
         syncChatAutosaveControl();
         root.clearTimeout(chatSessionSaveTimer);
         chatSessionSaveTimer = null;
-        var bridge = chatSessionBridge();
         if (!next) {
             if (chatSessionSaveInFlight) await Darkstar.async.runBestEffort(chatSessionSaveInFlight, 'CHAT_SESSION');
-            if (bridge && typeof bridge.clear === 'function') await Darkstar.async.runBestEffort(function() { return bridge.clear(); }, 'CHAT_SESSION');
             savedChatSessionRevision = chatSessionRevision;
-            if (typeof showNodeEditorToast === 'function') showNodeEditorToast('Chat autosave disabled and saved chat session cleared', 'info', 3200);
+            if (typeof showNodeEditorToast === 'function') showNodeEditorToast('Chat autosave disabled · Existing saved project chats preserved', 'info', 3200);
             return false;
         }
         chatSessionRevision += 1;
@@ -12298,6 +13897,7 @@ async function initializeAgentAttention() {
     }
 
     root.createChatSessionSnapshot = createChatSessionSnapshot;
+    root.createChatSessionSnapshotAsync = createChatSessionSnapshotAsync;
     root.restoreChatSessionSnapshot = restoreChatSessionSnapshot;
     root.restoreChatSession = restoreChatSession;
     root.applyRestoredChatComposer = applyRestoredChatComposer;
@@ -12310,7 +13910,7 @@ async function initializeAgentAttention() {
     root.syncChatAutosaveControl = syncChatAutosaveControl;
     root.setTimeout(syncChatAutosaveControl, 0);
 })(globalThis);
-    // <DARKSTAR_SOURCE_END path="backend/renderer/chat-session.js">
+// <DARKSTAR_SOURCE_END path="backend/renderer/chat-session.js">
     // RENDERER MODULE :: backend/renderer/offline-browser.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/offline-browser.js">
 (function initializeOfflineBrowser(root) {
@@ -12324,6 +13924,7 @@ async function initializeAgentAttention() {
     var MIN_READABLE_CHAT_WIDTH = 480;
     var SNAP_DISTANCE = 24;
     var UNSNAP_DISTANCE = 8;
+    var RESIZE_COLLAPSE_GRACE = 160;
     var state = {
         open: false,
         mode: 'offline',
@@ -12348,7 +13949,8 @@ async function initializeAgentAttention() {
         overlayBlockApplied: false,
         overlayBlockSerial: Promise.resolve(),
         activeBrowserId: '0',
-        openByBrowser: Object.create(null)
+        openByBrowser: Object.create(null),
+        visibilityRequestSerial: 0
     };
 
     function bridge() {
@@ -12376,12 +13978,9 @@ async function initializeAgentAttention() {
         state.open = Boolean(open);
         document.body.classList.toggle('offline-browser-open', state.open);
         var sidebar = document.getElementById('offlineBrowserSidebar');
-        var toggle = document.getElementById('offlineBrowserToggle');
+
         if (sidebar) sidebar.setAttribute('aria-hidden', state.open ? 'false' : 'true');
-        if (toggle) {
-            toggle.setAttribute('aria-pressed', state.open ? 'true' : 'false');
-            if (state.open) toggle.classList.remove('has-unseen-update');
-        }
+
         if (state.open) {
             scheduleBoundsUpdate();
             scheduleSettledBoundsUpdate();
@@ -12520,14 +14119,6 @@ async function initializeAgentAttention() {
         image.classList.add('ready');
     }
 
-    function footerText(next) {
-        if (next.error) return next.error;
-        if (next.loading) return isOnline() ? 'Loading page…' : 'Rendering local page…';
-        if (isOnline() && (next.url || next.path)) return 'Online page';
-        if (next.path) return 'Workspace page';
-        return 'Browser · no page loaded';
-    }
-
     function applyStatus(next) {
         if (!next || typeof next !== 'object') return;
         var currentBrowserId = activeBrowserId();
@@ -12537,39 +14128,23 @@ async function initializeAgentAttention() {
         if (typeof next.overlayBlocked === 'boolean') state.overlayBlockApplied = next.overlayBlocked;
         if (typeof next.visible === 'boolean' && next.visible !== state.open) applyOpenState(next.visible);
         state.status = Object.assign({}, state.status, next);
-        var notificationToggle = document.getElementById('offlineBrowserToggle');
-        if (notificationToggle) {
-            notificationToggle.classList.toggle('has-unseen-update', Boolean(state.status.attentionRequired) && !state.open);
-            notificationToggle.setAttribute('aria-label', Boolean(state.status.attentionRequired) && !state.open
-                ? 'Open Browser — new update available'
-                : 'Toggle Browser');
-        }
         var sidebar = document.getElementById('offlineBrowserSidebar');
         var address = document.getElementById('offlineBrowserAddress');
-        var title = document.getElementById('offlineBrowserTitle');
-        var footer = document.getElementById('offlineBrowserStatus');
         var back = document.getElementById('offlineBrowserBack');
         var forward = document.getElementById('offlineBrowserForward');
         var reload = document.getElementById('offlineBrowserReload');
         var reset = document.getElementById('offlineBrowserReset');
         var badge = document.getElementById('offlineBrowserModeBadge');
-        var network = document.getElementById('offlineBrowserNetworkState');
         var frame = document.getElementById('offlineBrowserOnlineFrame');
         var locationValue = next.url || next.path;
         if (address && document.activeElement !== address) {
             if (locationValue) address.value = locationValue;
             else if (isOnline() && Object.prototype.hasOwnProperty.call(next, 'url')) address.value = '';
         }
-        if (title) title.textContent = next.title || 'Browser';
-        if (footer) {
-            footer.textContent = footerText(next);
-            footer.classList.toggle('error', Boolean(next.error));
-        }
         if (badge) {
             badge.textContent = isOnline() ? 'ONLINE' : 'LOCAL';
             badge.title = isOnline() ? 'Online page' : 'Workspace file';
         }
-        if (network) network.textContent = isOnline() ? 'Online' : 'Workspace file';
         if (back) back.disabled = !next.canGoBack;
         if (forward) forward.disabled = !next.canGoForward;
         if (reload) reload.classList.toggle('loading', Boolean(next.loading));
@@ -12692,21 +14267,24 @@ async function initializeAgentAttention() {
         scheduleSettledBoundsUpdate();
     }
 
-    async function setOpen(value) {
+    async function setOpen(value, options) {
         var browserId = activeBrowserId();
-        state.openByBrowser[browserId] = Boolean(value);
-        applyOpenState(Boolean(value));
+        var nextOpen = Boolean(value);
+        var requestSerial = ++state.visibilityRequestSerial;
+        var focusAddress = !options || options.focusAddress !== false;
+        state.openByBrowser[browserId] = nextOpen;
+        applyOpenState(nextOpen);
         var api = bridge();
         if (api && typeof api.setVisible === 'function') {
             try {
-                var response = await api.setVisible(Boolean(value), browserId);
-                if (browserId === activeBrowserId() && response && response.status) applyStatus(response.status);
+                var response = await api.setVisible(nextOpen, browserId);
+                if (requestSerial === state.visibilityRequestSerial && browserId === activeBrowserId() && response && response.status) applyStatus(response.status);
             } catch (_error) { /* The footer reports bridge errors on use. */ }
         }
-        if (browserId === activeBrowserId() && state.open) {
+        if (requestSerial === state.visibilityRequestSerial && browserId === activeBrowserId() && state.open) {
             scheduleBoundsUpdate();
             scheduleSettledBoundsUpdate();
-            document.getElementById('offlineBrowserAddress')?.focus();
+            if (focusAddress) document.getElementById('offlineBrowserAddress')?.focus();
         }
         return Boolean(state.openByBrowser[browserId]);
     }
@@ -12756,7 +14334,7 @@ async function initializeAgentAttention() {
         var api = bridge();
         var browserId = activeBrowserId();
         if (!api || typeof api[action] !== 'function') {
-            applyStatus({ browserId: browserId, error: 'Browser is unavailable in this build.', loading: false });
+            applyStatus({ browserId: browserId, error: 'Browser Workspace is unavailable in this build.', loading: false });
             return null;
         }
         try {
@@ -12883,18 +14461,33 @@ async function initializeAgentAttention() {
         event.preventDefault();
         var handle = event.currentTarget;
         var pointerId = event.pointerId;
+        var startedOpen = state.open;
+        var phase = startedOpen ? 'open' : 'collapsed';
+        var minimum = minimumWidth();
+        var transitionTimer = null;
+        var preserveInitialSnap = startedOpen && state.snapped;
+        var releasedFromInitialSnap = false;
         state.resizing = true;
         document.body.classList.add('offline-browser-resizing');
-        var startX = event.clientX;
-        var startWidth = document.getElementById('offlineBrowserSidebar')?.getBoundingClientRect().width || savedWidth();
-        var startedSnapped = state.snapped;
-        var releasedFromInitialSnap = false;
-        function move(moveEvent) {
-            if (!state.resizing || moveEvent.pointerId !== pointerId) return;
-            var requestedWidth = startWidth + (startX - moveEvent.clientX);
+        function minimumEdgeX() {
+            return viewportWidth() - minimum;
+        }
+        // clientX and viewport width share CSS-pixel coordinates, including under display scaling.
+        function pointerWidth(pointerX) { return viewportWidth() - pointerX; }
+        function animatePhase(nextPhase) {
+            if (phase === nextPhase) return;
+            phase = nextPhase;
+            preserveInitialSnap = releasedFromInitialSnap = false;
+            document.body.classList.add('offline-browser-resize-transitioning');
+            if (transitionTimer !== null) root.clearTimeout(transitionTimer);
+            transitionTimer = root.setTimeout(function() { transitionTimer = null; document.body.classList.remove('offline-browser-resize-transitioning'); }, 190);
+            setWidth(minimum, false, false);
+            setOpen(phase === 'open', { focusAddress: false });
+        }
+        function applyRequestedWidth(requestedWidth) {
             var distanceFromSidebar = maximumWidth() - requestedWidth;
             var snap;
-            if (startedSnapped && !releasedFromInitialSnap) {
+            if (preserveInitialSnap && !releasedFromInitialSnap) {
                 snap = distanceFromSidebar <= UNSNAP_DISTANCE;
                 if (!snap) releasedFromInitialSnap = true;
             } else if (releasedFromInitialSnap) {
@@ -12905,6 +14498,24 @@ async function initializeAgentAttention() {
             }
             setWidth(requestedWidth, false, snap);
         }
+        function move(moveEvent) {
+            if (!state.resizing || moveEvent.pointerId !== pointerId) return;
+            var pointerX = moveEvent.clientX;
+            var minimumEdge = minimumEdgeX();
+            if (phase === 'collapsed') {
+                if (pointerX > minimumEdge) return;
+                animatePhase('open');
+                applyRequestedWidth(pointerWidth(pointerX));
+                return;
+            }
+            var requestedWidth = pointerWidth(pointerX);
+            if (requestedWidth < minimum) {
+                applyRequestedWidth(minimum);
+                if (pointerX - minimumEdge >= RESIZE_COLLAPSE_GRACE) animatePhase('collapsed');
+                return;
+            }
+            applyRequestedWidth(requestedWidth);
+        }
         function end(endEvent) {
             if (!state.resizing || endEvent.pointerId !== pointerId) return;
             state.resizing = false;
@@ -12914,6 +14525,12 @@ async function initializeAgentAttention() {
             handle.removeEventListener('pointercancel', end);
             handle.removeEventListener('lostpointercapture', end);
             try { if (handle.hasPointerCapture?.(pointerId)) handle.releasePointerCapture(pointerId); } catch (_error) {}
+            // Closed-to-closed exploratory drags preserve the normal reopen width;
+            // gestures ending open persist their final width.
+            if (phase === 'collapsed') {
+                if (startedOpen) setWidth(minimum, true, false);
+                return;
+            }
             var width = document.getElementById('offlineBrowserSidebar')?.getBoundingClientRect().width || savedWidth();
             setWidth(width, true, state.snapped);
         }
@@ -12960,9 +14577,10 @@ async function initializeAgentAttention() {
             if (!document.hidden) handleBoundsInvalidated();
         });
         document.addEventListener('keydown', function(event) {
-            if ((event.ctrlKey || event.metaKey) && event.shiftKey && String(event.key).toLowerCase() === 'b') {
+            if (String(event.key || '') === 'Tab' && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
                 event.preventDefault();
-                setOpen(!state.open);
+                if (typeof root.toggleOfflineBrowser === 'function') root.toggleOfflineBrowser();
+                else setOpen(!state.open);
             }
         });
     }
@@ -12978,12 +14596,465 @@ async function initializeAgentAttention() {
     root.offlineBrowserReload = function() { return invoke('reload'); };
     root.resetBrowser = function() { return invoke('reset'); };
     root.onOfflineBrowserAddressKeydown = onAddressKeydown;
-    root.updateOfflineBrowserBounds = scheduleBoundsUpdate;
+    root.updateOfflineBrowserBounds = scheduleBoundsUpdate; root.refreshOfflineBrowserStatus = function() { applyStatus(state.status); };
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initialize, { once: true });
     else initialize();
 })(globalThis);
     // <DARKSTAR_SOURCE_END path="backend/renderer/offline-browser.js">
+    // RENDERER MODULE :: backend/renderer/browser-workspace.js
+    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/browser-workspace.js">
+(function initializeBrowserWorkspace(root) {
+    'use strict';
+
+    var pendingOpenByTab = Object.create(null);
+
+    function tabKey(value) {
+        var numeric = Number(value);
+        return Number.isFinite(numeric) ? String(numeric) : String(value === undefined || value === null ? '0' : value);
+    }
+
+    function activeKey() {
+        return tabKey(typeof activeTabId === 'undefined' ? 0 : activeTabId);
+    }
+
+    function browserWorkspaceTool(name) {
+        var tool = String(name || '').toLowerCase();
+        return tool === 'browser_control' || tool === 'screenshot_html' || tool === 'open_side_browser';
+    }
+
+    async function openBrowserWorkspace(tabId) {
+        var key = tabKey(tabId === undefined ? activeKey() : tabId);
+        pendingOpenByTab[key] = true;
+        if (key !== activeKey()) return true;
+        delete pendingOpenByTab[key];
+        if (typeof root.toggleOfflineBrowser !== 'function') return false;
+        await root.toggleOfflineBrowser(true);
+        return true;
+    }
+
+    async function openForTool(name, tabId) {
+        if (!browserWorkspaceTool(name)) return false;
+        return openBrowserWorkspace(tabId);
+    }
+
+    function wrapBrowserOwnership() {
+        var activate = root.activateOfflineBrowserForTab;
+        if (typeof activate === 'function') root.activateOfflineBrowserForTab = async function(tabId) {
+            var result = await activate(tabId);
+            var key = tabKey(tabId);
+            if (pendingOpenByTab[key] && key === activeKey()) {
+                delete pendingOpenByTab[key];
+                if (typeof root.toggleOfflineBrowser === 'function') await root.toggleOfflineBrowser(true);
+            }
+            return result;
+        };
+
+        var release = root.releaseOfflineBrowserForTab;
+        if (typeof release === 'function') root.releaseOfflineBrowserForTab = async function(tabId) {
+            delete pendingOpenByTab[tabKey(tabId)];
+            return release(tabId);
+        };
+    }
+
+    function initialize() {
+        wrapBrowserOwnership();
+    }
+
+    root.openBrowserWorkspaceForTool = openForTool;
+    root.openBrowserWorkspace = function(tabId) { return openBrowserWorkspace(tabId === undefined ? activeKey() : tabId); };
+
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initialize, { once: true });
+    else initialize();
+})(globalThis);
+    // <DARKSTAR_SOURCE_END path="backend/renderer/browser-workspace.js">
+    // RENDERER MODULE :: backend/renderer/image-lightbox.js
+    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/image-lightbox.js">
+(function initializeImageLightbox(root) {
+    'use strict';
+
+    var TRIGGER_SELECTOR = '.image-lightbox-trigger, .message-image, .context-image-frame img, .queue-image';
+    var previousFocus = null;
+    var editorState = null;
+    var MIN_ZOOM_FACTOR = 0.10;
+    var MAX_IMAGE_SCALE = 16;
+
+    function elements() {
+        return {
+            root: document.getElementById('imageLightbox'), image: document.getElementById('imageLightboxImage'),
+            overlay: document.getElementById('imageLightboxOverlay'), wrap: document.getElementById('imageLightboxCanvasWrap'),
+            stage: document.getElementById('imageLightboxStage'),
+            close: document.getElementById('imageLightboxClose'), use: document.getElementById('imageLightboxUseEdit'),
+            reset: document.getElementById('imageLightboxReset'), undo: document.getElementById('imageLightboxUndo'),
+            select: document.getElementById('imageLightboxSelectMode'), brush: document.getElementById('imageLightboxBrushMode'),
+            view: document.getElementById('imageLightboxViewMode'), brushColor: document.getElementById('imageLightboxBrushColor'),
+            brushSize: document.getElementById('imageLightboxBrushSize'), brushSizeValue: document.getElementById('imageLightboxBrushSizeValue'),
+            status: document.getElementById('imageLightboxStatus')
+        };
+    }
+    function setBrowserOverlayBlocked(blocked) {
+        if (typeof root.setOfflineBrowserOverlayBlockReason !== 'function') return;
+        Promise.resolve(root.setOfflineBrowserOverlayBlockReason('image-lightbox', blocked === true)).catch(function() { return false; });
+    }
+    function imageSource(image) {
+        if (!image || typeof image.getAttribute !== 'function') return '';
+        return String(image.currentSrc || image.getAttribute('src') || '');
+    }
+    function imageCaption(image) {
+        if (!image) return '';
+        var explicit = image.dataset ? String(image.dataset.imageCaption || '').trim() : '';
+        if (explicit) return explicit.slice(0, 240);
+        var alt = String(image.getAttribute && image.getAttribute('alt') || image.alt || '').trim();
+        if (!alt || /^(?:attached image(?: preview)?|enlarged image|preview)$/iu.test(alt)) return '';
+        return alt.slice(0, 240);
+    }
+    function activeHistoryImage(image) {
+        if (!image || !image.dataset || image.dataset.messageIndex === undefined) return null;
+        var tab = typeof tabs !== 'undefined' && Array.isArray(tabs) ? tabs.find(function(candidate) { return candidate && Number(candidate.id) === Number(activeTabId); }) : null;
+        var messageIndex = Number(image.dataset.messageIndex), imageIndex = Number(image.dataset.imageIndex || 0);
+        var message = tab && Array.isArray(tab.history) ? tab.history[messageIndex] : null;
+        return message && Array.isArray(message.images) && message.images[imageIndex] && typeof message.images[imageIndex] === 'object' ? message.images[imageIndex] : null;
+    }
+    function sourceRecordForImage(image) {
+        if (image && image.id === 'imagePreview' && typeof pendingImage !== 'undefined' && pendingImage && typeof pendingImage === 'object') return pendingImage;
+        return activeHistoryImage(image);
+    }
+    function dataUrlFromRecord(record, fallback) {
+        if (record && record.edit && record.edit.sourceBase64 && root.Darkstar && root.Darkstar.imageData) return root.Darkstar.imageData.safeDataUrl({ base64: record.edit.sourceBase64, mimeType: 'image/png' }, 'image/png');
+        if (record && root.Darkstar && root.Darkstar.imageData) {
+            var value = root.Darkstar.imageData.safeDataUrl(record, record.mimeType || 'image/png');
+            if (value) return value;
+        }
+        return String(fallback || '');
+    }
+    function clonePoint(point) { return { x: Number(point.x), y: Number(point.y) }; }
+    function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
+    function normalizeRect(a, b, width, height) {
+        var x0 = clamp(Math.min(a.x, b.x), 0, width), y0 = clamp(Math.min(a.y, b.y), 0, height);
+        var x1 = clamp(Math.max(a.x, b.x), 0, width), y1 = clamp(Math.max(a.y, b.y), 0, height);
+        return { x: Math.floor(x0), y: Math.floor(y0), width: Math.max(1, Math.ceil(x1) - Math.floor(x0)), height: Math.max(1, Math.ceil(y1) - Math.floor(y0)) };
+    }
+    function pointerPoint(event, canvas) {
+        var rect = canvas.getBoundingClientRect();
+        if (!rect.width || !rect.height) return { x: 0, y: 0 };
+        return {
+            x: clamp((event.clientX - rect.left) * canvas.width / rect.width, 0, canvas.width),
+            y: clamp((event.clientY - rect.top) * canvas.height / rect.height, 0, canvas.height)
+        };
+    }
+    function brushBounds(strokes, width, height) {
+        if (!Array.isArray(strokes) || !strokes.length) return null;
+        var minX = width, minY = height, maxX = 0, maxY = 0, found = false;
+        strokes.forEach(function(stroke) {
+            var radius = Math.max(1, Number(stroke.size) || 1) / 2;
+            (stroke.points || []).forEach(function(point) {
+                found = true; minX = Math.min(minX, point.x - radius); minY = Math.min(minY, point.y - radius);
+                maxX = Math.max(maxX, point.x + radius); maxY = Math.max(maxY, point.y + radius);
+            });
+        });
+        if (!found) return null;
+        minX = clamp(minX, 0, width); minY = clamp(minY, 0, height); maxX = clamp(maxX, 0, width); maxY = clamp(maxY, 0, height);
+        var boxWidth = Math.max(1, maxX - minX), boxHeight = Math.max(1, maxY - minY), side = Math.ceil(Math.max(boxWidth, boxHeight));
+        if (side > Math.min(width, height)) return { impossible: true, bounds: { x: minX, y: minY, width: boxWidth, height: boxHeight } };
+        var centerX = (minX + maxX) / 2, centerY = (minY + maxY) / 2;
+        var x = Math.round(centerX - side / 2), y = Math.round(centerY - side / 2);
+        x = clamp(x, 0, width - side); y = clamp(y, 0, height - side);
+        return { x: Math.floor(x), y: Math.floor(y), width: side, height: side, impossible: false };
+    }
+    function currentRegion() {
+        if (!editorState) return null;
+        if (editorState.mode === 'selection') return editorState.selection;
+        if (editorState.mode === 'brush') {
+            var region = brushBounds(editorState.strokes, editorState.width, editorState.height);
+            return region && region.impossible !== true ? region : null;
+        }
+        return null;
+    }
+    function drawStroke(context, stroke) {
+        var points = Array.isArray(stroke.points) ? stroke.points : [];
+        if (!points.length) return;
+        context.save(); context.strokeStyle = String(stroke.color || '#ff4f24'); context.fillStyle = context.strokeStyle;
+        context.lineWidth = Math.max(1, Number(stroke.size) || 1); context.lineCap = 'round'; context.lineJoin = 'round';
+        if (points.length === 1) { context.beginPath(); context.arc(points[0].x, points[0].y, context.lineWidth / 2, 0, Math.PI * 2); context.fill(); }
+        else { context.beginPath(); context.moveTo(points[0].x, points[0].y); points.slice(1).forEach(function(point) { context.lineTo(point.x, point.y); }); context.stroke(); }
+        context.restore();
+    }
+    function redrawOverlay() {
+        var ui = elements(), canvas = ui.overlay;
+        if (!canvas || !editorState) return;
+        var context = canvas.getContext('2d'); context.clearRect(0, 0, canvas.width, canvas.height);
+        if (editorState.mode === 'selection' && editorState.selection) {
+            var r = editorState.selection;
+            context.save(); context.fillStyle = 'rgba(255, 54, 54, .38)'; context.strokeStyle = 'rgba(255, 94, 74, .98)';
+            context.lineWidth = Math.max(2, Math.round(Math.max(canvas.width, canvas.height) / 700));
+            context.fillRect(r.x, r.y, r.width, r.height); context.strokeRect(r.x + .5, r.y + .5, Math.max(0, r.width - 1), Math.max(0, r.height - 1)); context.restore();
+        } else if (editorState.mode === 'brush') {
+            editorState.strokes.forEach(function(stroke) { drawStroke(context, stroke); });
+            var regionInfo = brushBounds(editorState.strokes, editorState.width, editorState.height);
+            if (regionInfo && regionInfo.impossible !== true) {
+                context.save(); context.strokeStyle = 'rgba(255, 82, 64, .98)'; context.setLineDash([Math.max(8, canvas.width / 160), Math.max(6, canvas.width / 220)]);
+                context.lineWidth = Math.max(2, Math.round(Math.max(canvas.width, canvas.height) / 800));
+                context.strokeRect(regionInfo.x + .5, regionInfo.y + .5, Math.max(0, regionInfo.width - 1), Math.max(0, regionInfo.height - 1)); context.restore();
+            }
+        }
+        updateControls();
+    }
+    function regionLabel(region) { return region ? region.width + '×' + region.height + ' at ' + region.x + ',' + region.y : ''; }
+    function updateControls() {
+        var ui = elements(); if (!editorState) return;
+        [ui.view, ui.select, ui.brush].forEach(function(button) { if (button) button.setAttribute('aria-pressed', 'false'); });
+        var active = editorState.mode === 'selection' ? ui.select : (editorState.mode === 'brush' ? ui.brush : ui.view);
+        if (active) active.setAttribute('aria-pressed', 'true');
+        var region = currentRegion(), impossible = editorState.mode === 'brush' && brushBounds(editorState.strokes, editorState.width, editorState.height)?.impossible === true;
+        if (ui.use) ui.use.disabled = !region || impossible;
+        if (ui.undo) ui.undo.disabled = editorState.mode === 'brush' ? !editorState.strokes.length : !editorState.selection;
+        if (ui.reset) ui.reset.disabled = !editorState.selection && !editorState.strokes.length;
+        if (ui.brushColor) ui.brushColor.disabled = editorState.mode !== 'brush';
+        if (ui.brushSize) ui.brushSize.disabled = editorState.mode !== 'brush';
+        if (ui.brushSizeValue) ui.brushSizeValue.textContent = String(Math.round(Number(ui.brushSize && ui.brushSize.value || 32))) + ' px';
+        if (ui.status) {
+            ui.status.classList.toggle('error', impossible);
+            ui.status.textContent = impossible ? 'Brush marks cannot fit inside one square without leaving the image. Split this into two edits.'
+                : region ? (editorState.mode === 'brush' ? 'Inpaint square · ' : 'Editable region · ') + regionLabel(region)
+                    : editorState.mode === 'brush' ? 'Draw a color sketch. Darkstar will inpaint the smallest square that contains every stroke.'
+                        : editorState.mode === 'selection' ? 'Drag across the image to mark the only area that may change.'
+                            : 'Choose Select or Brush to create an inpainting edit.';
+        }
+        if (ui.overlay) ui.overlay.style.cursor = editorState.mode === 'brush' ? 'crosshair' : (editorState.mode === 'selection' ? 'crosshair' : 'default');
+    }
+    function fittedScale(ui) {
+        if (!ui || !ui.stage || !editorState || !editorState.width || !editorState.height) return 1;
+        var availableWidth = Math.max(80, ui.stage.clientWidth - 40), availableHeight = Math.max(80, ui.stage.clientHeight - 40);
+        return Math.min(1, availableWidth / editorState.width, availableHeight / editorState.height);
+    }
+    function applyImageScale(scale) {
+        var ui = elements(); if (!ui.wrap || !editorState || !editorState.width || !editorState.height) return;
+        editorState.scale = Math.max(0.001, Number(scale) || 1);
+        ui.wrap.style.width = Math.max(1, editorState.width * editorState.scale) + 'px';
+        ui.wrap.style.height = Math.max(1, editorState.height * editorState.scale) + 'px';
+    }
+    function fitImage(resetViewport) {
+        var ui = elements(); if (!ui.image || !ui.wrap || !ui.stage || !editorState || !editorState.width || !editorState.height) return;
+        var fit = fittedScale(ui), minimum = Math.max(0.001, fit * MIN_ZOOM_FACTOR);
+        editorState.fitScale = fit;
+        if (resetViewport === true || !editorState.zoomTouched || !editorState.scale) {
+            editorState.zoomTouched = false;
+            applyImageScale(fit);
+            ui.stage.scrollLeft = 0; ui.stage.scrollTop = 0;
+            return;
+        }
+        applyImageScale(clamp(editorState.scale, minimum, MAX_IMAGE_SCALE));
+    }
+    function normalizedWheelDelta(event, stage) {
+        var multiplier = event.deltaMode === 1 ? 16 : (event.deltaMode === 2 ? Math.max(1, stage.clientHeight) : 1);
+        return Number(event.deltaY || 0) * multiplier;
+    }
+    function onStageWheel(event) {
+        var ui = elements(); if (!editorState || !ui.stage || !ui.wrap || !editorState.width || !editorState.height) return;
+        var delta = normalizedWheelDelta(event, ui.stage); if (!delta) return;
+        event.preventDefault();
+        var oldRect = ui.wrap.getBoundingClientRect(); if (!oldRect.width || !oldRect.height) return;
+        var anchorX = clamp((event.clientX - oldRect.left) / oldRect.width, 0, 1);
+        var anchorY = clamp((event.clientY - oldRect.top) / oldRect.height, 0, 1);
+        var oldAnchorX = oldRect.left + oldRect.width * anchorX, oldAnchorY = oldRect.top + oldRect.height * anchorY;
+        var minimum = Math.max(0.001, (editorState.fitScale || fittedScale(ui)) * MIN_ZOOM_FACTOR);
+        var nextScale = clamp(editorState.scale * Math.exp(-delta * 0.0015), minimum, MAX_IMAGE_SCALE);
+        if (Math.abs(nextScale - editorState.scale) < 0.00001) return;
+        editorState.zoomTouched = true; applyImageScale(nextScale);
+        var newRect = ui.wrap.getBoundingClientRect();
+        ui.stage.scrollLeft += (newRect.left + newRect.width * anchorX) - oldAnchorX;
+        ui.stage.scrollTop += (newRect.top + newRect.height * anchorY) - oldAnchorY;
+    }
+    function endPan(event) {
+        var ui = elements(); if (!editorState || !editorState.pan || !ui.stage) return;
+        if (event && event.pointerId !== undefined && editorState.pan.pointerId !== event.pointerId) return;
+        var pointerId = editorState.pan.pointerId; editorState.pan = null; ui.stage.classList.remove('is-panning');
+        try { if (ui.stage.hasPointerCapture(pointerId)) ui.stage.releasePointerCapture(pointerId); } catch (_) {}
+    }
+    function onStagePointerDown(event) {
+        var ui = elements(); if (!editorState || !ui.stage || event.button !== 1) return;
+        event.preventDefault();
+        editorState.pan = { pointerId: event.pointerId, clientX: event.clientX, clientY: event.clientY, scrollLeft: ui.stage.scrollLeft, scrollTop: ui.stage.scrollTop };
+        try { ui.stage.setPointerCapture(event.pointerId); } catch (_) {}
+        ui.stage.classList.add('is-panning');
+    }
+    function onStagePointerMove(event) {
+        var ui = elements(); if (!editorState || !editorState.pan || !ui.stage || editorState.pan.pointerId !== event.pointerId) return;
+        event.preventDefault();
+        ui.stage.scrollLeft = editorState.pan.scrollLeft - (event.clientX - editorState.pan.clientX);
+        ui.stage.scrollTop = editorState.pan.scrollTop - (event.clientY - editorState.pan.clientY);
+    }
+    function onStageAuxClick(event) { if (event.button === 1) event.preventDefault(); }
+    function setMode(mode) {
+        if (!editorState || ['view', 'selection', 'brush'].indexOf(mode) < 0) return;
+        editorState.mode = mode;
+        redrawOverlay();
+    }
+    function resetEdit() {
+        if (!editorState) return;
+        editorState.selection = null; editorState.strokes = []; editorState.activeStroke = null; editorState.dragStart = null;
+        redrawOverlay();
+    }
+    function undo() {
+        if (!editorState) return;
+        if (editorState.mode === 'brush') editorState.strokes.pop();
+        else editorState.selection = null;
+        redrawOverlay();
+    }
+    function base64FromDataUrl(value) { var parsed = root.Darkstar && root.Darkstar.imageData ? root.Darkstar.imageData.parseDataUrl(value) : null; return parsed ? parsed.base64 : ''; }
+    function imageCanvas() {
+        var canvas = document.createElement('canvas'); canvas.width = editorState.width; canvas.height = editorState.height;
+        canvas.getContext('2d').drawImage(editorState.sourceImage, 0, 0, canvas.width, canvas.height); return canvas;
+    }
+    function buildGuideCanvas() {
+        var canvas = imageCanvas(), context = canvas.getContext('2d'), region = currentRegion();
+        if (editorState.mode === 'selection') {
+            context.save(); context.fillStyle = 'rgba(255, 54, 54, .40)'; context.strokeStyle = 'rgb(255, 82, 64)'; context.lineWidth = Math.max(2, Math.round(Math.max(canvas.width, canvas.height) / 700));
+            context.fillRect(region.x, region.y, region.width, region.height); context.strokeRect(region.x + .5, region.y + .5, Math.max(0, region.width - 1), Math.max(0, region.height - 1)); context.restore();
+        } else editorState.strokes.forEach(function(stroke) { drawStroke(context, stroke); });
+        return canvas;
+    }
+    function armEdit() {
+        var region = currentRegion(); if (!editorState || !region) return false;
+        var sourceCanvas = imageCanvas(), guideCanvas = buildGuideCanvas();
+        var sourceBase64 = base64FromDataUrl(sourceCanvas.toDataURL('image/png')), guideBase64 = base64FromDataUrl(guideCanvas.toDataURL('image/png'));
+        if (!sourceBase64 || !guideBase64) return false;
+        var originalName = String(editorState.record && editorState.record.name || editorState.caption || 'image.png').replace(/\.[^.]+$/u, '');
+        var attachment = {
+            base64: guideBase64, mimeType: 'image/png', name: originalName + '-inpaint.png', size: Math.floor(guideBase64.length * 3 / 4),
+            edit: { version: 1, mode: editorState.mode, sourceBase64: sourceBase64, sourceWidth: editorState.width, sourceHeight: editorState.height,
+                region: { x: region.x, y: region.y, width: region.width, height: region.height } }
+        };
+        if (typeof pendingImage === 'undefined') return false;
+        pendingImage = attachment;
+        var preview = document.getElementById('imagePreview'); if (preview && root.Darkstar && root.Darkstar.imageData) preview.src = root.Darkstar.imageData.safeDataUrl({ base64: guideBase64, mimeType: 'image/png' }, 'image/png');
+        var name = document.getElementById('imageName'); if (name) name.textContent = attachment.name;
+        var size = document.getElementById('imageSize'); if (size && typeof formatFileSize === 'function') size.textContent = formatFileSize(attachment.size);
+        var container = document.getElementById('imagePreviewContainer'); if (container) container.classList.add('has-image');
+        if (typeof updateScheduleButton === 'function') updateScheduleButton();
+        if (typeof captureActiveComposerDraft === 'function') captureActiveComposerDraft();
+        if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
+        close();
+        var input = document.getElementById('messageInput'); if (input && typeof input.focus === 'function') input.focus({ preventScroll: true });
+        return true;
+    }
+    function onPointerDown(event) {
+        var ui = elements(); if (!editorState || !ui.overlay || event.button !== 0 || editorState.mode === 'view') return;
+        event.preventDefault(); var point = pointerPoint(event, ui.overlay);
+        try { ui.overlay.setPointerCapture(event.pointerId); } catch (_) {}
+        if (editorState.mode === 'selection') { editorState.dragStart = point; editorState.selection = { x: Math.floor(point.x), y: Math.floor(point.y), width: 1, height: 1 }; }
+        else {
+            var stroke = { color: String(ui.brushColor && ui.brushColor.value || '#ff4f24'), size: Math.max(2, Number(ui.brushSize && ui.brushSize.value || 32)), points: [clonePoint(point)] };
+            editorState.strokes.push(stroke); editorState.activeStroke = stroke;
+        }
+        redrawOverlay();
+    }
+    function onPointerMove(event) {
+        var ui = elements(); if (!editorState || !ui.overlay || !ui.overlay.hasPointerCapture(event.pointerId)) return;
+        var point = pointerPoint(event, ui.overlay);
+        if (editorState.mode === 'selection' && editorState.dragStart) editorState.selection = normalizeRect(editorState.dragStart, point, editorState.width, editorState.height);
+        else if (editorState.mode === 'brush' && editorState.activeStroke) {
+            var points = editorState.activeStroke.points, previous = points[points.length - 1];
+            if (!previous || Math.hypot(point.x - previous.x, point.y - previous.y) >= Math.max(1, editorState.activeStroke.size / 8)) points.push(clonePoint(point));
+        }
+        redrawOverlay();
+    }
+    function onPointerUp(event) {
+        var ui = elements(); if (!editorState || !ui.overlay) return;
+        if (ui.overlay.hasPointerCapture(event.pointerId)) { try { ui.overlay.releasePointerCapture(event.pointerId); } catch (_) {} }
+        editorState.dragStart = null; editorState.activeStroke = null; redrawOverlay();
+    }
+    function initializeLoadedImage(ui) {
+        if (!editorState || !ui.image || !ui.overlay) return;
+        editorState.width = ui.image.naturalWidth; editorState.height = ui.image.naturalHeight;
+        if (!editorState.width || !editorState.height) return;
+        ui.overlay.width = editorState.width; ui.overlay.height = editorState.height;
+        editorState.sourceImage = ui.image;
+        fitImage(true); redrawOverlay();
+    }
+    function openFromImage(image) {
+        var ui = elements(); if (!ui.root || !ui.image || !ui.close || !ui.overlay) return false;
+        var visibleSource = imageSource(image); if (!visibleSource) return false;
+        var record = sourceRecordForImage(image), source = dataUrlFromRecord(record, visibleSource); if (!source) return false;
+        previousFocus = document.activeElement && typeof document.activeElement.focus === 'function' ? document.activeElement : null;
+        editorState = { trigger: image, record: record, caption: imageCaption(image), mode: 'view', selection: null, strokes: [], activeStroke: null, dragStart: null, width: 0, height: 0, sourceImage: null, fitScale: 1, scale: 1, zoomTouched: false, pan: null };
+        ui.image.onload = function() { initializeLoadedImage(ui); };
+        ui.image.setAttribute('src', source); ui.image.alt = String(image && image.alt || 'Image editor source').trim() || 'Image editor source';
+        ui.root.hidden = false; ui.root.setAttribute('aria-hidden', 'false'); document.body.classList.add('image-lightbox-open'); setBrowserOverlayBlocked(true);
+        if (ui.image.complete && ui.image.naturalWidth) initializeLoadedImage(ui);
+        root.requestAnimationFrame(function() { fitImage(false); if (!ui.root.hidden && typeof ui.select.focus === 'function') ui.select.focus({ preventScroll: true }); });
+        return true;
+    }
+    function close() {
+        var ui = elements(); if (!ui.root || ui.root.hidden) return false;
+        ui.root.hidden = true; ui.root.setAttribute('aria-hidden', 'true'); document.body.classList.remove('image-lightbox-open');
+        if (ui.image) { ui.image.onload = null; ui.image.removeAttribute('src'); }
+        if (ui.overlay) { var context = ui.overlay.getContext('2d'); context.clearRect(0, 0, ui.overlay.width, ui.overlay.height); ui.overlay.width = 1; ui.overlay.height = 1; }
+        if (ui.stage) ui.stage.classList.remove('is-panning');
+        setBrowserOverlayBlocked(false); editorState = null;
+        var restore = previousFocus; previousFocus = null;
+        if (restore && restore.isConnected !== false && typeof restore.focus === 'function') root.requestAnimationFrame(function() { restore.focus({ preventScroll: true }); });
+        return true;
+    }
+    function triggerFromTarget(target) {
+        if (!target || typeof target.closest !== 'function') return null;
+        var image = target.closest(TRIGGER_SELECTOR); return image && String(image.tagName || '').toUpperCase() === 'IMG' ? image : null;
+    }
+    function onClick(event) {
+        var ui = elements();
+        if (ui.root && !ui.root.hidden) {
+            if (event.target === ui.root || event.target === ui.close) { event.preventDefault(); close(); return; }
+            if (event.target === ui.view) { setMode('view'); return; }
+            if (event.target === ui.select) { setMode('selection'); return; }
+            if (event.target === ui.brush) { setMode('brush'); return; }
+            if (event.target === ui.reset) { resetEdit(); return; }
+            if (event.target === ui.undo) { undo(); return; }
+            if (event.target === ui.use) { armEdit(); return; }
+            return;
+        }
+        var image = triggerFromTarget(event.target); if (!image) return;
+        event.preventDefault(); openFromImage(image);
+    }
+    function focusableControls(ui) {
+        return [ui.view, ui.select, ui.brush, ui.brushColor, ui.brushSize, ui.undo, ui.reset, ui.use, ui.close].filter(function(element) { return element && !element.disabled && element.offsetParent !== null; });
+    }
+    function onKeydown(event) {
+        var ui = elements();
+        if (ui.root && !ui.root.hidden) {
+            if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(); return; }
+            if (event.key === 'Tab') {
+                var controls = focusableControls(ui); if (!controls.length) return;
+                var index = controls.indexOf(document.activeElement), next = event.shiftKey ? (index <= 0 ? controls.length - 1 : index - 1) : (index < 0 || index === controls.length - 1 ? 0 : index + 1);
+                event.preventDefault(); controls[next].focus({ preventScroll: true }); return;
+            }
+            return;
+        }
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        var image = triggerFromTarget(event.target); if (!image) return;
+        event.preventDefault(); openFromImage(image);
+    }
+    function initialize() {
+        var ui = elements();
+        document.addEventListener('click', onClick); document.addEventListener('keydown', onKeydown, true);
+        if (ui.overlay) { ui.overlay.addEventListener('pointerdown', onPointerDown); ui.overlay.addEventListener('pointermove', onPointerMove); ui.overlay.addEventListener('pointerup', onPointerUp); ui.overlay.addEventListener('pointercancel', onPointerUp); }
+        if (ui.stage) {
+            ui.stage.addEventListener('wheel', onStageWheel, { passive: false });
+            ui.stage.addEventListener('pointerdown', onStagePointerDown);
+            ui.stage.addEventListener('pointermove', onStagePointerMove);
+            ui.stage.addEventListener('pointerup', endPan);
+            ui.stage.addEventListener('pointercancel', endPan);
+            ui.stage.addEventListener('auxclick', onStageAuxClick);
+        }
+        if (ui.brushSize) ui.brushSize.addEventListener('input', updateControls);
+        if (root.ResizeObserver && ui.stage) new root.ResizeObserver(function() { if (editorState) fitImage(false); }).observe(ui.stage);
+    }
+    root.openImageLightbox = function(image) { return openFromImage(image); };
+    root.closeImageLightbox = close;
+    root.imageEditRegionForBrushStrokes = brushBounds;
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initialize, { once: true }); else initialize();
+})(globalThis);
+    // <DARKSTAR_SOURCE_END path="backend/renderer/image-lightbox.js">
+
     // RENDERER MODULE :: backend/renderer/message-deletion.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/message-deletion.js">
 // === MESSAGE-DELETION.JS ===
@@ -13234,8 +15305,7 @@ async function copyAssistantMessage(index, button) {
     // RENDERER MODULE :: backend/renderer/chat.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/chat.js">
 // === CHAT.JS ===
-var chatTraceExpansionEnabled = false;
-function renderChat() {
+var chatTraceExpansionEnabled = false; function renderChat() {
     const tab = getActiveTab();
     if (!tab) return;
     const container = document.getElementById('chatContainer');
@@ -13247,6 +15317,8 @@ function renderChat() {
             '<p class="welcome-subtitle"></p></div>';
         if (typeof applyWelcomeQuote === 'function') applyWelcomeQuote(tab);
     } else {
+        // Build history off-document and commit once to avoid per-message layout/timers.
+        var fragment = typeof document.createDocumentFragment === 'function' ? document.createDocumentFragment() : container;
         for (let i = 0; i < tab.history.length; i++) {
             const msg = tab.history[i];
             if (msg && msg.hiddenFromChat === true) continue;
@@ -13264,12 +15336,12 @@ function renderChat() {
                 toolContext: msg.toolContext,
                 messageId: messageId,
                 errorMessage: msg.error, contextMessage: msg,
+                renderTarget: fragment, deferEffects: fragment !== container,
             });
         }
-    }
-    if (typeof restoreActiveGenerationUi === 'function') restoreActiveGenerationUi(tab);
-    if (typeof syncRenderedMessageActionVisibility === 'function') syncRenderedMessageActionVisibility();
-    syncChatTraceExpansionButton();
+        if (fragment !== container) container.appendChild(fragment);
+    } if (typeof restoreActiveGenerationUi === 'function') restoreActiveGenerationUi(tab);
+    if (typeof syncRenderedMessageActionVisibility === 'function') syncRenderedMessageActionVisibility(); syncChatTraceExpansionButton();
     if (typeof scheduleHeldTokenInspectionRefresh === 'function') scheduleHeldTokenInspectionRefresh();
 }
 function compactVisibleContent(content) {
@@ -13303,7 +15375,7 @@ function smartScrollToBottom() {
     // physically at the bottom. Rejoin follow mode before streamed content grows.
     if (userScrolledUp && isAtBottom(container)) resumeSmartChatAutoscroll();
     if (userScrolledUp) return;
-    container.scrollTop = container.scrollHeight;
+    container.scrollTop = 2147483647;
 }
 
 const ADD_MESSAGE_OPTION_NAMES = Object.freeze([
@@ -13319,6 +15391,28 @@ function normalizeAddMessageOptions(messageOptions, legacyArguments) {
     }, {});
 }
 
+function presentedImageRecords(message) {
+    var ids = Array.isArray(message && message.presentedImageIds) ? message.presentedImageIds.map(String) : [];
+    if (!ids.length) return [];
+    var byId = new Map();
+    (Array.isArray(message.agentTimeline) ? message.agentTimeline : []).forEach(function(segment) {
+        var id = segment && segment.type === 'image' && segment.imageSource && segment.imageSource.id ? String(segment.imageSource.id) : '';
+        if (id && segment.base64) byId.set(id, { base64: String(segment.base64), mimeType: String(segment.mimeType || 'image/png'), name: '' });
+    });
+    return ids.map(function(id) { return byId.get(id) || null; }).filter(Boolean);
+}
+function syncPresentedMessageImages(messageElement, message, messageIndex) {
+    var answer = messageElement && messageElement.querySelector ? messageElement.querySelector('.message-answer') : null;
+    if (!answer) return;
+    Array.from(answer.querySelectorAll('.presented-response-image')).forEach(function(node) { node.remove(); });
+    presentedImageRecords(message).forEach(function(item, imageIndex) {
+        var url = Darkstar.imageData.safeDataUrl(item, 'image/png'); if (!url) return;
+        var wrap = document.createElement('span'); wrap.className = 'message-image-wrap presented-response-image';
+        var image = document.createElement('img'); image.className = 'message-image image-lightbox-trigger'; image.src = url; image.alt = 'Response image'; image.draggable = false; image.tabIndex = 0; image.setAttribute('role', 'button'); image.setAttribute('aria-label', 'Open image editor'); image.dataset.messageIndex = String(messageIndex); image.dataset.imageIndex = String(imageIndex);
+        wrap.appendChild(image); answer.appendChild(wrap);
+    });
+}
+
 function addMessage(messageOptions) {
     var options = normalizeAddMessageOptions(messageOptions, arguments);
     var role = String(options.role || 'assistant');
@@ -13326,11 +15420,11 @@ function addMessage(messageOptions) {
     var isTyping = options.isTyping === true;
     var { messageIndex, imageData, reasoning, working, agentTimeline, toolContext, messageId, errorMessage, contextMessage } = options;
 
-    const container = document.getElementById('chatContainer');
-    const welcome = document.getElementById('welcomeScreen');
-    if (welcome) welcome.remove();
-    const spacer = document.querySelector('.chat-spacer');
-    if (spacer) spacer.remove();
+    const container = document.getElementById('chatContainer'), renderTarget = options.renderTarget && typeof options.renderTarget.appendChild === 'function' ? options.renderTarget : container, deferEffects = options.deferEffects === true;
+    if (renderTarget === container) {
+        const welcome = document.getElementById('welcomeScreen'); if (welcome) welcome.remove();
+        const spacer = document.querySelector('.chat-spacer'); if (spacer) spacer.remove();
+    }
     const div = document.createElement('div');
     var assistantLike = role === 'assistant' || role === 'adversary';
     div.className = 'message ' + role;
@@ -13354,7 +15448,7 @@ function addMessage(messageOptions) {
         var normalized = typeof item === 'string' ? { base64: item, mimeType: 'image/jpeg' } : item;
         var imageUrl = Darkstar.imageData.safeDataUrl(normalized, 'image/jpeg');
         if (!imageUrl) return;
-        imageHtml += '<span class="message-image-wrap"><img class="message-image" src="' + imageUrl + '"></span>';
+        imageHtml += '<span class="message-image-wrap"><img class="message-image image-lightbox-trigger" src="' + imageUrl + '" alt="Attached image" draggable="false" tabindex="0" role="button" aria-label="Open image editor" data-message-index="' + String(messageIndex) + '" data-image-index="' + String(imageIndex) + '"></span>';
         renderedImageSourceKeys.push(messageId ? ('history-image:' + String(messageId) + ':' + imageIndex) : '');
     });
     var renderedContent = formatMessage(content);
@@ -13379,19 +15473,22 @@ function addMessage(messageOptions) {
     Array.from(div.querySelectorAll('.message-image-wrap')).forEach(function(wrapper, imageIndex) {
         if (renderedImageSourceKeys[imageIndex]) wrapper.dataset.contextImageSourceKey = renderedImageSourceKeys[imageIndex];
     });
-    container.appendChild(div);
+    renderTarget.appendChild(div);
     if (assistantLike) {
         var timeline = Array.isArray(agentTimeline) && agentTimeline.length
             ? agentTimeline
             : buildLegacyAgentTimeline(reasoning, working, toolContext);
         if (timeline.length) updateMessageAgentTimeline(div, enrichAgentTimeline(contextMessage, timeline));
+        if (contextMessage) syncPresentedMessageImages(div, contextMessage, messageIndex);
     }
-    setTimeout(function() {
-        var currentContainer = document.getElementById('chatContainer');
-        if (!currentContainer || (typeof currentContainer.contains === 'function' && !currentContainer.contains(div))) return;
-        smartScrollToBottom();
-    }, 50);
-    if (typeof scheduleHeldTokenInspectionRefresh === 'function') scheduleHeldTokenInspectionRefresh();
+    if (!deferEffects) {
+        setTimeout(function() {
+            var currentContainer = document.getElementById('chatContainer');
+            if (!currentContainer || (typeof currentContainer.contains === 'function' && !currentContainer.contains(div))) return;
+            smartScrollToBottom();
+        }, 50);
+        if (typeof scheduleHeldTokenInspectionRefresh === 'function') scheduleHeldTokenInspectionRefresh();
+    }
     return div;
 }
 
@@ -13452,6 +15549,7 @@ function normalizeAgentTimeline(timeline) {
             imageName: String(segment.name || segment.imageName || ''),
             base64: String(segment.base64 || ''),
             ephemeral: segment.ephemeral === true,
+            imageGeneration: Darkstar.imageGenerationPreview.normalize(segment.imageGeneration),
             contextArguments: String(segment.contextArguments || '')
         };
     });
@@ -13722,6 +15820,7 @@ function createToolCallBlock() {
     block.className = 'tool-call-block';
     block.dataset.userExpanded = chatTraceExpansionEnabled ? 'true' : 'false';
     block.innerHTML = '<div class="tool-call-header" role="button" tabindex="0" aria-expanded="false"><span class="tool-call-title activity-title"><span class="activity-glyph activity-glyph-tool" aria-hidden="true"></span><span class="tool-call-label">Tool Call</span></span><span class="tool-call-icon">›</span></div>' +
+        Darkstar.imageGenerationPreview.stageHtml() +
         '<div class="tool-call-preview" aria-hidden="true"><pre class="tool-call-preview-inner"></pre></div>' +
         '<div class="tool-call-content" aria-hidden="true"><div class="tool-call-content-inner"></div></div>';
     bindDisclosure(block, 'tool-call', scrollToolCallPreviewToLatest);
@@ -13752,15 +15851,14 @@ function placeTimelineBlock(slot, block, index) {
     return true;
 }
 
-function appendStreamingText(target, content, previousValue) {
-    var previous = typeof previousValue === 'string' ? previousValue : '';
-    if (content.indexOf(previous) === 0) {
-        var appended = content.slice(previous.length);
-        if (appended) target.appendChild(document.createTextNode(appended));
-    } else {
-        target.textContent = content;
-    }
-    return content;
+function streamingTextCursor(content) { var text = String(content === undefined || content === null ? '' : content); return { length: text.length, tail: text.slice(Math.max(0, text.length - 64)) }; }
+function appendStreamingText(target, content, previousCursor) {
+    var text = String(content === undefined || content === null ? '' : content), cursor = previousCursor && typeof previousCursor === 'object' ? previousCursor : { length: 0, tail: '' };
+    var priorLength = Math.max(0, Number(cursor.length) || 0), priorTail = String(cursor.tail || '');
+    var guardLength = Math.min(64, priorLength, priorTail.length), canAppend = !priorLength || (text.length >= priorLength && (!guardLength || text.slice(priorLength - guardLength, priorLength) === priorTail.slice(-guardLength)));
+    if (canAppend) { var appended = text.slice(priorLength); if (appended) target.appendChild(document.createTextNode(appended)); }
+    else target.textContent = text;
+    return streamingTextCursor(text);
 }
 
 function renderStreamingMarkdown(target, content, previousValue) {
@@ -13783,7 +15881,7 @@ function renderReasoningSegment(block, segment) {
     setTextIfChanged(label, active ? 'Reasoning ...' : 'Reasoned');
 
     var previewInner = block.querySelector('.thinking-preview-inner');
-    if (previewInner) block._previewReasoningValue = appendStreamingText(previewInner, segment.content, block._previewReasoningValue);
+    if (previewInner) block._previewReasoningCursor = appendStreamingText(previewInner, segment.content, block._previewReasoningCursor);
 
     var content = block.querySelector('.thinking-content-inner');
     block._latestReasoningContent = segment.content;
@@ -13791,7 +15889,7 @@ function renderReasoningSegment(block, segment) {
         if (!content) return;
         if (isActiveAgentSegment(block.dataset.segmentState, block.dataset.segmentStatus)) {
             content.textContent = block._latestReasoningContent || '';
-            block._expandedReasoningValue = block._latestReasoningContent || '';
+            block._expandedReasoningValue = block._latestReasoningContent || ''; block._expandedReasoningCursor = streamingTextCursor(block._latestReasoningContent || '');
             block._expandedReasoningFormatted = false;
         } else if (block._expandedReasoningValue !== block._latestReasoningContent || !block._expandedReasoningFormatted) {
             content.innerHTML = formatMessage(block._latestReasoningContent || '');
@@ -13805,19 +15903,20 @@ function renderReasoningSegment(block, segment) {
             var followExpandedReasoning = shouldAutoFollowExpandedReasoning(block);
             if (block._expandedReasoningFormatted) {
                 content.textContent = '';
-                block._expandedReasoningValue = '';
+                block._expandedReasoningValue = ''; block._expandedReasoningCursor = null;
             }
-            block._expandedReasoningValue = appendStreamingText(content, segment.content, block._expandedReasoningValue);
+            block._expandedReasoningCursor = appendStreamingText(content, segment.content, block._expandedReasoningCursor);
+            block._expandedReasoningValue = segment.content;
             block._expandedReasoningFormatted = false;
             if (followExpandedReasoning) scrollReasoningContentToLatest(block);
         } else if (block._expandedReasoningValue !== segment.content || !block._expandedReasoningFormatted) {
             content.innerHTML = formatMessage(segment.content);
-            block._expandedReasoningValue = segment.content;
+            block._expandedReasoningValue = segment.content; block._expandedReasoningCursor = null;
             block._expandedReasoningFormatted = true;
         }
     } else if (!active && content) {
         content.innerHTML = formatMessage(segment.content);
-        block._expandedReasoningValue = segment.content;
+        block._expandedReasoningValue = segment.content; block._expandedReasoningCursor = null;
         block._expandedReasoningFormatted = true;
     }
 
@@ -13838,22 +15937,21 @@ function renderImageSegment(block, segment) {
             frame = document.createElement('div');
             frame.className = 'context-image-frame';
             image = document.createElement('img');
+            image.className = 'image-lightbox-trigger';
             image.alt = segment.imageName || 'Tool screenshot';
             image.loading = 'lazy';
+            image.draggable = false;
+            image.tabIndex = 0;
+            image.setAttribute('role', 'button');
+            image.setAttribute('aria-label', 'Open image in image editor');
             frame.appendChild(image);
             content.appendChild(frame);
-            var meta = document.createElement('div');
-            meta.className = 'context-image-meta';
-            content.appendChild(meta);
         }
         var dataUrl = Darkstar.imageData.safeDataUrl(segment, 'image/png');
         if (dataUrl && image.getAttribute('src') !== dataUrl) image.setAttribute('src', dataUrl);
-        image.alt = segment.imageName || 'Tool screenshot';
-        var metaTarget = content.querySelector('.context-image-meta');
-        if (metaTarget) {
-            var metaText = segment.imageName || 'Tool image';
-            setTextIfChanged(metaTarget, metaText);
-        }
+        image.alt = 'Tool image';
+        image.setAttribute('aria-label', 'Open image in image editor');
+        frame.classList.toggle('generated-image-frame', /^generated-\d+\.(?:png|jpe?g|webp)$/iu.test(String(segment.imageName || '')));
     }
     setDisclosureState(block, 'thinking', segment.state || 'complete', segment.status || 'complete');
 }
@@ -13917,7 +16015,7 @@ function renderCompactingSegment(block, segment) {
 
     var previewInner = block.querySelector('.working-preview-inner');
     var previewText = segment.content || segment.reasoning || (active ? 'Preparing compaction request…' : '');
-    if (previewInner) block._compactingPreviewValue = appendStreamingText(previewInner, previewText, block._compactingPreviewValue);
+    if (previewInner) block._compactingPreviewCursor = appendStreamingText(previewInner, previewText, block._compactingPreviewCursor);
 
     var reasoningSlot = block.querySelector('.compacting-reasoning-slot');
     if (reasoningSlot) {
@@ -13967,12 +16065,30 @@ function formatActivityCount(value) {
     return number.toLocaleString ? number.toLocaleString() : String(number);
 }
 
+function imageGenerationRestoreActive(segment) {
+    return Boolean(
+        segment && segment.name === 'generate_image'
+        && isActiveAgentSegment(segment.state, segment.status)
+        && segment.imageGeneration && segment.imageGeneration.finalImage === true
+        && String(segment.imageGeneration.phase || '') === 'restoring-language-model'
+    );
+}
+
+function imageGenerationFinalDelivered(segment) {
+    return Boolean(
+        segment && segment.name === 'generate_image'
+        && segment.imageGeneration && segment.imageGeneration.finalImage === true
+        && segment.imageGeneration.base64
+    );
+}
+
 function toolCallPhaseLabel(segment) {
     var active = isActiveAgentSegment(segment.state, segment.status);
     if (segment.status === 'stopped' && segment.phase === 'preparing') return 'Tool Call Interrupted';
     if (segment.status === 'stopped') return 'Tool Interrupted';
+    if (imageGenerationRestoreActive(segment)) return 'Restoring Language Model ...';
     if (active && segment.phase === 'preparing') return segment.resumed ? 'Continuing Tool Call ...' : 'Preparing Tool Call ...';
-    if (active && segment.phase === 'executing') return 'Executing Tool ...';
+    if (active && segment.phase === 'executing') return imageGenerationFinalDelivered(segment) ? 'Image Ready' : 'Executing Tool ...';
     return 'Tool Call';
 }
 function toolCallProgressText(segment) {
@@ -13987,6 +16103,12 @@ function toolCallProgressText(segment) {
         return (segment.resumed ? 'Continuing ' : 'Writing ') + name + ' arguments…' + (details.length ? ' · ' + details.join(' · ') : '');
     }
     if (segment.phase === 'executing' && isActiveAgentSegment(segment.state, segment.status)) {
+        if (imageGenerationRestoreActive(segment)) {
+            return 'Image ready · restoring language model… · ' + formatActivityDuration(segment.executionElapsedMs);
+        }
+        if (imageGenerationFinalDelivered(segment)) {
+            return 'Image ready · finishing image task… · ' + formatActivityDuration(segment.executionElapsedMs);
+        }
         var execution = 'Executing ' + name + '… · ' + formatActivityDuration(segment.executionElapsedMs);
         if (segment.preparationMs) execution += ' · arguments generated in ' + formatActivityDuration(segment.preparationMs);
         return execution;
@@ -14011,7 +16133,8 @@ function buildToolCallExpandedContent(container, segment) {
     if (segment.status === 'error') status.textContent = 'Error';
     else if (segment.status === 'stopped') status.textContent = 'Interrupted';
     else if (segment.phase === 'preparing' && isActiveAgentSegment(segment.state, segment.status)) status.textContent = 'Generating arguments';
-    else if (segment.phase === 'executing' && isActiveAgentSegment(segment.state, segment.status)) status.textContent = 'Executing';
+    else if (imageGenerationRestoreActive(segment)) status.textContent = 'Restoring language model';
+    else if (segment.phase === 'executing' && isActiveAgentSegment(segment.state, segment.status)) status.textContent = imageGenerationFinalDelivered(segment) ? 'Image ready' : 'Executing';
     else status.textContent = 'Complete';
     if (segment.status !== 'error' && segment.phase === 'preparing') status.textContent += ' · ' + formatActivityDuration(segment.preparationMs);
     else if (segment.status !== 'error' && segment.phase === 'executing') status.textContent += ' · ' + formatActivityDuration(segment.executionElapsedMs);
@@ -14055,7 +16178,11 @@ function buildToolCallExpandedContent(container, segment) {
         result.className = 'tool-call-result';
         var resultText = segment.result || (segment.status === 'stopped'
             ? 'Tool execution was interrupted before a result was returned.'
-            : (isActiveAgentSegment(segment.state, segment.status) ? 'Waiting for tool result…' : 'No result returned.'));
+            : (imageGenerationRestoreActive(segment)
+                ? 'Image ready. Restoring language model…'
+                : (imageGenerationFinalDelivered(segment) && isActiveAgentSegment(segment.state, segment.status)
+                    ? 'Image ready. Finishing image task…'
+                    : (isActiveAgentSegment(segment.state, segment.status) ? 'Waiting for tool result…' : 'No result returned.'))));
         result.textContent = resultText;
         entry.appendChild(result);
     }
@@ -14070,6 +16197,7 @@ function renderToolCallSegment(block, segment) {
     setTextIfChanged(label, toolCallPhaseLabel(segment));
     var previewInner = block.querySelector('.tool-call-preview-inner');
     setTextIfChanged(previewInner, toolCallProgressText(segment));
+    Darkstar.imageGenerationPreview.render(block, segment, isActiveAgentSegment, setTextIfChanged);
     buildToolCallExpandedContent(block.querySelector('.tool-call-content-inner'), segment);
     setDisclosureState(block, 'tool-call', segment.state, segment.status);
     if (isActiveAgentSegment(segment.state, segment.status) && block.dataset.userExpanded !== 'true') scrollToolCallPreviewToLatest(block);
@@ -14108,7 +16236,9 @@ function updateMessageAgentTimeline(messageElement, timeline) {
                     : (segment.type === 'worked'
                         ? createWorkedBlock()
                         : (segment.type === 'compacting' ? createCompactingBlock() : createToolCallBlock())));
-            if (disclosureState.get(segment.id) === true) block.dataset.userExpanded = 'true';
+            if (disclosureState.has(segment.id)) {
+                block.dataset.userExpanded = disclosureState.get(segment.id) === true ? 'true' : 'false';
+            }
         }
         block._onDisclosureChange = function(expanded) {
             disclosureState.set(segment.id, expanded === true);
@@ -14147,9 +16277,7 @@ function setMessageAgentTimelineState(messageElement, state) {
     });
     updateMessageAgentTimeline(messageElement, timeline);
 }
-
-
-    // <DARKSTAR_SOURCE_END path="backend/renderer/chat.js">
+// <DARKSTAR_SOURCE_END path="backend/renderer/chat.js">
     // --------------------------------------------------------------------------
     // [9800] COMPOSER + UI STATE :: tokens, controls, queue, tabs, server, params and images
     // --------------------------------------------------------------------------
@@ -14742,6 +16870,7 @@ function copyScheduledImage(image) {
         mimeType: normalizedSource.mimeType
     };
     if (Number.isFinite(Number(image.size)) && Number(image.size) >= 0) copy.size = Number(image.size);
+    if (image.edit && typeof image.edit === 'object') copy.edit = JSON.parse(JSON.stringify(image.edit));
     return copy;
 }
 
@@ -14829,6 +16958,7 @@ function scheduleMessage() {
     input.value = '';
     input.style.height = 'auto'; input.style.overflowY = 'hidden';
     if (image && typeof removeImage === 'function') removeImage();
+    if (typeof captureActiveComposerDraft === 'function') captureActiveComposerDraft();
     updateScheduleButton();
     renderQueue();
     if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
@@ -15020,7 +17150,7 @@ function renderQueue() {
         const item = document.createElement('div');
         item.className = 'queue-item';
         item.innerHTML = '<span class="queue-badge">' + (i + 1 + queuedGenerations.length) + '</span>'
-            + (imageUrl ? '<img class="queue-image" src="' + escapeQueueText(imageUrl) + '" alt="Scheduled attachment">' : '')
+            + (imageUrl ? '<img class="queue-image image-lightbox-trigger" src="' + escapeQueueText(imageUrl) + '" alt="Scheduled attachment" draggable="false" tabindex="0" role="button" aria-label="Enlarge scheduled attachment">' : '')
             + '<span class="queue-copy">'
             + '<span class="queue-text">' + escapeQueueText(messageText || 'Image attachment') + '</span>'
             + (image ? '<span class="queue-attachment">' + escapeQueueText(image.name || 'image.png') + '</span>' : '')
@@ -15036,7 +17166,7 @@ function renderQueue() {
         var item = document.createElement('div');
         item.className = 'queue-item queue-generation';
         item.innerHTML = '<span class="queue-badge">NEXT</span>'
-            + (imageUrl ? '<img class="queue-image" src="' + escapeQueueText(imageUrl) + '" alt="Queued attachment">' : '')
+            + (imageUrl ? '<img class="queue-image image-lightbox-trigger" src="' + escapeQueueText(imageUrl) + '" alt="Queued attachment" draggable="false" tabindex="0" role="button" aria-label="Enlarge queued attachment">' : '')
             + '<span class="queue-copy">'
             + '<span class="queue-text">' + escapeQueueText(messageText || 'Regenerate response') + '</span>'
             + '<span class="queue-attachment">Waiting for a free model slot</span>'
@@ -15133,8 +17263,524 @@ function scheduleTabLayoutRefresh() {
 }
 
 
+var tabDragState = {
+    tabId: null, pointerId: null, sourceProjectId: null, sourceIndex: -1,
+    element: null, active: false, settling: false, renderPending: false,
+    startX: 0, startY: 0, x: 0, y: 0, offsetX: 0, offsetY: 0,
+    sourceRect: null, tabBarRect: null, unit: 0, itemMetrics: [], previewIndex: -1, previewMode: 'idle',
+    projectMetrics: [], ghost: null, marker: null, frame: 0,
+    projectTargetId: null, projectTargetElement: null, projectTargetRect: null, projectTargetBlocked: false
+};
+var tabDragSuppressClickUntil = 0;
+
+function draggedTabRecord() {
+    if (tabDragState.tabId === null) return null;
+    return tabs.find(function(tab) { return tab && Number(tab.id) === Number(tabDragState.tabId); }) || null;
+}
+
+function tabProjectMoveBlockReason(tab, targetProjectId) {
+    if (!tab || tab._closing === true) return 'This tab is unavailable.';
+    var target = typeof getProjectById === 'function' ? getProjectById(targetProjectId) : null;
+    if (!target) return 'The destination project is unavailable.';
+    if (Number(tab.projectId) === Number(targetProjectId)) return '';
+    if (typeof generationSessionForTab === 'function' && generationSessionForTab(tab.id)) return 'Stop this tab before moving it to another project.';
+    if (tab.generationQueued === true) return 'Wait for this queued generation before moving the tab.';
+    var targetTabs = typeof tabsForProject === 'function' ? tabsForProject(targetProjectId) : [];
+    if (targetTabs.length >= 10) return 'The destination project already has 10 tabs.';
+    return '';
+}
+
+function globalInsertionIndexForProject(projectId, projectIndex) {
+    var owned = tabs.filter(function(candidate) {
+        return candidate && candidate._closing !== true && Number(candidate.projectId) === Number(projectId);
+    });
+    if (owned.length) {
+        var clamped = Math.max(0, Math.min(Number(projectIndex) || 0, owned.length));
+        if (clamped < owned.length) return tabs.indexOf(owned[clamped]);
+        return tabs.indexOf(owned[owned.length - 1]) + 1;
+    }
+    var projectPosition = Array.isArray(projects) ? projects.findIndex(function(project) { return Number(project.id) === Number(projectId); }) : -1;
+    if (projectPosition >= 0) {
+        var laterIds = new Set(projects.slice(projectPosition + 1).map(function(project) { return Number(project.id); }));
+        var laterIndex = tabs.findIndex(function(candidate) { return candidate && laterIds.has(Number(candidate.projectId)); });
+        if (laterIndex >= 0) return laterIndex;
+    }
+    return tabs.length;
+}
+
+function repositionTabRecord(tabId, targetProjectId, targetIndex) {
+    var tab = tabs.find(function(candidate) { return candidate && Number(candidate.id) === Number(tabId); });
+    if (!tab) return null;
+    var sourceProjectId = Number(tab.projectId);
+    var sourceOrder = typeof tabsForProject === 'function' ? tabsForProject(sourceProjectId) : tabs.filter(function(candidate) { return Number(candidate.projectId) === sourceProjectId; });
+    var sourceIndex = sourceOrder.findIndex(function(candidate) { return Number(candidate.id) === Number(tab.id); });
+    var requestedIndex = Math.max(0, Number.isFinite(Number(targetIndex)) ? Math.floor(Number(targetIndex)) : 0);
+    if (sourceProjectId === Number(targetProjectId) && sourceIndex >= 0 && requestedIndex > sourceIndex) requestedIndex -= 1;
+    var globalIndex = tabs.indexOf(tab);
+    if (globalIndex < 0) return null;
+    tabs.splice(globalIndex, 1);
+    tab.projectId = Number(targetProjectId);
+    var targetOwned = tabs.filter(function(candidate) { return candidate && candidate._closing !== true && Number(candidate.projectId) === Number(targetProjectId); });
+    requestedIndex = Math.max(0, Math.min(requestedIndex, targetOwned.length));
+    var insertionIndex = globalInsertionIndexForProject(targetProjectId, requestedIndex);
+    tabs.splice(insertionIndex, 0, tab);
+    return { tab: tab, sourceProjectId: sourceProjectId, targetProjectId: Number(targetProjectId), sourceIndex: sourceIndex, targetIndex: requestedIndex };
+}
+
+function reorderTabWithinProject(tabId, targetIndex) {
+    var tab = tabs.find(function(candidate) { return candidate && Number(candidate.id) === Number(tabId); });
+    if (!tab || tab._closing === true) return false;
+    var projectId = Number(tab.projectId);
+    var result = repositionTabRecord(tab.id, projectId, targetIndex);
+    if (!result) return false;
+    renderTabs();
+    if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
+    return true;
+}
+
+function moveTabToProject(tabId, targetProjectId, targetIndex) {
+    var tab = tabs.find(function(candidate) { return candidate && Number(candidate.id) === Number(tabId); });
+    if (!tab) return false;
+    var target = typeof getProjectById === 'function' ? getProjectById(targetProjectId) : null;
+    var reason = tabProjectMoveBlockReason(tab, targetProjectId);
+    if (!target || reason) {
+        if (reason && typeof playUiSound === 'function') playUiSound('blocked');
+        return false;
+    }
+    if (Number(tab.projectId) === Number(targetProjectId)) return reorderTabWithinProject(tab.id, targetIndex);
+    var source = typeof getProjectById === 'function' ? getProjectById(tab.projectId) : null;
+    var sourceActiveTabId = source ? Number(source.activeTabId) : null;
+    var targetActiveTabId = Number(target.activeTabId);
+    var sourceIndex = (typeof tabsForProject === 'function' ? tabsForProject(tab.projectId) : []).findIndex(function(candidate) { return Number(candidate.id) === Number(tab.id); });
+    var movingVisibleActiveTab = Number(tab.projectId) === Number(activeProjectId) && Number(tab.id) === Number(activeTabId);
+    if (movingVisibleActiveTab) {
+        if (typeof saveActiveTabScrollState === 'function') saveActiveTabScrollState();
+        if (typeof captureActiveComposerDraft === 'function') captureActiveComposerDraft();
+        if (typeof collapseScheduledQueueUi === 'function') collapseScheduledQueueUi();
+    }
+    var result = repositionTabRecord(tab.id, target.id, targetIndex);
+    if (!result) return false;
+    if (source) {
+        var sourceTabs = typeof tabsForProject === 'function' ? tabsForProject(source.id) : [];
+        var fallback = sourceTabs.find(function(candidate) { return Number(candidate.id) === Number(sourceActiveTabId); }) || null;
+        if (!fallback && sourceTabs.length) fallback = sourceTabs[Math.max(0, Math.min(sourceIndex, sourceTabs.length - 1))];
+        if (!fallback && typeof ensureProjectHasTab === 'function') fallback = ensureProjectHasTab(source);
+        if (fallback) source.activeTabId = fallback.id;
+        if (movingVisibleActiveTab && fallback) {
+            activeTabId = fallback.id;
+            if (typeof synchronizeLegacyGenerationState === 'function') synchronizeLegacyGenerationState();
+            if (typeof restoreTabScrollState === 'function') restoreTabScrollState(activeTabId);
+            if (typeof activateWorkspaceForTab === 'function') activateWorkspaceForTab(activeTabId);
+            if (typeof activateOfflineBrowserForTab === 'function') Darkstar.async.runBestEffort(function() { return activateOfflineBrowserForTab(activeTabId); }, 'TABS');
+            if (typeof restoreComposerDraftForTab === 'function') restoreComposerDraftForTab(fallback);
+        }
+    }
+    var targetTabs = typeof tabsForProject === 'function' ? tabsForProject(target.id) : [];
+    var targetSelection = targetTabs.find(function(candidate) { return Number(candidate.id) === Number(targetActiveTabId); })
+        || targetTabs.find(function(candidate) { return Number(candidate.id) !== Number(tab.id); }) || targetTabs[0] || tab;
+    target.activeTabId = targetSelection.id;
+    renderTabs();
+    if (movingVisibleActiveTab) {
+        if (typeof renderChat === 'function') renderChat();
+        if (typeof updateTokenCounter === 'function') updateTokenCounter();
+        if (typeof renderQueue === 'function') renderQueue();
+        if (typeof updateButtonStates === 'function') updateButtonStates(typeof activeTabOwnsGeneration === 'function' ? activeTabOwnsGeneration() : false);
+        if (typeof syncProjectComposerGate === 'function') syncProjectComposerGate();
+    }
+    if (typeof renderProjects === 'function') renderProjects();
+    if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
+    return true;
+}
+
+function tabDragShiftForIndex(sourceIndex, previewIndex, candidateIndex, unit) {
+    var distance = Math.max(0, Number(unit) || 0);
+    if (previewIndex > sourceIndex && candidateIndex > sourceIndex && candidateIndex <= previewIndex) return -distance;
+    if (previewIndex < sourceIndex && candidateIndex >= previewIndex && candidateIndex < sourceIndex) return distance;
+    return 0;
+}
+
+function tabDragCommitIndex(sourceIndex, previewIndex) {
+    return previewIndex > sourceIndex ? previewIndex + 1 : previewIndex;
+}
+
+function resetTabDragState(renderPending) {
+    tabDragState = {
+        tabId: null, pointerId: null, sourceProjectId: null, sourceIndex: -1,
+        element: null, active: false, settling: false, renderPending: Boolean(renderPending),
+        startX: 0, startY: 0, x: 0, y: 0, offsetX: 0, offsetY: 0,
+        sourceRect: null, tabBarRect: null, unit: 0, itemMetrics: [], previewIndex: -1, previewMode: 'idle',
+        projectMetrics: [], ghost: null, marker: null, frame: 0,
+        projectTargetId: null, projectTargetElement: null, projectTargetRect: null, projectTargetBlocked: false
+    };
+}
+
+function clearTabProjectDropTarget() {
+    var element = tabDragState.projectTargetElement;
+    if (!element && tabDragState.projectTargetId === null && tabDragState.projectTargetBlocked !== true) return;
+    if (element && element.classList) element.classList.remove('tab-drop-target', 'tab-drop-blocked');
+    tabDragState.projectTargetId = null;
+    tabDragState.projectTargetElement = null;
+    tabDragState.projectTargetRect = null;
+    tabDragState.projectTargetBlocked = false;
+    if (tabDragState.ghost && tabDragState.ghost.classList) tabDragState.ghost.classList.remove('project-drop', 'project-drop-blocked');
+}
+
+function clearTabDragPreviewTransforms() {
+    (tabDragState.itemMetrics || []).forEach(function(metric) {
+        if (metric && metric.element && metric.element.style) metric.element.style.transform = '';
+    });
+    if (tabDragState.marker && tabDragState.marker.classList) tabDragState.marker.classList.remove('visible');
+}
+
+function cleanupTabDragVisuals() {
+    if (tabDragState.frame && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(tabDragState.frame);
+    tabDragState.frame = 0;
+    clearTabProjectDropTarget();
+    clearTabDragPreviewTransforms();
+    if (tabDragState.element && tabDragState.element.classList) {
+        tabDragState.element.classList.remove('tab-drag-source');
+        tabDragState.element.setAttribute('aria-grabbed', 'false');
+    }
+    if (tabDragState.ghost && tabDragState.ghost.parentNode) tabDragState.ghost.parentNode.removeChild(tabDragState.ghost);
+    if (tabDragState.marker && tabDragState.marker.parentNode) tabDragState.marker.parentNode.removeChild(tabDragState.marker);
+    if (document.body && document.body.classList) document.body.classList.remove('tab-pointer-drag-active', 'tab-pointer-drag-settling');
+}
+
+function measureTabDragGeometry(tabBar, element) {
+    var items = Array.from(tabBar.querySelectorAll('.tab-item'));
+    var metrics = items.map(function(item, index) {
+        var rect = item.getBoundingClientRect();
+        return { element: item, index: index, rect: rect, center: rect.left + rect.width / 2 };
+    });
+    var sourceIndex = metrics.findIndex(function(metric) { return metric.element === element; });
+    var sourceRect = sourceIndex >= 0 ? metrics[sourceIndex].rect : element.getBoundingClientRect();
+    var unit = sourceRect.width + 1;
+    if (metrics.length > 1) {
+        var first = metrics[0].rect;
+        var second = metrics[1].rect;
+        var measuredUnit = Math.abs(Number(second.left) - Number(first.left));
+        if (measuredUnit > 0) unit = measuredUnit;
+    }
+    return { metrics: metrics, sourceIndex: sourceIndex, sourceRect: sourceRect, unit: unit, tabBarRect: tabBar.getBoundingClientRect() };
+}
+
+function measureTabProjectDropGeometry() {
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return [];
+    return Array.from(document.querySelectorAll('.schema-project-item')).map(function(element) {
+        var projectId = Number(element.dataset && element.dataset.projectId);
+        if (!Number.isFinite(projectId) || typeof element.getBoundingClientRect !== 'function') return null;
+        var rect = element.getBoundingClientRect();
+        return { element: element, projectId: projectId, rect: rect };
+    }).filter(Boolean);
+}
+
+function tabProjectDropTargetForPointer(clientX, clientY) {
+    var x = Number(clientX) || 0;
+    var y = Number(clientY) || 0;
+    return (tabDragState.projectMetrics || []).find(function(metric) {
+        var rect = metric && metric.rect;
+        return rect && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+    }) || null;
+}
+
+function createTabDragGhost(element, rect) {
+    var ghost = element.cloneNode(true);
+    ghost.classList.remove('tab-drag-source', 'active');
+    ghost.classList.add('tab-drag-ghost');
+    ghost.removeAttribute('data-tab');
+    ghost.removeAttribute('aria-grabbed');
+    ghost.querySelectorAll('[id]').forEach(function(node) { node.removeAttribute('id'); });
+    ghost.style.width = Math.round(rect.width) + 'px';
+    ghost.style.height = Math.round(rect.height) + 'px';
+    document.body.appendChild(ghost);
+    return ghost;
+}
+
+function createTabDragMarker(rect) {
+    var marker = document.createElement('div');
+    marker.className = 'tab-drag-insertion';
+    marker.style.top = Math.round(rect.top + 5) + 'px';
+    marker.style.height = Math.max(12, Math.round(rect.height - 10)) + 'px';
+    document.body.appendChild(marker);
+    return marker;
+}
+
+function positionTabDragGhost(clientX, clientY) {
+    var ghost = tabDragState.ghost;
+    if (!ghost) return;
+    var left = Number(clientX) - tabDragState.offsetX;
+    var top = Number(clientY) - tabDragState.offsetY;
+    ghost.style.transform = 'translate3d(' + left.toFixed(2) + 'px,' + top.toFixed(2) + 'px,0) scale(1.025)';
+}
+
+function tabPreviewIndexForPointerX(clientX) {
+    var sourceIndex = tabDragState.sourceIndex;
+    var previewIndex = 0;
+    (tabDragState.itemMetrics || []).forEach(function(metric) {
+        if (metric.index === sourceIndex) return;
+        if (Number(clientX) >= Number(metric.center)) previewIndex += 1;
+    });
+    return Math.max(0, Math.min(previewIndex, Math.max(0, tabDragState.itemMetrics.length - 1)));
+}
+
+function applyTabDragPreview(previewIndex) {
+    if (!tabDragState.active) return;
+    previewIndex = Math.max(0, Math.min(Number(previewIndex) || 0, Math.max(0, tabDragState.itemMetrics.length - 1)));
+    if (tabDragState.previewMode === 'tabs' && tabDragState.previewIndex === previewIndex) return;
+    tabDragState.previewMode = 'tabs';
+    tabDragState.previewIndex = previewIndex;
+    (tabDragState.itemMetrics || []).forEach(function(metric) {
+        if (!metric || !metric.element || metric.index === tabDragState.sourceIndex) return;
+        var shift = tabDragShiftForIndex(tabDragState.sourceIndex, previewIndex, metric.index, tabDragState.unit);
+        metric.element.style.transform = shift ? 'translate3d(' + Math.round(shift) + 'px,0,0)' : '';
+    });
+    if (tabDragState.marker && tabDragState.sourceRect) {
+        var markerX = tabDragState.sourceRect.left + (previewIndex - tabDragState.sourceIndex) * tabDragState.unit;
+        tabDragState.marker.style.transform = 'translate3d(' + Math.round(markerX) + 'px,0,0)';
+        tabDragState.marker.classList.add('visible');
+    }
+}
+
+function applyTabRemovalPreview() {
+    if (tabDragState.previewMode === 'project') return;
+    tabDragState.previewMode = 'project';
+    (tabDragState.itemMetrics || []).forEach(function(metric) {
+        if (!metric || !metric.element || metric.index === tabDragState.sourceIndex) return;
+        var shift = metric.index > tabDragState.sourceIndex ? -tabDragState.unit : 0;
+        metric.element.style.transform = shift ? 'translate3d(' + Math.round(shift) + 'px,0,0)' : '';
+    });
+    if (tabDragState.marker && tabDragState.marker.classList) tabDragState.marker.classList.remove('visible');
+}
+
+function applyTabOutsidePreview() {
+    if (tabDragState.previewMode === 'outside') return;
+    tabDragState.previewMode = 'outside';
+    tabDragState.previewIndex = tabDragState.sourceIndex;
+    (tabDragState.itemMetrics || []).forEach(function(metric) {
+        if (metric && metric.element && metric.index !== tabDragState.sourceIndex) metric.element.style.transform = '';
+    });
+    if (tabDragState.marker && tabDragState.marker.classList) tabDragState.marker.classList.remove('visible');
+}
+
+function setTabProjectDropTarget(metric, blocked) {
+    var element = metric && metric.element;
+    var projectId = metric ? Number(metric.projectId) : null;
+    if (tabDragState.projectTargetElement === element && tabDragState.projectTargetBlocked === Boolean(blocked)) return;
+    clearTabProjectDropTarget();
+    tabDragState.projectTargetId = projectId;
+    tabDragState.projectTargetElement = element || null;
+    tabDragState.projectTargetRect = metric && metric.rect ? metric.rect : null;
+    tabDragState.projectTargetBlocked = Boolean(blocked);
+    if (element && element.classList) element.classList.add(blocked ? 'tab-drop-blocked' : 'tab-drop-target');
+    if (tabDragState.ghost && tabDragState.ghost.classList) tabDragState.ghost.classList.add(blocked ? 'project-drop-blocked' : 'project-drop');
+}
+
+function flushTabPointerDragFrame() {
+    tabDragState.frame = 0;
+    if (!tabDragState.active || tabDragState.settling) return;
+    var dragged = draggedTabRecord();
+    if (!dragged) return;
+    var projectTarget = tabProjectDropTargetForPointer(tabDragState.x, tabDragState.y);
+    if (projectTarget) {
+        var targetChanged = tabDragState.projectTargetElement !== projectTarget.element;
+        if (targetChanged) {
+            var reason = tabProjectMoveBlockReason(dragged, projectTarget.projectId);
+            setTabProjectDropTarget(projectTarget, Boolean(reason));
+        }
+        applyTabRemovalPreview();
+        return;
+    }
+    clearTabProjectDropTarget();
+    var rect = tabDragState.tabBarRect;
+    var insideTabBar = rect && tabDragState.x >= rect.left && tabDragState.x <= rect.right
+        && tabDragState.y >= rect.top - 12 && tabDragState.y <= rect.bottom + 12;
+    if (insideTabBar && Number(dragged.projectId) === Number(activeProjectId)) {
+        applyTabDragPreview(tabPreviewIndexForPointerX(tabDragState.x));
+    } else {
+        applyTabOutsidePreview();
+    }
+}
+
+function scheduleTabPointerDragFrame() {
+    if (tabDragState.frame || !tabDragState.active) return;
+    var requestFrame = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : function(callback) { return setTimeout(callback, 16); };
+    tabDragState.frame = requestFrame(flushTabPointerDragFrame);
+}
+
+function activateTabPointerDrag(element) {
+    var tabBar = document.getElementById('tabBar');
+    if (!tabBar || !element) return false;
+    var geometry = measureTabDragGeometry(tabBar, element);
+    if (geometry.sourceIndex < 0) return false;
+    tabDragState.active = true;
+    tabDragState.sourceIndex = geometry.sourceIndex;
+    tabDragState.previewIndex = geometry.sourceIndex;
+    tabDragState.sourceRect = geometry.sourceRect;
+    tabDragState.tabBarRect = geometry.tabBarRect;
+    tabDragState.unit = geometry.unit;
+    tabDragState.itemMetrics = geometry.metrics;
+    tabDragState.projectMetrics = measureTabProjectDropGeometry();
+    tabDragState.previewMode = 'idle';
+    tabDragState.offsetX = tabDragState.startX - geometry.sourceRect.left;
+    tabDragState.offsetY = tabDragState.startY - geometry.sourceRect.top;
+    tabDragState.ghost = createTabDragGhost(element, geometry.sourceRect);
+    tabDragState.marker = createTabDragMarker(geometry.sourceRect);
+    element.classList.add('tab-drag-source');
+    element.setAttribute('aria-grabbed', 'true');
+    if (document.body && document.body.classList) document.body.classList.add('tab-pointer-drag-active');
+    try { if (typeof element.setPointerCapture === 'function') element.setPointerCapture(tabDragState.pointerId); } catch (_error) {}
+    positionTabDragGhost(tabDragState.x, tabDragState.y);
+    applyTabDragPreview(tabDragState.sourceIndex);
+    return true;
+}
+
+function beginTabPointerGesture(event, tab, element) {
+    if (!event || !tab || !element || Number(event.button) !== 0 || event.isPrimary === false) return false;
+    if (event.target && event.target.closest && event.target.closest('.tab-close')) return false;
+    if (tabDragState.tabId !== null) return false;
+    resetTabDragState(false);
+    tabDragState.tabId = Number(tab.id);
+    tabDragState.pointerId = event.pointerId;
+    tabDragState.sourceProjectId = Number(tab.projectId);
+    tabDragState.element = element;
+    tabDragState.startX = tabDragState.x = Number(event.clientX) || 0;
+    tabDragState.startY = tabDragState.y = Number(event.clientY) || 0;
+    return true;
+}
+
+function onTabPointerMove(event) {
+    if (tabDragState.tabId === null || event.pointerId !== tabDragState.pointerId || tabDragState.settling) return;
+    var samples = typeof event.getCoalescedEvents === 'function' ? event.getCoalescedEvents() : null;
+    var sample = samples && samples.length ? samples[samples.length - 1] : event;
+    tabDragState.x = Number(sample.clientX) || 0;
+    tabDragState.y = Number(sample.clientY) || 0;
+    if (!tabDragState.active) {
+        var dx = tabDragState.x - tabDragState.startX;
+        var dy = tabDragState.y - tabDragState.startY;
+        if ((dx * dx) + (dy * dy) < 25) return;
+        if (!activateTabPointerDrag(tabDragState.element)) { resetTabDragState(false); return; }
+    }
+    // Ghost motion is transform-only and intentionally updates immediately. The
+    // heavier insertion/project-state work remains coalesced to one animation frame.
+    positionTabDragGhost(tabDragState.x, tabDragState.y);
+    scheduleTabPointerDragFrame();
+}
+
+function animateTabDragGhostTo(left, top, scale, opacity, done) {
+    var ghost = tabDragState.ghost;
+    if (!ghost) { done(); return; }
+    tabDragState.settling = true;
+    if (document.body && document.body.classList) document.body.classList.add('tab-pointer-drag-settling');
+    ghost.classList.add('tab-drag-settling');
+    var settled = false;
+    var onTransitionEnd = function(event) { if (event && event.propertyName !== 'transform') return; finish(); };
+    var finish = function() {
+        if (settled) return;
+        settled = true;
+        ghost.removeEventListener('transitionend', onTransitionEnd);
+        done();
+    };
+    ghost.addEventListener('transitionend', onTransitionEnd);
+    var requestFrame = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : function(callback) { return setTimeout(callback, 0); };
+    requestFrame(function() {
+        ghost.style.transform = 'translate3d(' + Math.round(left) + 'px,' + Math.round(top) + 'px,0) scale(' + Number(scale || 1) + ')';
+        ghost.style.opacity = String(opacity);
+    });
+    setTimeout(finish, 190);
+}
+
+function finalizeTabPointerDrag(commit) {
+    var pending = tabDragState.renderPending;
+    cleanupTabDragVisuals();
+    resetTabDragState(false);
+    if (typeof commit === 'function') commit();
+    else if (pending && typeof renderTabs === 'function') renderTabs();
+}
+
+function cancelTabPointerDrag() {
+    if (tabDragState.tabId === null) return false;
+    if (!tabDragState.active) { resetTabDragState(tabDragState.renderPending); return true; }
+    clearTabProjectDropTarget();
+    applyTabDragPreview(tabDragState.sourceIndex);
+    var rect = tabDragState.sourceRect;
+    animateTabDragGhostTo(rect.left, rect.top, 1, 0.72, function() { finalizeTabPointerDrag(null); });
+    return true;
+}
+
+function completeTabPointerDrag(event, cancelled) {
+    if (tabDragState.tabId === null || (event && event.pointerId !== undefined && event.pointerId !== tabDragState.pointerId)) return false;
+    if (event) {
+        tabDragState.x = Number(event.clientX) || tabDragState.x;
+        tabDragState.y = Number(event.clientY) || tabDragState.y;
+    }
+    if (!tabDragState.active) { resetTabDragState(tabDragState.renderPending); return false; }
+    tabDragSuppressClickUntil = Date.now() + 180;
+    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+    positionTabDragGhost(tabDragState.x, tabDragState.y);
+    if (tabDragState.frame) {
+        var cancelFrame = typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame : clearTimeout;
+        cancelFrame(tabDragState.frame);
+        tabDragState.frame = 0;
+    }
+    flushTabPointerDragFrame();
+    if (cancelled) return cancelTabPointerDrag();
+    var dragged = draggedTabRecord();
+    if (!dragged) return cancelTabPointerDrag();
+    if (tabDragState.projectTargetElement) {
+        if (tabDragState.projectTargetBlocked) {
+            if (typeof playUiSound === 'function') playUiSound('blocked');
+            return cancelTabPointerDrag();
+        }
+        var projectId = tabDragState.projectTargetId;
+        var projectRect = tabDragState.projectTargetRect;
+        var ghostHeight = tabDragState.sourceRect ? tabDragState.sourceRect.height : 0;
+        var left = projectRect.left + 12;
+        var top = projectRect.top + (projectRect.height - ghostHeight * 0.82) / 2;
+        var targetTabs = typeof tabsForProject === 'function' ? tabsForProject(projectId) : [];
+        animateTabDragGhostTo(left, top, 0.82, 0, function() {
+            finalizeTabPointerDrag(function() { moveTabToProject(dragged.id, projectId, targetTabs.length); });
+        });
+        return true;
+    }
+    var rect = tabDragState.tabBarRect;
+    var validTabDrop = rect && tabDragState.x >= rect.left && tabDragState.x <= rect.right
+        && tabDragState.y >= rect.top - 12 && tabDragState.y <= rect.bottom + 12;
+    if (!validTabDrop) return cancelTabPointerDrag();
+    var previewIndex = tabDragState.previewIndex;
+    var sourceIndex = tabDragState.sourceIndex;
+    var targetLeft = tabDragState.sourceRect.left + (previewIndex - sourceIndex) * tabDragState.unit;
+    var targetTop = tabDragState.sourceRect.top;
+    var commitIndex = tabDragCommitIndex(sourceIndex, previewIndex);
+    animateTabDragGhostTo(targetLeft, targetTop, 1, 0.96, function() {
+        finalizeTabPointerDrag(previewIndex === sourceIndex ? null : function() { reorderTabWithinProject(dragged.id, commitIndex); });
+    });
+    return true;
+}
+
+function initializeTabDragSurfaces(tabBar) {
+    if (tabBar && (!tabBar.dataset || tabBar.dataset.tabPointerBound !== 'true')) {
+        if (tabBar.dataset) tabBar.dataset.tabPointerBound = 'true';
+        tabBar.addEventListener('pointerdown', function(event) {
+            var element = event.target && event.target.closest ? event.target.closest('.tab-item') : null;
+            if (!element || !tabBar.contains(element)) return;
+            var tabId = Number(element.dataset && element.dataset.tab);
+            var tab = tabs.find(function(candidate) { return candidate && Number(candidate.id) === tabId; });
+            beginTabPointerGesture(event, tab, element);
+        });
+    }
+    if (typeof window !== 'undefined' && (!document.body || !document.body.dataset || document.body.dataset.tabPointerWindowBound !== 'true')) {
+        if (document.body && document.body.dataset) document.body.dataset.tabPointerWindowBound = 'true';
+        window.addEventListener('pointermove', onTabPointerMove, { passive: true });
+        window.addEventListener('pointerup', function(event) { completeTabPointerDrag(event, false); });
+        window.addEventListener('pointercancel', function(event) { completeTabPointerDrag(event, true); });
+        window.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape' && tabDragState.active) { event.preventDefault(); cancelTabPointerDrag(); }
+        });
+    }
+}
 function renderTabs() {
     if (typeof renderAgentAttention === 'function') renderAgentAttention();
+    if (tabDragState && (tabDragState.active || tabDragState.settling)) { tabDragState.renderPending = true; return true; }
     const tabBar = document.getElementById('tabBar');
     if (!tabBar) return false;
     var barWidth = visibleTabBarWidth(tabBar);
@@ -15146,14 +17792,14 @@ function renderTabs() {
         return false;
     }
     if (tabBar.dataset) delete tabBar.dataset.layoutPending;
-    // Remove all tab items and delimiters but keep the + and Browser controls.
+    initializeTabDragSurfaces(tabBar);
+    // Remove all tab items and delimiters while preserving the + control.
     tabBar.querySelectorAll('.tab-item, .tab-delimiter').forEach(el => el.remove());
     const minWidth = 80;
     const maxWidth = 350;
     const renderedTabs = typeof activeProjectTabs === 'function' ? activeProjectTabs() : tabs;
     const totalTabs = renderedTabs.length;
     const tabNew = tabBar.querySelector('.tab-new');
-    const browserToggle = tabBar.querySelector('.tab-bar-browser-toggle');
     const measuredWidth = function(element, fallback) {
         if (!element) return 0;
         if (typeof element.getBoundingClientRect === 'function') {
@@ -15168,7 +17814,6 @@ function renderTabs() {
     const delimiterOuterWidth = 1;
     const reservedWidth = 24
         + measuredWidth(tabNew, 32)
-        + measuredWidth(browserToggle, 92)
         + delimiterCount * delimiterOuterWidth;
     const availableWidth = Math.max(minWidth, barWidth - reservedWidth);
     let tabWidth = Math.floor(availableWidth / Math.max(1, totalTabs));
@@ -15191,7 +17836,9 @@ function renderTabs() {
         else if (tabGenerating) div.title = 'Generating';
         div.dataset.tab = tab.id;
         div.style.width = tabWidth + 'px';
+        div.setAttribute('aria-grabbed', 'false');
         div.addEventListener('click', function(event) {
+            if (Date.now() < tabDragSuppressClickUntil) return;
             if (event.target && event.target.closest && event.target.closest('.tab-close')) return;
             switchTab(tab.id);
         });
@@ -15220,9 +17867,67 @@ function renderTabs() {
     return true;
 }
 
+function composerDraftForTab(tab) {
+    if (!tab || typeof tab !== 'object') return { text: '', image: null };
+    var current = tab.composerDraft && typeof tab.composerDraft === 'object' ? tab.composerDraft : {};
+    var image = current.image && typeof current.image === 'object' ? Object.assign({}, current.image) : null;
+    tab.composerDraft = { text: String(current.text || ''), image: image };
+    return tab.composerDraft;
+}
+
+function captureComposerDraftForTab(tab) {
+    if (!tab || typeof tab !== 'object') return false;
+    var input = document.getElementById('messageInput');
+    var image = typeof pendingImage !== 'undefined' && pendingImage && typeof pendingImage === 'object'
+        ? Object.assign({}, pendingImage)
+        : null;
+    tab.composerDraft = {
+        text: input ? String(input.value || '') : String(composerDraftForTab(tab).text || ''),
+        image: image
+    };
+    return true;
+}
+
+function captureActiveComposerDraft() {
+    return captureComposerDraftForTab(typeof getActiveTab === 'function' ? getActiveTab() : null);
+}
+
+function restoreComposerDraftForTab(tab) {
+    var draft = composerDraftForTab(tab);
+    var input = document.getElementById('messageInput');
+    if (input) {
+        input.value = draft.text;
+        input.style.height = 'auto'; input.style.overflowY = 'hidden';
+        input.style.height = Math.min(input.scrollHeight || 0, 200) + 'px';
+        input.style.overflowY = (input.scrollHeight || 0) > 200 ? 'auto' : 'hidden';
+    }
+
+    pendingImage = draft.image && typeof draft.image === 'object' ? Object.assign({}, draft.image) : null;
+    var preview = document.getElementById('imagePreview');
+    var container = document.getElementById('imagePreviewContainer');
+    var name = document.getElementById('imageName');
+    var size = document.getElementById('imageSize');
+    if (pendingImage) {
+        var dataUrl = Darkstar.imageData.safeDataUrl(pendingImage, pendingImage.mimeType || 'image/png');
+        if (preview && dataUrl) preview.src = dataUrl;
+        if (name) name.textContent = String(pendingImage.name || 'image.png');
+        if (size && typeof formatFileSize === 'function') size.textContent = formatFileSize(Number(pendingImage.size) || 0);
+        if (container) container.classList.add('has-image');
+    } else {
+        if (preview) preview.removeAttribute('src');
+        if (name) name.textContent = '';
+        if (size) size.textContent = '';
+        if (container) container.classList.remove('has-image');
+    }
+    if (typeof updateSlashCommandMenu === 'function') updateSlashCommandMenu(draft.text);
+    if (typeof updateScheduleButton === 'function') updateScheduleButton();
+    return true;
+}
+
 function tabIsPristine(tab) {
     if (!tab || tab.history.length !== 0 || tab.tokens !== 0) return false;
-    return true;
+    var draft = composerDraftForTab(tab);
+    return !String(draft.text || '').length && !draft.image;
 }
 
 
@@ -15244,6 +17949,7 @@ function switchTab(tabId) {
         closeEditModal({ restoreFocus: false });
     }
     saveActiveTabScrollState();
+    captureActiveComposerDraft();
     if (typeof collapseScheduledQueueUi === 'function') collapseScheduledQueueUi();
     activeTabId = tabId;
     if (typeof getActiveProject === 'function') {
@@ -15267,12 +17973,7 @@ function switchTab(tabId) {
     updateTokenCounter();
     renderQueue();
     if (typeof updateButtonStates === 'function') updateButtonStates(typeof activeTabOwnsGeneration === 'function' ? activeTabOwnsGeneration() : false);
-    // Clear input when switching tabs
-    const input = document.getElementById('messageInput');
-    if (input) {
-        input.value = '';
-        input.style.height = 'auto'; input.style.overflowY = 'hidden';
-    }
+    restoreComposerDraftForTab(targetTab);
     if (typeof updateScheduleButton === 'function') updateScheduleButton();
     if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
 }
@@ -15288,6 +17989,7 @@ function createNewTab() {
     if (otherEmpty) {
         // Route to an existing empty tab even while other tabs are generating.
         saveActiveTabScrollState();
+        captureActiveComposerDraft();
         if (typeof collapseScheduledQueueUi === 'function') collapseScheduledQueueUi();
         activeTabId = otherEmpty.id;
         if (typeof getActiveProject === 'function') {
@@ -15302,8 +18004,7 @@ function createNewTab() {
         renderChat();
         updateTokenCounter();
         renderQueue();
-        const input = document.getElementById('messageInput');
-        if (input) { input.value = ''; input.style.height = 'auto'; input.style.overflowY = 'hidden'; }
+        restoreComposerDraftForTab(otherEmpty);
         if (typeof updateButtonStates === 'function') updateButtonStates(false);
         if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
         return;
@@ -15319,9 +18020,10 @@ function createNewTab() {
         return; // Max 10 tabs
     }
     const newId = nextTabId++;
-    const tab = { id: newId, projectId: typeof activeProjectId === 'undefined' ? 0 : activeProjectId, title: nextDefaultChatTitle(typeof activeProjectId === 'undefined' ? 0 : activeProjectId), history: [], tokens: 0, tokensExact: false, tokensPerSecond: 0, scheduled: [], conversationNameState: 'idle', userScrolledUp: false, welcomeQuote: '' };
+    const tab = { id: newId, projectId: typeof activeProjectId === 'undefined' ? 0 : activeProjectId, title: nextDefaultChatTitle(typeof activeProjectId === 'undefined' ? 0 : activeProjectId), history: [], tokens: 0, tokensExact: false, tokensPerSecond: 0, scheduled: [], conversationNameState: 'idle', userScrolledUp: false, welcomeQuote: '', composerDraft: { text: '', image: null } };
     if (typeof ensureWelcomeQuoteForTab === 'function') ensureWelcomeQuoteForTab(tab);
     saveActiveTabScrollState();
+    captureActiveComposerDraft();
     if (typeof collapseScheduledQueueUi === 'function') collapseScheduledQueueUi();
     tabs.push(tab);
     activeTabId = newId;
@@ -15350,12 +18052,7 @@ function createNewTab() {
     renderChat();
     updateTokenCounter();
     renderQueue();
-    // Clear input when creating new tab
-    const input = document.getElementById('messageInput');
-    if (input) {
-        input.value = '';
-        input.style.height = 'auto'; input.style.overflowY = 'hidden';
-    }
+    restoreComposerDraftForTab(tab);
     if (typeof updateScheduleButton === 'function') updateScheduleButton();
     if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
 }
@@ -15410,6 +18107,7 @@ function closeTab(tabId) {
                     restoreTabScrollState(activeTabId);
                     if (typeof activateWorkspaceForTab === 'function') activateWorkspaceForTab(activeTabId);
                     if (typeof activateOfflineBrowserForTab === 'function') Darkstar.async.runBestEffort(function() { return activateOfflineBrowserForTab(activeTabId); }, 'TABS');
+                    restoreComposerDraftForTab(typeof getActiveTab === 'function' ? getActiveTab() : null);
                 }
                 if (typeof releaseOfflineBrowserForTab === 'function') Darkstar.async.runBestEffort(function() { return releaseOfflineBrowserForTab(tabId); }, 'TABS');
                 if (typeof releaseWorkspaceForTab === 'function') releaseWorkspaceForTab(tabId);
@@ -15437,6 +18135,7 @@ function closeTab(tabId) {
         restoreTabScrollState(activeTabId);
         if (typeof activateWorkspaceForTab === 'function') activateWorkspaceForTab(activeTabId);
         if (typeof activateOfflineBrowserForTab === 'function') Darkstar.async.runBestEffort(function() { return activateOfflineBrowserForTab(activeTabId); }, 'TABS');
+        restoreComposerDraftForTab(typeof getActiveTab === 'function' ? getActiveTab() : null);
     }
     if (typeof releaseOfflineBrowserForTab === 'function') Darkstar.async.runBestEffort(function() { return releaseOfflineBrowserForTab(tabId); }, 'TABS');
     if (typeof releaseWorkspaceForTab === 'function') releaseWorkspaceForTab(tabId);
@@ -15535,6 +18234,17 @@ function normalizeProjectorRecords(records) {
     }).filter(Boolean);
 }
 
+function normalizeDiffusionModelRecords(records) {
+    var seen = Object.create(null);
+    return (Array.isArray(records) ? records : []).map(function(model) {
+        if (!model || typeof model !== 'object') return null;
+        var modelPath = String(model.path || '').trim();
+        if (!modelPath || seen[modelPath]) return null;
+        seen[modelPath] = true;
+        return { path: modelPath, fileName: String(model.fileName || modelPath.split(/[\/]/).pop() || modelPath) };
+    }).filter(Boolean);
+}
+
 function modelInventorySignature(models) {
     return JSON.stringify((Array.isArray(models) ? models : []).map(function(model) {
         return [String(model.id || ''), String(model.displayName || ''), model.layerCount || null, model.contextLength || null, model.reasoning || null, model.mtp || null];
@@ -15544,7 +18254,7 @@ function modelInventorySignature(models) {
 function rerenderModelDependentNodes() {
     if (!nodeEditorState || !nodeEditorState.initialized || typeof rerenderNode !== 'function') return;
     nodeEditorState.nodes.filter(function(node) {
-        return node.type === 'modelLoader' || node.type === 'sampler' || node.type === 'loadServer';
+        return node.type === 'modelLoader' || node.type === 'sampler' || node.type === 'loadServer' || node.type === 'localSampler';
     }).forEach(function(node) {
         rerenderNode(node.id);
     });
@@ -15552,19 +18262,21 @@ function rerenderModelDependentNodes() {
 
 function rerenderModelReasoningNodes() {
     if (!nodeEditorState || !nodeEditorState.initialized || typeof rerenderNode !== 'function') return;
-    nodeEditorState.nodes.filter(function(node) { return node.type === 'sampler'; }).forEach(function(node) {
+    nodeEditorState.nodes.filter(function(node) { return node.type === 'localSampler'; }).forEach(function(node) {
         rerenderNode(node.id);
     });
 }
 
-function applyModelInventory(records, projectorRecords) {
+function applyModelInventory(records, projectorRecords, diffusionModelRecords) {
     var select = document.getElementById('modelSelect');
     if (!select) return false;
     var models = normalizeModelRecords(records);
     window.Darkstar = window.Darkstar || {};
     var previousInventory = Array.isArray(window.Darkstar.modelInventory) ? window.Darkstar.modelInventory : [];
     var previousProjectors = Array.isArray(window.Darkstar.projectorInventory) ? window.Darkstar.projectorInventory : [];
+    var previousDiffusionModels = Array.isArray(window.Darkstar.diffusionModelInventory) ? window.Darkstar.diffusionModelInventory : [];
     var projectors = normalizeProjectorRecords(projectorRecords);
+    var diffusionModels = normalizeDiffusionModelRecords(diffusionModelRecords);
     var loader = typeof nodeEditorState !== 'undefined' && nodeEditorState && Array.isArray(nodeEditorState.nodes)
         ? nodeEditorState.nodes.find(function(node) { return node.type === 'modelLoader'; })
         : null;
@@ -15576,9 +18288,11 @@ function applyModelInventory(records, projectorRecords) {
     var previousSignature = modelInventorySignature(previousInventory);
     var nextSignature = modelInventorySignature(models);
     var projectorChanged = JSON.stringify(previousProjectors) !== JSON.stringify(projectors);
-    var changed = previousSignature !== nextSignature || projectorChanged;
+    var diffusionModelsChanged = JSON.stringify(previousDiffusionModels) !== JSON.stringify(diffusionModels);
+    var changed = previousSignature !== nextSignature || projectorChanged || diffusionModelsChanged;
 
     window.Darkstar.modelInventory = models.slice();
+    window.Darkstar.diffusionModelInventory = diffusionModels.slice();
     window.Darkstar.projectorInventory = projectors.slice();
     select.innerHTML = '';
     if (!models.length) {
@@ -15609,6 +18323,9 @@ function applyModelInventory(records, projectorRecords) {
 
     if (changed) {
         rerenderModelDependentNodes();
+        if (diffusionModelsChanged && nodeEditorState && nodeEditorState.initialized && typeof rerenderNode === 'function') {
+            nodeEditorState.nodes.filter(function(node) { return node.type === 'com.darkstar.diffusion-backend-gguf.setter'; }).forEach(function(node) { rerenderNode(node.id); });
+        }
         if (typeof refreshModelDependentNodeControls === 'function') {
             refreshModelDependentNodeControls({ resetGpuLayers: false });
         }
@@ -15640,16 +18357,18 @@ async function loadModelList(options) {
     try {
         var records = [];
         var projectors = [];
+        var diffusionModels = [];
         if (window.darkstar && window.darkstar.nodes && typeof window.darkstar.nodes.listModels === 'function') {
             var response = await window.darkstar.nodes.listModels();
             if (response && response.success && Array.isArray(response.models)) records = response.models;
+            if (response && response.success && Array.isArray(response.diffusionModels)) diffusionModels = response.diffusionModels;
             if (response && response.success && Array.isArray(response.projectors)) projectors = response.projectors;
         }
         if (!records.length && window.darkstar && typeof window.darkstar.listModels === 'function') {
             var listedModels = await window.darkstar.listModels();
             records = Array.isArray(listedModels) ? listedModels : [];
         }
-        return applyModelInventory(records, projectors);
+        return applyModelInventory(records, projectors, diffusionModels);
     } catch (error) {
         if (!options.quiet) console.error('[LM] Error:', error && error.message ? error.message : error);
         showModelInventoryError();
@@ -15666,7 +18385,8 @@ function startAutomaticModelRefresh() {
         nodeBridge.onModelsChanged(function(payload) {
             var records = payload && Array.isArray(payload.models) ? payload.models : payload;
             var projectors = payload && Array.isArray(payload.projectors) ? payload.projectors : [];
-            applyModelInventory(records, projectors);
+            var diffusionModels = payload && Array.isArray(payload.diffusionModels) ? payload.diffusionModels : [];
+            applyModelInventory(records, projectors, diffusionModels);
         });
     }
 
@@ -15690,7 +18410,7 @@ function startAutomaticModelRefresh() {
     // RENDERER MODULE :: backend/renderer/params.js
     // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/params.js">
 // === PARAMS.JS ===
-// Parameters are managed by the Sampler node in the graph.
+// Sampling parameters are owned by L_Sampler in the graph.
 // This getter is an intentional compatibility API for external/custom code.
 
 
@@ -15700,17 +18420,17 @@ function startAutomaticModelRefresh() {
 
 
 function getGenerationParams() {
-    // Parameters come from the Sampler node in the graph
-    var sampler = nodeEditorState.nodes.find(function(n) { return n.type === 'sampler'; });
-    if (sampler && sampler.params) {
+    // Sampling parameters come from L_Sampler.
+    var localSampler = nodeEditorState.nodes.find(function(n) { return n.type === 'localSampler'; });
+    if (localSampler && localSampler.params) {
         return {
-            temperature: parseFloat(sampler.params.temperature),
-            top_p: parseFloat(sampler.params.topP),
-            top_k: parseInt(sampler.params.topK),
-            repeat_penalty: parseFloat(sampler.params.repeatPenalty)
+            temperature: parseFloat(localSampler.params.temperature),
+            top_p: parseFloat(localSampler.params.topP),
+            top_k: parseInt(localSampler.params.topK),
+            repeat_penalty: parseFloat(localSampler.params.repeatPenalty)
         };
     }
-    // No sampler in graph — this should not happen if the graph is valid
+    // No L_Sampler in graph — this should not happen for a valid local pipeline
     return null;
 }
     // <DARKSTAR_SOURCE_END path="backend/renderer/params.js">
@@ -15749,6 +18469,7 @@ function showPendingImage(file, dataUrl, fallbackName, mimeTypeHint) {
     const container = document.getElementById('imagePreviewContainer');
     if (container) container.classList.add('has-image');
     if (typeof updateScheduleButton === 'function') updateScheduleButton();
+    if (typeof captureActiveComposerDraft === 'function') captureActiveComposerDraft();
     if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(350);
     return true;
 }
@@ -15819,6 +18540,7 @@ function removeImage() {
     const container = document.getElementById('imagePreviewContainer');
     if (container) container.classList.remove('has-image');
     if (typeof updateScheduleButton === 'function') updateScheduleButton();
+    if (typeof captureActiveComposerDraft === 'function') captureActiveComposerDraft();
     if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(350);
 }
 
@@ -15924,6 +18646,7 @@ function formatFileSize(bytes) {
         if (input.style) { input.style.height = 'auto'; input.style.overflowY = 'hidden'; }
         if (typeof root.closeSlashCommandMenu === 'function') root.closeSlashCommandMenu();
         if (typeof root.updateScheduleButton === 'function') root.updateScheduleButton();
+        if (typeof captureActiveComposerDraft === 'function') captureActiveComposerDraft();
     }
 
     function activeSession(tab) {
@@ -16080,6 +18803,46 @@ function formatFileSize(bytes) {
         return addition ? base + '\n\nSUPERVISOR ADDITIONAL ARGUMENTS:\n' + addition : base;
     }
 
+    function adversaryContextImage(part, index) {
+        if (!part || typeof part !== 'object' || String(part.type || '') !== 'image_url') return null;
+        var imageUrl = typeof part.image_url === 'string' ? part.image_url : (part.image_url && typeof part.image_url === 'object' ? part.image_url.url : '');
+        var parsed = root.Darkstar && root.Darkstar.imageData && root.Darkstar.imageData.parseDataUrl(String(imageUrl || ''));
+        if (!parsed || ['image/png', 'image/jpeg', 'image/webp'].indexOf(parsed.mimeType) < 0) return null;
+        var extension = parsed.mimeType === 'image/jpeg' ? 'jpg' : parsed.mimeType.split('/')[1];
+        return { id: 'adversary-context-image-' + String(index + 1), name: 'context-image-' + String(index + 1) + '.' + extension,
+            mimeType: parsed.mimeType, base64: parsed.base64, size: Math.max(0, Math.floor(parsed.base64.length * 3 / 4)) };
+    }
+
+    function adversaryVisualContextMessages(message) {
+        if (!message || message.role !== 'assistant' || !Array.isArray(message.toolContext)) return [];
+        var visualMessages = [];
+        var nextImageIndex = 0;
+        message.toolContext.forEach(function(toolMessage) {
+            if (!toolMessage || toolMessage.role !== 'user' || !Array.isArray(toolMessage.content)) return;
+            var images = [];
+            var textParts = [];
+            toolMessage.content.forEach(function(part) {
+                if (part && typeof part === 'object' && part.type === 'text' && typeof part.text === 'string' && part.text.trim()) {
+                    textParts.push(part.text.trim());
+                }
+                var image = adversaryContextImage(part, nextImageIndex);
+                if (image) {
+                    images.push(image);
+                    nextImageIndex += 1;
+                }
+            });
+            if (!images.length) return;
+            visualMessages.push({
+                role: 'user',
+                content: textParts.join('\n').trim() || 'Image context from the original agent run.',
+                images: images,
+                adversaryVisualContext: true,
+                ephemeral: true
+            });
+        });
+        return visualMessages;
+    }
+
     function historySnapshot(history, instruction) {
         var snapshot = [];
         (Array.isArray(history) ? history : []).forEach(function(message) {
@@ -16102,6 +18865,9 @@ function formatFileSize(bytes) {
             if (message.excludeOwnContentFromContext === true) clean.excludeOwnContentFromContext = true;
             if (message.compactedContext === true) clean.compactedContext = true;
             if (message.autoCompacted === true) clean.autoCompacted = true;
+            if (clean.role === 'assistant') {
+                adversaryVisualContextMessages(message).forEach(function(visualMessage) { snapshot.push(visualMessage); });
+            }
             snapshot.push(clean);
         });
         snapshot.push({
@@ -16250,7 +19016,7 @@ function createGenerationSession(tab) {
         responseText: '',
         agentTimeline: [],
         working: [],
-        toolContext: [],
+        toolContext: [], presentedImageIds: [],
         partialToolCall: null,
         interventionSequence: 0,
         interventionHandoffOpen: false,
@@ -16457,7 +19223,7 @@ function persistFailedAssistant(tab, assistantDiv, message, timeline, session) {
         reasoning: reasoning,
         working: working,
         toolContext: toolContext,
-        agentTimeline: storedTimeline
+        agentTimeline: storedTimeline, presentedImageIds: session && Array.isArray(session.presentedImageIds) ? session.presentedImageIds.slice() : []
     };
     if (typeof enforceAtomicToolState === 'function') enforceAtomicToolState(record);
     var hasRecoverableContext = Array.isArray(record.toolContext) && record.toolContext.length > 0;
@@ -16611,7 +19377,7 @@ function persistInterruptedGeneration(tab, session, options) {
             ? session.working.map(function(activity) { return activity && typeof activity === 'object' ? Object.assign({}, activity) : activity; })
             : [],
         toolContext: session && Array.isArray(session.toolContext) ? copyGenerationToolContext(session.toolContext) : [],
-        agentTimeline: finalizeInterruptedTimeline(session && session.agentTimeline),
+        agentTimeline: finalizeInterruptedTimeline(session && session.agentTimeline), presentedImageIds: session && Array.isArray(session.presentedImageIds) ? session.presentedImageIds.slice() : [],
         interrupted: true,
         finishReason: 'interrupted',
         browserCompartmentActivated: Boolean(session && session.browserCompartmentActivated)
@@ -16622,7 +19388,7 @@ function persistInterruptedGeneration(tab, session, options) {
         || String(interruptedRecord.reasoning || '').length
         || (Array.isArray(interruptedRecord.agentTimeline) && interruptedRecord.agentTimeline.length)
         || (Array.isArray(interruptedRecord.toolContext) && interruptedRecord.toolContext.length)
-        || (Array.isArray(interruptedRecord.working) && interruptedRecord.working.length));
+        || (Array.isArray(interruptedRecord.working) && interruptedRecord.working.length) || (Array.isArray(interruptedRecord.presentedImageIds) && interruptedRecord.presentedImageIds.length));
     if (!hasMaterial && options.allowBoundaryOnly === false) return null;
     interruptedRecord.continuable = hasMaterial;
     interruptedRecord.interruptionBoundary = !hasMaterial;
@@ -17047,7 +19813,7 @@ async function sendMessage(regenerateFromIndex, options) {
         return payload.type === 'preparation-error'
             || payload.type === 'tool-context'
             || payload.type === 'context-image'
-            || payload.type === 'browser-compartment-activated';
+            || payload.type === 'browser-compartment-activated' || payload.type === 'response-image';
     }
     var generationUi = Darkstar.generationUi.createCoordinator({
         session: session,
@@ -17057,7 +19823,7 @@ async function sendMessage(regenerateFromIndex, options) {
         displayRole: function() { return generationDisplayRole(session); },
         addMessage: addMessage,
         formatMessage: function(text) { return formatMessage(text); },
-        updateMessageAgentTimeline: updateMessageAgentTimeline,
+        updateMessageAgentTimeline: updateMessageAgentTimeline, syncPresentedMessageImages: typeof syncPresentedMessageImages === 'function' ? syncPresentedMessageImages : null,
         timelineForDisplay: function(timeline) { return enrichAgentTimeline(session, continuationTimeline(session, timeline)); },
         updateRenderedMessageActions: typeof updateRenderedMessageActions === 'function' ? updateRenderedMessageActions : null,
         updateTokenCounter: updateTokenCounter,
@@ -17233,23 +19999,23 @@ async function sendMessage(regenerateFromIndex, options) {
                 session.lastModelOutputKind = 'tool';
                 session.phase = 'tool';
             }
-            if (state.browserCompartmentActivated === true) session.browserCompartmentActivated = true;
+            if (Array.isArray(state.presentedImageIds)) session.presentedImageIds = state.presentedImageIds.map(String); if (state.browserCompartmentActivated === true) session.browserCompartmentActivated = true;
         },
         onToolEvent: function(payload, working, timeline, toolContext) {
             if (!generationSessionIsCurrent(session)) return;
-            if (payload && payload.type === 'browser-compartment-activated') session.browserCompartmentActivated = true;
+            var wasToolPhase = session.phase === 'tool', imagePhase = payload && payload.imageGeneration && typeof payload.imageGeneration === 'object' ? String(payload.imageGeneration.phase || '') : '';
+            var imagePhaseChanged = Boolean(imagePhase && imagePhase !== session.imageGenerationPhase); if (imagePhase) session.imageGenerationPhase = imagePhase;
+            if (payload && payload.type === 'browser-compartment-activated') session.browserCompartmentActivated = true; if (payload && payload.type === 'start' && payload.activity && typeof globalThis.openBrowserWorkspaceForTool === 'function') Darkstar.async.runBestEffort(function() { return globalThis.openBrowserWorkspaceForTool(payload.activity.name, session.tabId); }, 'BROWSER_WORKSPACE');
             if (Array.isArray(working)) session.working = working;
-            if (Array.isArray(toolContext)) session.toolContext = copyGenerationToolContext(toolContext);
-            if (payload && (payload.type === 'start' || payload.type === 'progress' || payload.type === 'preparing' || payload.type === 'tool-context')) {
-                session.phase = 'tool';
-                session.lastModelOutputKind = 'tool';
+            if (Array.isArray(toolContext)) session.toolContext = copyGenerationToolContext(toolContext); if (payload && payload.type === 'response-image' && payload.imageId && !session.presentedImageIds.includes(String(payload.imageId))) { session.presentedImageIds.push(String(payload.imageId)); generationUi.queueAnswer(); }
+            if (payload && (payload.activity || payload.preparation || payload.type === 'tool-context' || payload.type === 'context-image' || payload.type === 'response-image' || payload.type === 'browser-compartment-activated' || payload.type === 'tool-call-fresh-retry')) {
+                session.phase = 'tool'; session.lastModelOutputKind = 'tool';
             }
             if (Array.isArray(timeline)) session.agentTimeline = generationTimelineWithCompactionPrelude(session, timeline);
-            scheduleReasoningBoundarySave(session.agentTimeline);
+            if (session.tabId === activeTabId && ((!wasToolPhase && session.phase === 'tool') || imagePhaseChanged)) generationUi.queueTimelineBoundary(session.agentTimeline);
             if (toolEventIsPersistenceBoundary(payload) && typeof scheduleChatSessionSave === 'function') {
                 scheduleChatSessionSave(0);
             }
-            if (session.tabId === activeTabId) smartScrollToBottom();
         },
         onAgentTimeline: function(timeline) {
             if (!generationSessionIsCurrent(session)) return;
@@ -17331,7 +20097,7 @@ async function sendMessage(regenerateFromIndex, options) {
             var fullWorking = Array.isArray(result.result.working) ? result.result.working : [];
             var toolMessages = Array.isArray(result.result.toolMessages) ? result.result.toolMessages : [];
             var runtimeAgentTimeline = Array.isArray(result.result.agentTimeline) ? result.result.agentTimeline : [];
-            var browserCompartmentActivated = result.result.browserCompartmentActivated === true;
+            var browserCompartmentActivated = result.result.browserCompartmentActivated === true; var presentedImageIds = Array.isArray(result.result.presentedImageIds) ? result.result.presentedImageIds.map(String) : []; session.presentedImageIds = presentedImageIds;
             var generatedDisplayTimeline = generationTimelineWithCompactionPrelude(session, runtimeAgentTimeline.length ? runtimeAgentTimeline : buildLegacyAgentTimeline(fullReasoning, fullWorking, toolMessages));
             var agentTimeline = generatedDisplayTimeline;
             session.agentTimeline = copyGenerationTimeline(agentTimeline);
@@ -17357,7 +20123,7 @@ async function sendMessage(regenerateFromIndex, options) {
                     assistantMessage.reasoning = continuationCombinedReasoning(session, fullReasoning);
                     assistantMessage.working = continuationWorking(session, fullWorking);
                     assistantMessage.toolContext = continuationToolContext(session, toolMessages);
-                    assistantMessage.agentTimeline = continuationTimeline(session, generatedDisplayTimeline);
+                    assistantMessage.agentTimeline = continuationTimeline(session, generatedDisplayTimeline); assistantMessage.presentedImageIds = Array.from(new Set((Array.isArray(assistantMessage.presentedImageIds) ? assistantMessage.presentedImageIds : []).concat(presentedImageIds)));
                     assistantMessage.browserCompartmentActivated = Boolean(session.continuationBaseBrowserCompartmentActivated) || browserCompartmentActivated;
                     assistantMessage.excludeOwnContentFromContext = Boolean(session.continuationBaseExcludeOwnContentFromContext) || assistantMessage.browserCompartmentActivated;
                     assistantMessage.finishReason = result.result.finishReason || null; assistantMessage.stopDetails = result.result.stopDetails && typeof result.result.stopDetails === 'object' ? structuredClone(result.result.stopDetails) : null;
@@ -17385,7 +20151,7 @@ async function sendMessage(regenerateFromIndex, options) {
                         reasoning: fullReasoning,
                         working: fullWorking,
                         toolContext: toolMessages,
-                        agentTimeline: agentTimeline,
+                        agentTimeline: agentTimeline, presentedImageIds: presentedImageIds.slice(),
                         finishReason: result.result.finishReason || null,
                         interrupted: false,
                         continuable: false,
@@ -17401,7 +20167,7 @@ async function sendMessage(regenerateFromIndex, options) {
                         reasoning: fullReasoning,
                         working: fullWorking,
                         toolContext: toolMessages,
-                        agentTimeline: agentTimeline,
+                        agentTimeline: agentTimeline, presentedImageIds: presentedImageIds.slice(),
                         finishReason: result.result.finishReason || null, stopDetails: result.result.stopDetails && typeof result.result.stopDetails === 'object' ? structuredClone(result.result.stopDetails) : null,
                         continuable: continuationFinishReasonIsAbrupt(result.result.finishReason, fullResponse, fullReasoning, agentTimeline),
                         interrupted: continuationFinishReasonIsAbrupt(result.result.finishReason, fullResponse, fullReasoning, agentTimeline),
@@ -17415,7 +20181,7 @@ async function sendMessage(regenerateFromIndex, options) {
                     assistantDiv.dataset.index = String(assistantHistoryIndex);
                     assistantDiv.dataset.messageId = String(assistantMessage.id || '');
                     assistantDiv.dataset.transient = 'false';
-                    assistantDiv.removeAttribute('data-generation-id');
+                    assistantDiv.removeAttribute('data-generation-id'); if (typeof syncPresentedMessageImages === 'function') syncPresentedMessageImages(assistantDiv, assistantMessage, assistantHistoryIndex);
                     if (typeof updateRenderedMessageActions === 'function') {
                         updateRenderedMessageActions(assistantDiv, generationDisplayRole(session), assistantHistoryIndex, assistantMessage.id);
                     }
@@ -17775,7 +20541,7 @@ function clearChat(options) {
         pendingImage = null;
         if (typeof removeImage === 'function') removeImage();
         var input = document.getElementById('messageInput');
-        if (input) { input.value = ''; input.style.height = 'auto'; input.style.overflowY = 'hidden'; }
+        if (input) { input.value = ''; input.style.height = 'auto'; input.style.overflowY = 'hidden'; } if (typeof captureActiveComposerDraft === 'function') captureActiveComposerDraft();
         var queue = document.getElementById('messageQueue');
         var toggle = document.getElementById('queueToggle');
         if (queue) queue.classList.remove('expanded');
@@ -18756,8 +21522,9 @@ function clearNodeContext() {
 
     function controlAutoCompactEnabled() {
         if (typeof nodeEditorState === 'undefined' || !nodeEditorState || !Array.isArray(nodeEditorState.nodes)) return false;
-        var control = nodeEditorState.nodes.find(function(node) { return node && node.type === 'control'; });
-        return Boolean(control && control.params && control.params.autoCompact === true);
+        var owner = nodeEditorState.nodes.find(function(node) { return node && node.type === 'sampler'; });
+        if (!owner) owner = nodeEditorState.nodes.find(function(node) { return node && node.type === 'control'; }) || null;
+        return Boolean(owner && owner.params && owner.params.autoCompact === true);
     }
 
     function liveAutoCompactThresholdReached(usage) {
@@ -18769,12 +21536,16 @@ function clearNodeContext() {
     function modelMessagesForCount(tab) {
         var system = [];
         var conversation = [];
-        var contextNode = typeof nodeEditorState !== 'undefined' && nodeEditorState && Array.isArray(nodeEditorState.nodes)
-            ? nodeEditorState.nodes.find(function(node) { return node && node.type === 'context'; })
-            : null;
-        var configuredSystem = String(contextNode && contextNode.params && contextNode.params.systemPrompt || '').trim();
+        var contextOwner = null;
+        if (typeof nodeEditorState !== 'undefined' && nodeEditorState && Array.isArray(nodeEditorState.nodes)) {
+            contextOwner = nodeEditorState.nodes.find(function(node) { return node && node.type === 'sampler'; }) ||
+                nodeEditorState.nodes.find(function(node) { return node && node.type === 'context'; }) || null;
+        }
+        var configuredSystem = String(contextOwner && contextOwner.params && contextOwner.params.systemPrompt || '').trim();
         if (configuredSystem) system.push({ role: 'system', content: configuredSystem });
-        (Array.isArray(tab && tab.history) ? tab.history : []).forEach(function(message) {
+        var sourceHistory = Array.isArray(tab && tab.history) ? tab.history : [];
+        if (contextOwner && contextOwner.params && contextOwner.params.includeHistory === false && sourceHistory.length) sourceHistory = sourceHistory.slice(-1);
+        sourceHistory.forEach(function(message) {
             if (!message || message.excludeFromContext === true) return;
             var role = String(message.role || '');
             if (['system', 'user', 'assistant'].indexOf(role) < 0) return;
@@ -19656,12 +22427,19 @@ function nodeRuntimeUnloadRelevantSignature(node) {
     if (type === 'control') {
         return JSON.stringify({ nameConversations: node.params.nameConversations, autoCompact: node.params.autoCompact });
     }
-    if (type === 'loadServer' || type === 'context') return JSON.stringify(node.params);
+    if (type === 'loadServer') return JSON.stringify(node.params);
+    if (type === 'localSampler') return null;
+    if (type === 'context') return JSON.stringify(node.params);
     if (type === 'sampler') {
-        return JSON.stringify({ contextSize: node.params.contextSize });
+        return JSON.stringify({
+            systemPrompt: node.params.systemPrompt,
+            includeHistory: node.params.includeHistory,
+            nameConversations: node.params.nameConversations,
+            autoCompact: node.params.autoCompact
+        });
     }
     if (type === 'modelLoader') return JSON.stringify({ projectorPath: String(node.params.projectorPath || '').trim() });
-    if (type === 'skills') return JSON.stringify((Array.isArray(node.params.skills) ? node.params.skills : []).map(function(skill) { return String(skill && skill.path || '').trim(); }));
+    if (type === 'tools') return JSON.stringify((Array.isArray(node.params.skills) ? node.params.skills : []).map(function(skill) { return String(skill && skill.path || '').trim(); }));
     return null;
 }
 
@@ -19885,7 +22663,7 @@ function switchView(view) {
         if (typeof scheduleTabLayoutRefresh === 'function') scheduleTabLayoutRefresh();
         else if (typeof renderTabs === 'function') setTimeout(renderTabs, 0);
         if (statusSettings) {
-            statusSettings.setAttribute('aria-label', 'Open node editor');
+            statusSettings.setAttribute('aria-label', 'Open settings');
             statusSettings.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"></path></svg>';
         }
     }
@@ -20000,16 +22778,16 @@ document.querySelectorAll('.effort-btn[data-effort]').forEach(function(button) {
 bindClickById('mobileClearChatButton', function() { clearChat(); toggleSettings(); });
 bindClickById('nodeWorkflowSaveButton', saveNodeWorkflow);
 bindClickById('nodeWorkflowLoadButton', loadNodeWorkflow);
-bindClickById('nodeAutoLayoutButton', autoArrangeNodeGraph);
+// Tidy is intentionally not exposed as a settings-sidebar control.
 bindClickById('nodeClearContextButton', clearNodeContext);
 bindClickById('nodeChatTraceButton', toggleChatTraceExpansion);
 bindClickById('nodeChatAutosaveButton', toggleChatAutosave);
 bindClickById('nodeMuteButton', toggleDarkstarUiMuted);
 bindClickById('nodeThemeButton', toggleDarkstarTheme);
-bindClickById('nodeResetGraphButton', resetNodeGraph);
+bindClickById('workflowAddSectionButton', openWorkflowSectionSearch);
 bindClickById('tabNav', function() { switchView('settings'); });
 bindClickById('newTabButton', createNewTab);
-bindClickById('offlineBrowserToggle', toggleOfflineBrowser);
+
 bindClickById('workspaceToggle', toggleWorkspace);
 bindClickById('projectAddButton', createNewProject);
 bindClickById('offlineBrowserBack', offlineBrowserBack);
@@ -20018,7 +22796,6 @@ bindClickById('offlineBrowserReload', offlineBrowserReload);
 bindClickById('offlineBrowserOpenButton', openOfflineBrowserAddress);
 bindClickById('offlineBrowserChooseFileButton', chooseOfflineBrowserFile);
 bindClickById('offlineBrowserReset', resetBrowser);
-bindClickById('offlineBrowserCloseButton', function() { toggleOfflineBrowser(false); });
 bindClickById('offlineBrowserFocusAddressButton', function() {
     var address = document.getElementById('offlineBrowserAddress');
     if (address) address.focus();
@@ -20059,6 +22836,7 @@ if (messageInput) {
         this.style.height = Math.min(this.scrollHeight, 200) + 'px'; this.style.overflowY = this.scrollHeight > 200 ? 'auto' : 'hidden';
         updateScheduleButton();
         if (typeof updateSlashCommandMenu === 'function') updateSlashCommandMenu(this.value);
+        if (typeof captureActiveComposerDraft === 'function') captureActiveComposerDraft();
         if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(500);
     });
     messageInput.addEventListener('paste', handleComposerImagePaste);
@@ -20146,7 +22924,10 @@ function setDarkstarStartupUiReady(ready) {
     var chatSessionRestored = false;
     try {
         if (typeof startAutomaticModelRefresh === 'function') startAutomaticModelRefresh();
-        await loadModelList();
+        // Model inventory can involve a large directory and must never gate the first usable shell paint.
+        // The graph tolerates an initially empty inventory and applyModelInventory() refreshes model-backed
+        // controls when the asynchronous scan completes.
+        var initialModelInventoryPromise = typeof loadModelList === 'function' ? loadModelList() : Promise.resolve(false);
         // Load validated custom-node renderers before the graph registry is consumed.
         if (typeof loadCustomNodes === 'function') {
             try { await loadCustomNodes(); } catch (pluginError) { console.error('[CUSTOM NODES]', pluginError.message); }
@@ -20179,6 +22960,7 @@ function setDarkstarStartupUiReady(ready) {
         renderQueue();
         if (typeof initializePermissionPolicyUi === 'function') await initializePermissionPolicyUi();
         if (typeof initializeFilesystemAccessUi === 'function') await initializeFilesystemAccessUi();
+        if (typeof initializeInternetAccessUi === 'function') await initializeInternetAccessUi();
         if (typeof initializeAgentAttention === 'function') await initializeAgentAttention();
         if (typeof applyRestoredChatComposer === 'function') applyRestoredChatComposer();
         if (typeof initializeProjectsUi === 'function') {
@@ -20191,30 +22973,28 @@ function setDarkstarStartupUiReady(ready) {
             container.scrollTop = container.scrollHeight;
             if (typeof resumeSmartChatAutoscroll === 'function') resumeSmartChatAutoscroll();
 
-            var scrollQueue = {};
-            function animateScroll(el, distance) {
-                var id = el === container ? 'chat' : 'queue';
-                if (!scrollQueue[id]) scrollQueue[id] = { el: el, pending: 0, animating: false };
-                scrollQueue[id].pending += distance;
-                if (!scrollQueue[id].animating) {
-                    scrollQueue[id].animating = true;
-                    function tick() {
-                        var q = scrollQueue[id];
-                        if (!q || Math.abs(q.pending) < 0.5) {
-                            q.animating = false;
-                            q.pending = 0;
-                            return;
-                        }
-                        var step = q.pending * 0.15;
-                        q.el.scrollTop += step;
-                        q.pending -= step;
-                        if (id === 'chat' && step > 0 && isAtBottom(q.el) && typeof resumeSmartChatAutoscroll === 'function') {
-                            resumeSmartChatAutoscroll();
-                        }
-                        requestAnimationFrame(tick);
+            // The message queue keeps its compact eased wheel behavior; chat itself
+            // scrolls natively below.  Keeping this state queue-only prevents the
+            // chat viewport from accidentally re-entering the JavaScript scroll path.
+            var queueScrollState = { el: null, pending: 0, animating: false };
+            function animateQueueScroll(el, distance) {
+                queueScrollState.el = el;
+                queueScrollState.pending += distance;
+                if (queueScrollState.animating) return;
+                queueScrollState.animating = true;
+                function tick() {
+                    var q = queueScrollState;
+                    if (Math.abs(q.pending) < 0.5) {
+                        q.animating = false;
+                        q.pending = 0;
+                        return;
                     }
+                    var step = q.pending * 0.15;
+                    q.el.scrollTop += step;
+                    q.pending -= step;
                     requestAnimationFrame(tick);
                 }
+                requestAnimationFrame(tick);
             }
             var previousChatScrollTop = container.scrollTop;
             var chatScrollPointerActive = false;
@@ -20257,6 +23037,13 @@ function setDarkstarStartupUiReady(ready) {
                 }
                 previousChatScrollTop = currentScrollTop;
             }, { passive: true });
+            // Keep chat scrolling on Chromium's native compositor path.  The old
+            // wheel handler cancelled the browser's default scrolling and replayed
+            // each wheel delta through a frame-count-based JavaScript easing loop.
+            // On long conversations, slower renderer frames stretched that easing
+            // in wall-clock time and made input latency scale with chat length.
+            // We still observe wheel intent here so generation autoscroll detaches
+            // exactly as before, but the browser owns the actual scroll movement.
             container.addEventListener('wheel', function(e) {
                 var nestedScroller = typeof nestedScrollableElement === 'function' ? nestedScrollableElement(this, e.target) : null;
                 if (nestedScroller) {
@@ -20265,7 +23052,6 @@ function setDarkstarStartupUiReady(ready) {
                     if (nestedCanScroll) { e.stopPropagation(); return; }
                 }
                 markChatScrollIntent(600);
-                e.preventDefault();
                 if ((typeof activeTabOwnsGeneration === 'function' ? activeTabOwnsGeneration() : isGenerating) && e.deltaY < 0) {
                     if (typeof setSmartChatAutoscrollDetached === 'function') setSmartChatAutoscrollDetached(true);
                     else userScrolledUp = true;
@@ -20274,18 +23060,21 @@ function setDarkstarStartupUiReady(ready) {
                     if (typeof resumeSmartChatAutoscroll === 'function') resumeSmartChatAutoscroll();
                     else userScrolledUp = false;
                 }
-                animateScroll(this, e.deltaY * 1.3);
-            }, { passive: false });
+            }, { passive: true });
             const queue = document.getElementById('messageQueue');
             if (queue) {
                 queue.addEventListener('wheel', function(e) {
                     e.preventDefault();
                     e.stopPropagation();
-                    animateScroll(this, e.deltaY * 1.3);
+                    animateQueueScroll(this, e.deltaY * 1.3);
                 }, { passive: false });
             }
         }
         if (typeof scheduleTabLayoutRefresh === 'function') scheduleTabLayoutRefresh();
+        await initialModelInventoryPromise;
+        if (typeof refreshModelDependentNodeControls === 'function') {
+            await refreshModelDependentNodeControls({ resetGpuLayers: false, queryModelMetadata: true });
+        }
     } catch(e) {
         initializationError = e;
         console.error('[INIT] Error:', e.message);
@@ -20510,7 +23299,7 @@ function setDarkstarStartupUiReady(ready) {
     }
 
     function samplerStatus(node, descriptor) {
-        if (!descriptor) return 'Connect [ Custom ] Load Model (API) to auto-detect provider controls.';
+        if (!descriptor) return 'Connect [ Custom ] Invoke Language Model (API) to auto-detect provider controls.';
         var count = Array.isArray(descriptor.apiParameters) ? descriptor.apiParameters.length : 0;
         return String(descriptor.providerLabel || descriptor.provider || 'API') + ' · ' + descriptor.id + ' · ' + count + ' controls auto-detected';
     }
@@ -20550,12 +23339,12 @@ function setDarkstarStartupUiReady(ready) {
 
     var loaderDefinition = {
         id: LOADER_ID,
-        title: '[ Custom ] Load Model (API)',
+        title: '[ Custom ] Invoke Language Model (API)',
         badge: 'CUSTOM',
         outputNode: false,
         rerenderOnParameterChange: true,
         inputs: [],
-        outputs: [{ name: 'model', label: 'model', type: types.MODEL }],
+        outputs: [{ name: 'model', label: 'Language Model', type: types.MODEL }],
         factory: function(nodeId, x, y) {
             return common.baseNode(loaderDefinition, nodeId, x, y, {
                 params: { provider: 'auto', baseUrl: '', model: '', apiKeyEnv: '', vision: 'auto' },
@@ -20564,7 +23353,7 @@ function setDarkstarStartupUiReady(ready) {
         },
         normalizeNode: function(node) {
             ensureLoaderParams(node);
-            ensureRuntime(node);
+            ensureRuntime(node); var savedTitle = String(node.title || '').trim(); if (!savedTitle || savedTitle === '[ Custom ] Load Model (API)' || savedTitle === 'Load Model (API)') node.title = loaderDefinition.title; (node.outputs || []).forEach(function(output) { if (output && output.name === 'model') output.label = 'Language Model'; });
         },
         buildContentHTML: function(node) {
             var p = ensureLoaderParams(node);
@@ -20632,14 +23421,14 @@ function setDarkstarStartupUiReady(ready) {
         },
         execute: async function(_inputs, node) {
             var p = ensureLoaderParams(node);
-            if (!String(p.model || '').trim()) throw new Error('[ Custom ] Load Model (API): enter or discover a model ID.');
+            if (!String(p.model || '').trim()) throw new Error('[ Custom ] Invoke Language Model (API): enter or discover a model ID.');
             node.status = 'loading';
             node.statusMessage = 'Resolving API model…';
             var response = await nodes.invokeBackend(PLUGIN_ID, 'describe', { config: loaderConfig(node) });
             var runtime = ensureRuntime(node);
             runtime.descriptor = response.descriptor;
             runtime.keySource = response.keySource || runtime.keySource || '';
-            if (!runtime.descriptor || !runtime.descriptor.id) throw new Error('[ Custom ] Load Model (API): provider detection did not produce a model descriptor.');
+            if (!runtime.descriptor || !runtime.descriptor.id) throw new Error('[ Custom ] Invoke Language Model (API): provider detection did not produce a model descriptor.');
             if (Number(runtime.descriptor.contextSize) > 0) {
                 root.TOKEN_LIMIT = Math.floor(Number(runtime.descriptor.contextSize));
                 if (typeof root.updateTokenCounter === 'function') root.updateTokenCounter();
@@ -20658,12 +23447,11 @@ function setDarkstarStartupUiReady(ready) {
         badge: 'CUSTOM',
         outputNode: true,
         inputs: [
-            { name: 'model', label: 'model', type: types.MODEL, required: true },
-            { name: 'text', label: 'text', type: types.TEXT, required: true },
-            { name: 'image', label: 'image', type: types.IMAGE, required: false },
+            { name: 'model', label: 'Language Model', type: types.MODEL, required: true },
+            { name: 'context', label: 'Context', type: types.TEXT, required: true },
             { name: 'skills', label: 'Skills', type: types.SKILLS, required: false },
             { name: 'tools', label: 'Tools', type: types.TOOLS, required: false },
-            { name: 'while', label: 'While', type: types.CONTROL, required: true }
+            { name: 'while', label: 'Passive', type: types.CONTROL, required: true }
         ],
         outputs: [],
         factory: function(nodeId, x, y) {
@@ -20685,6 +23473,8 @@ function setDarkstarStartupUiReady(ready) {
         },
         normalizeNode: function(node) {
             ensureSamplerParams(node);
+            node.inputs = samplerDefinition.inputs.map(function(input) { return Object.assign({}, input); });
+            node.outputs = [];
         },
         buildContentHTML: function(node) {
             ensureSamplerParams(node);
@@ -20707,7 +23497,7 @@ function setDarkstarStartupUiReady(ready) {
             if (!loader) throw new Error('[ Custom ] Autoregressive Sampler (API): no connected API loader is available for compaction.');
             var descriptor = ensureRuntime(loader).descriptor;
             if (!descriptor) descriptor = await refreshDescriptor(loader);
-            if (!descriptor) throw new Error('[ Custom ] Load Model (API): configure a model before compacting context.');
+            if (!descriptor) throw new Error('[ Custom ] Invoke Language Model (API): configure a model before compacting context.');
             var p = ensureSamplerParams(node);
             return cancelableComplete(loader, descriptor, request.messages || [], {
                 maxTokens: Number(request.maxTokens) || Math.min(2048, Number(p.maxTokens) || 2048),
@@ -20723,9 +23513,10 @@ function setDarkstarStartupUiReady(ready) {
         },
         execute: async function(inputs, node, context) {
             if (!inputs.model || inputs.model.remote !== true || inputs.model.apiPlugin !== PLUGIN_ID) {
-                throw new Error('[ Custom ] Autoregressive Sampler (API): connect [ Custom ] Load Model (API).');
+                throw new Error('[ Custom ] Autoregressive Sampler (API): connect [ Custom ] Invoke Language Model (API).');
             }
-            if (!Array.isArray(inputs.text) || !inputs.text.length) throw new Error('[ Custom ] Autoregressive Sampler (API): no text context input.');
+            var contextMessages = Array.isArray(inputs.context) ? inputs.context : inputs.text;
+            if (!Array.isArray(contextMessages) || !contextMessages.length) throw new Error('[ Custom ] Autoregressive Sampler (API): no Context input.');
             var loader = connectedApiLoader(node);
             if (!loader) throw new Error('[ Custom ] Autoregressive Sampler (API): the connected API loader is unavailable.');
             var p = ensureSamplerParams(node);
@@ -20743,7 +23534,7 @@ function setDarkstarStartupUiReady(ready) {
                 node.statusMessage = 'Naming conversation via API…';
                 await context.ensureConversationTitle({
                     model: inputs.model,
-                    messages: inputs.text,
+                    messages: contextMessages,
                     sampler: { seed: Number(p.seed), temperature: Number(p.temperature), topK: Number(p.topK), topP: Number(p.topP) },
                     generateTitle: function(titleRequest) {
                         return cancelableComplete(loader, inputs.model, titleRequest.messages || [], {
@@ -20798,7 +23589,7 @@ function setDarkstarStartupUiReady(ready) {
                     requestId: requestId,
                     model: inputs.model,
                     config: loaderConfig(loader),
-                    messages: inputs.text,
+                    messages: contextMessages,
                     skills: inputs.skills || { skills: [] },
                     tools: toolConfiguration,
                     control: Object.assign({}, inputs.while || {}, { reasoning: 'auto' }),
@@ -20827,6 +23618,7 @@ function setDarkstarStartupUiReady(ready) {
                     working: Array.isArray(result && result.working) ? result.working : [],
                     toolMessages: Array.isArray(result && result.toolMessages) ? result.toolMessages : [],
                     agentTimeline: Array.isArray(result && result.agentTimeline) ? result.agentTimeline : [],
+                    presentedImageIds: Array.isArray(result && result.presentedImageIds) ? result.presentedImageIds.map(String) : [],
                     agentRounds: Number(result && result.agentRounds) || 1,
                     toolRounds: Number(result && result.toolRounds) || 0
                 };
@@ -20876,8 +23668,8 @@ function setDarkstarStartupUiReady(ready) {
     var sdk = window.Darkstar.nodes;
     var controls = sdk.controls;
     var type = 'com.example.template.passthrough';
-    var inputs = [{ name: 'text', label: 'text', type: sdk.PORT_TYPES.TEXT, required: true }];
-    var outputs = [{ name: 'text', label: 'text', type: sdk.PORT_TYPES.TEXT }];
+    var inputs = [{ name: 'text', label: 'Text', type: sdk.PORT_TYPES.TEXT, required: true }];
+    var outputs = [{ name: 'text', label: 'Text', type: sdk.PORT_TYPES.TEXT }];
 
     sdk.registerNode({
         id: type,

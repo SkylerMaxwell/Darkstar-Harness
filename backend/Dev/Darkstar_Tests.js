@@ -94,6 +94,10 @@ function loadCommandHarness() {
                 toolContext: [
                     { role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'file_read', arguments: '{}' } }] },
                     { role: 'tool', tool_call_id: 'c1', content: 'SECRET TOOL RESULT' },
+                    { role: 'user', content: [
+                        { type: 'text', text: 'Generated image context.' },
+                        { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB' } },
+                    ] },
                 ],
             },
             { id: 'old-adv', role: 'system', content: 'OLD ADVERSARY MUST NOT LEAK', systemCommand: 'adversary', adversary: true },
@@ -146,10 +150,21 @@ function loadCommandHarness() {
     };
     context.globalThis = context;
     vm.createContext(context);
+    vm.runInContext(read('backend/renderer/image-data.js'), context, { filename: 'image-data.js' });
     vm.runInContext(read('backend/renderer/system-command-api.js'), context, { filename: 'system-command-api.js' });
     vm.runInContext(read('backend/renderer/adversary-context.js'), context, { filename: 'adversary-context.js' });
     vm.runInContext(read('backend/renderer/commands.js'), context, { filename: 'commands.js' });
     return { context, tab, input, calls };
+}
+
+function localSamplingConfig(overrides) {
+    return Object.assign({
+        seed: -1, temperature: 0.8, topK: 40, topP: 0.95, minP: 0.05, typicalP: 1,
+        repeatPenalty: 1.1, repeatLastN: 64, presencePenalty: 0, frequencyPenalty: 0,
+        dryMultiplier: 0, dryBase: 1.75, dryAllowedLength: 2, dryPenaltyLastN: 0,
+        mirostat: 0, mirostatTau: 5, mirostatEta: 0.1,
+        samplers: ['dry', 'top_k', 'typ_p', 'top_p', 'min_p', 'xtc', 'temperature'],
+    }, overrides || {});
 }
 
 function loadSamplerDefinition() {
@@ -164,16 +179,20 @@ function loadSamplerDefinition() {
                     return { text: 'critique', reasoning: '', finishReason: 'stop', working: [], toolMessages: [], agentTimeline: [] };
                 },
             },
+            imageData: { safeDataUrl(image) { return image && image.base64 ? `data:${image.mimeType || 'image/png'};base64,${image.base64}` : null; } },
+            async: { runBestEffort(operation) { return Promise.resolve().then(operation); } },
             nodes: {
                 builtinCommon: { baseNode(_def, id, x, y, extra) { return { id, x, y, ...extra }; } },
-                controls: { select: () => '', numberInput: () => '', slider: () => '', textInput: () => '', textarea: () => '', booleanSelect: () => '', status: () => '' },
-                PORT_TYPES: { MODEL: 'model', TEXT: 'text', IMAGE: 'image', SKILLS: 'skills', TOOLS: 'tools', CONTROL: 'control' },
+                controls: { select: () => '', numberInput: () => '', slider: () => '', textInput: () => '', textarea: () => '', booleanSelect: () => '', toggle: () => '', status: () => '' },
+                PORT_TYPES: { MODEL: 'model', SAMPLER_PARAMETERS: 'sampler-parameters', DM_SAMPLER: 'dm-sampler', TEXT: 'text', IMAGE: 'image', SKILLS: 'skills', TOOLS: 'tools', CONTROL: 'control' },
                 registerNode(value) { definition = value; },
             },
         },
     };
     context.globalThis = context;
     vm.createContext(context);
+    vm.runInContext(read('backend/renderer/nodes/builtin/context.js'), context, { filename: 'context.js' });
+    vm.runInContext(read('backend/renderer/nodes/builtin/control.js'), context, { filename: 'control.js' });
     vm.runInContext(read('backend/renderer/nodes/builtin/sampler.js'), context, { filename: 'sampler.js' });
     return { definition, requests };
 }
@@ -323,6 +342,13 @@ test('every adversary run receives visible agent context but never prior adversa
         assert.doesNotMatch(serialized, /SECRET MODEL REASONING/u);
         assert.doesNotMatch(serialized, /SECRET TIMELINE/u);
         assert.doesNotMatch(serialized, /SECRET TOOL RESULT/u);
+        assert.match(serialized, /Generated image context\./u, 'adversary must receive tool-produced visual context without receiving tool protocol');
+        const visualContext = call.adversaryHistory.find((message) => message && message.adversaryVisualContext === true);
+        assert.ok(visualContext, 'tool-produced images must be projected into ordinary adversary visual context');
+        assert.equal(visualContext.role, 'user');
+        assert.equal(Array.isArray(visualContext.images), true);
+        assert.equal(visualContext.images[0].mimeType, 'image/png');
+        assert.match(visualContext.images[0].base64, /^iVBOR/u);
         assert.equal(call.adversaryHistory.some((message) => Object.hasOwn(message, 'reasoning')), false);
         assert.equal(call.adversaryHistory.some((message) => Object.hasOwn(message, 'toolContext')), false);
         assert.equal(call.adversaryHistory.at(-1).role, 'user');
@@ -411,17 +437,22 @@ test('adversary accepts supervisor arguments with implicit or explicit cycle cou
 test('adversary generation keeps the normal Tools and Skills inputs instead of entering continuation restrictions', async () => {
     const { definition, requests } = loadSamplerDefinition();
     assert.ok(definition);
+    assert.equal(definition.inputs[0].label, 'LM Sampler');
+    const legacySampler = { params: {}, inputs: [{ name: 'model', label: 'model' }] };
+    definition.normalizeNode(legacySampler);
+    assert.equal(legacySampler.inputs[0].label, 'LM Sampler');
     const node = definition.factory(1, 0, 0);
-    node.params.reasoning = 'on';
     const text = [{ role: 'user', content: 'request' }, { role: 'assistant', content: 'answer' }];
     Object.defineProperty(text, '_darkstarContextOverflowPolicy', { value: 'off' });
     await definition.execute({
-        model: { id: 'model.gguf', multimodal: false, projectorPath: null },
-        text,
+        samplerParameters: localSamplingConfig({
+            reasoning: 'on',
+            model: { id: 'model.gguf', multimodal: false, projectorPath: null },
+        }),
         skills: { skills: [{ id: 'review-skill' }] },
         tools: { providers: ['workspace-tools'], maxRounds: 7, toolChoice: 'auto' },
-        while: { nameConversations: true },
     }, node, {
+        history: text,
         adversaryMode: true,
         continueFinalMessage: false,
         workspaceId: 'project-1', projectId: 1, tabId: 2, parallelSlots: 1,
@@ -513,14 +544,15 @@ test('/adversary command bubble uses the same slash-command green styling as /co
 test('adversary requests participate in the same Auto-compact preflight as ordinary agent requests', async () => {
     const { definition, requests } = loadSamplerDefinition();
     const node = definition.factory(91, 0, 0);
+    node.params.autoCompact = true;
     const preflights = [];
     const result = await definition.execute({
-        model: { id: 'model.gguf', multimodal: false, projectorPath: null },
-        text: [{ role: 'user', content: 'large critic context' }],
+        gguf: { id: 'model.gguf', multimodal: false, projectorPath: null, reasoningSelection: 'auto' },
+        samplerParameters: localSamplingConfig(),
         skills: { skills: [] }, tools: { providers: [], maxRounds: 0, toolChoice: 'none' },
-        while: { autoCompact: true },
     }, node, {
         adversaryMode: true, continueFinalMessage: false,
+        history: [{ role: 'user', content: 'large critic context' }],
         workspaceId: 'project-1', projectId: 1, tabId: 2, parallelSlots: 1,
         async preflightAutoCompact(request) { preflights.push(structuredClone(request)); return { compacted: true }; },
     });
@@ -610,8 +642,7 @@ function rendererHarness() {
     for (const rel of [
         'backend/renderer/nodes/builtin/common.js',
         'backend/renderer/nodes/builtin/load-tool.js',
-        'backend/renderer/nodes/builtin/tools.js',
-        'backend/renderer/nodes/builtin/skills.js'
+        'backend/renderer/nodes/builtin/loader.js'
     ]) vm.runInContext(source(rel), context, { filename: rel });
     return { context, definitions, calls };
 }
@@ -619,37 +650,33 @@ function rendererHarness() {
 test('agent-facing built-in nodes never dereference Darkstar.nodes.services.getAgentBridge', () => {
     for (const rel of [
         'backend/renderer/nodes/builtin/load-tool.js',
-        'backend/renderer/nodes/builtin/tools.js',
-        'backend/renderer/nodes/builtin/skills.js'
+        'backend/renderer/nodes/builtin/loader.js'
     ]) assert.doesNotMatch(source(rel), /nodes\.services\.getAgentBridge\s*\(/u, rel);
     assert.match(source('backend/renderer/nodes/builtin/common.js'), /function getAgentBridge\(\)[\s\S]*hostWindow\.darkstar[\s\S]*return preload\.agent/u);
 });
 
-test('Tools, Load Tool, and Skills execute when Darkstar.nodes.services is absent', async () => {
+test('Loader and Load Tool execute when Darkstar.nodes.services is absent', async () => {
     const { context, definitions, calls } = rendererHarness();
     assert.equal(context.Darkstar.nodes.services, undefined, 'test must reproduce the missing services namespace');
 
-    const toolsDef = definitions.get('tools');
+    const loaderDef = definitions.get('tools');
     const loadToolDef = definitions.get('loadTool');
-    const skillsDef = definitions.get('skills');
-    assert.ok(toolsDef && loadToolDef && skillsDef);
+    assert.ok(loaderDef && loadToolDef);
+    assert.equal(loaderDef.title, 'Loader');
+    assert.deepEqual(Array.from(loaderDef.outputs, (output) => output.name), ['tools', 'skills']);
 
-    const toolsNode = toolsDef.factory('tools-1', 0, 0);
-    const toolsOut = await toolsDef.execute({}, toolsNode);
-    assert.ok(Array.isArray(toolsOut.tools.providers));
-    assert.ok(calls.inspectToolProvider >= toolsOut.tools.providers.length);
+    const loaderNode = loaderDef.factory('loader-1', 0, 0);
+    loaderNode.params.skills = [{ path: 'C:/demo/SKILL.md', name: 'Demo Skill', compatible: true }];
+    const loaderOut = await loaderDef.execute({}, loaderNode);
+    assert.ok(Array.isArray(loaderOut.tools.providers));
+    assert.equal(loaderOut.skills.skills.length, 1);
+    assert.ok(calls.inspectToolProvider >= loaderOut.tools.providers.length);
+    assert.ok(calls.inspectSkill >= 1);
 
     const loadToolNode = loadToolDef.factory('tool-1', 0, 0);
     loadToolNode.params.path = 'C:/demo/tool.py';
     const loadToolOut = await loadToolDef.execute({}, loadToolNode);
     assert.equal(loadToolOut.tool.path, 'C:/demo/tool.py');
-
-    const skillsNode = skillsDef.factory('skills-1', 0, 0);
-    skillsNode.params.skills = [{ path: 'C:/demo/SKILL.md', name: 'Demo Skill', compatible: true }];
-    const skillsOut = await skillsDef.execute({}, skillsNode);
-    assert.equal(skillsOut.skills.skills.length, 1);
-
-    assert.ok(calls.inspectSkill >= 1);
 });
 });
 
@@ -762,7 +789,7 @@ test('streamAgent can complete beyond 4096 tokens without Continue when tools ar
                     catalog: '',
                     toolChoice: 'auto',
                     maxRounds: null,
-                   
+
                 };
             },
         },
@@ -908,7 +935,6 @@ TEST_FACTORIES.set("backend/Dev/tests/api-model-custom-node-regression.test.js",
 'use strict';
 
 const assert = require('node:assert/strict');
-const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
@@ -968,7 +994,7 @@ test('API custom plugin registers exactly the requested loader and sampler witho
         document: documentStub,
         Darkstar: {
             nodes: {
-                PORT_TYPES: { MODEL: 'MODEL', TEXT: 'TEXT', IMAGE: 'IMAGE', SKILLS: 'SKILLS', TOOLS: 'TOOLS', CONTROL: 'CONTROL' },
+                PORT_TYPES: { MODEL: 'MODEL', SAMPLER_PARAMETERS: 'SAMPLER_PARAMETERS', TEXT: 'TEXT', IMAGE: 'IMAGE', SKILLS: 'SKILLS', TOOLS: 'TOOLS', CONTROL: 'CONTROL' },
                 controls,
                 builtinCommon: {
                     baseNode(definition, nodeId, x, y, extra) {
@@ -983,24 +1009,55 @@ test('API custom plugin registers exactly the requested loader and sampler witho
     vm.runInNewContext(read('custom_nodes/api-model/renderer.js'), context, { filename: 'renderer.js' });
 
     assert.deepEqual(registered.map((definition) => definition.title), [
-        '[ Custom ] Load Model (API)',
+        '[ Custom ] Invoke Language Model (API)',
         '[ Custom ] Autoregressive Sampler (API)',
     ]);
     const loader = registered[0];
     const sampler = registered[1];
     assert.deepEqual(Array.from(loader.inputs), []);
     assert.equal(loader.outputs[0].type, 'MODEL');
+    assert.equal(loader.outputs[0].label, 'Language Model');
     assert.equal(sampler.outputNode, true);
+    assert.equal(sampler.inputs[0].label, 'Language Model');
     assert.deepEqual(Array.from(sampler.inputs, (input) => `${input.name}:${input.type}`), [
-        'model:MODEL', 'text:TEXT', 'image:IMAGE', 'skills:SKILLS', 'tools:TOOLS', 'while:CONTROL',
+        'model:MODEL', 'context:TEXT', 'skills:SKILLS', 'tools:TOOLS', 'while:CONTROL',
     ]);
+    const legacyLoader = { title: '[ Custom ] Load Model (API)', params: {}, runtime: {}, outputs: [{ name: 'model', label: 'model' }] };
+    loader.normalizeNode(legacyLoader);
+    assert.equal(legacyLoader.title, '[ Custom ] Invoke Language Model (API)');
+    assert.equal(legacyLoader.outputs[0].label, 'Language Model');
+    const legacySampler = { params: {}, inputs: [{ name: 'model', label: 'model' }, { name: 'text', label: 'Text' }, { name: 'image', label: 'Image' }] };
+    sampler.normalizeNode(legacySampler);
+    assert.equal(legacySampler.inputs[0].label, 'Language Model');
+    assert.equal(legacySampler.inputs[1].label, 'Context');
+    assert.equal(legacySampler.inputs.some((input) => input.name === 'image'), false);
     const loaderNode = loader.factory(1, 0, 0);
     assert.equal(Object.prototype.hasOwnProperty.call(loaderNode.params, 'apiKey'), false);
     assert.equal(Object.prototype.hasOwnProperty.call(loaderNode.runtime, 'apiKey'), true);
 
     const workflow = fs.readFileSync(path.join(root, 'workflows/darkstar-workflow.dswf'));
     assert.equal(workflow.includes(Buffer.from('com.darkstar.api-model')), false);
-    assert.equal(crypto.createHash('sha256').update(workflow).digest('hex'), 'ea552a384d11efdbccc0e62e263565a5c08843e1ecc85a0d20a2e8c1c68fce9c');
+    const { decodeWorkflowSnapshot } = require('../../workflow/workflow-snapshot-codec');
+    const snapshot = decodeWorkflowSnapshot(workflow);
+    const editor = snapshot.editor && typeof snapshot.editor === 'object' ? snapshot.editor : snapshot;
+    assert.equal(editor.nodes.some((node) => node && (node.type === 'apiModelLoader' || node.type === 'apiSampler')), false,
+        'installing the API plugin must not inject API nodes into the bundled local workflow');
+    const localServer = editor.nodes.find((node) => node && node.type === 'loadServer');
+    const localSampler = editor.nodes.find((node) => node && node.type === 'localSampler');
+    const localOrchestrator = editor.nodes.find((node) => node && node.type === 'sampler');
+    assert.ok(localServer);
+    assert.ok(localSampler);
+    assert.ok(localOrchestrator);
+    assert.equal(localServer.title, 'LlamaCPP Server');
+    assert.equal(localSampler.title, 'LM Sampler');
+    assert.equal(localOrchestrator.title, 'Orchestrator');
+    for (const key of ['seed', 'temperature', 'topK', 'topP', 'minP', 'typicalP', 'repeatPenalty', 'repeatLastN',
+        'presencePenalty', 'frequencyPenalty', 'dryMultiplier', 'dryBase', 'dryAllowedLength', 'dryPenaltyLastN',
+        'mirostat', 'mirostatTau', 'mirostatEta', 'samplers']) {
+        assert.equal(Object.hasOwn(localSampler.params, key), true, `L_Sampler must own ${key}`);
+        assert.equal(Object.hasOwn(localServer.params, key), false, `GGUF Server must not retain ${key}`);
+        assert.equal(Object.hasOwn(localOrchestrator.params, key), false, `Orchestrator must not retain ${key}`);
+    }
     const workflowSource = read('backend/renderer/workflow.js');
     assert.doesNotMatch(workflowSource, /com\.darkstar\.api-model/u);
     assert.match(read('backend/renderer/send.js'), /request && typeof request.generateTitle/u);
@@ -1020,12 +1077,12 @@ test('graph rejects simultaneous local and API output samplers before either can
         },
     };
     const result = sandbox.Darkstar.nodes.graphCore.trace([
-        { id: 1, type: 'sampler', title: 'Autoregressive Sampler', inputs: [], outputs: [] },
+        { id: 1, type: 'sampler', title: 'Orchestrator', inputs: [], outputs: [] },
         { id: 2, type: 'apiSampler', title: '[ Custom ] Autoregressive Sampler (API)', inputs: [], outputs: [] },
     ], [], registry);
     assert.equal(result.valid, false);
     assert.equal(result.errorNode, 2);
-    assert.match(result.error, /exactly one local or API Autoregressive Sampler/u);
+    assert.match(result.error, /exactly one local Orchestrator or API Autoregressive Sampler/u);
 });
 
 test('API provider autodetection builds model-specific sampler controls for OpenAI, Anthropic, Qwen, and generic endpoints', () => {
@@ -1262,12 +1319,34 @@ function scopedUipService(activeScope = '') {
     };
 }
 
-test('Tools node never renders or migrates Application Interface as a tool provider', () => {
-    const source = read('backend/renderer/nodes/builtin/tools.js');
+test('Loader node never renders or migrates Application Interface as a tool provider', () => {
+    const source = read('backend/renderer/nodes/builtin/loader.js');
     assert.doesNotMatch(source, /name:\s*'Application Interface'|function\s+uipProvider\s*\(/u);
     assert.match(source, /if \(!id \|\| id === 'uip'\) return null;/u);
     assert.match(source, /delete node\.params\.uipToolMigrationVersion;/u);
-    assert.match(source, /providers:\s*\[screenshotProvider\(\), browserControlProvider\(\), timeoutProvider\(\), askUserYesNoProvider\(\)\]/u);
+    assert.match(source, /providers:\s*\[screenshotProvider\(\), browserControlProvider\(\), timeoutProvider\(\), askUserYesNoProvider\(\), generateImageProvider\(\), showImageProvider\(\)\]/u);
+});
+
+test('Loader capability columns stay structurally stable and asset scrollbars retain native pointer ownership', () => {
+    const loaderSource = read('backend/renderer/nodes/builtin/loader.js');
+    const interactionsSource = read('backend/renderer/nodes/editor/interactions.js');
+    const css = read('backend/renderer/node-editor.css');
+
+    assert.match(loaderSource, /function assetSection\(label, count, content, emptyMessage\)[\s\S]*node-asset-empty/u,
+        'empty collections must render a real section instead of disappearing');
+    assert.match(loaderSource, /assetSection\('Skills', state\.skills\.length,[\s\S]*'No skills loaded\.'/u,
+        'Skills must remain present at zero items');
+    assert.equal((loaderSource.match(/class="node-asset-column"/gu) || []).length, 2,
+        'Tools and Skills must own permanent sibling columns');
+    assert.match(loaderSource, /class="node-asset-list" data-node-control="true"/u,
+        'native list scrollbar interaction must not trigger node selection/rerendering');
+    assert.match(interactionsSource, /if \(nodeEditorState\.selectedNode === nodeId\) return;/u,
+        'reselecting the active settings section must not destroy and recreate its scrollable DOM');
+    assert.doesNotMatch(css, /\.node-asset-section \+ \.node-asset-section \{[^}]*margin-top/u,
+        'the second grid column must not inherit vertical-stack spacing');
+    assert.match(css, /\.node-asset-column \{[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;/u);
+    assert.match(css, /\.node-action-row\.node-asset-actions \{[\s\S]*margin:\s*auto 0 0;/u,
+        'column action buttons should remain bottom-aligned regardless of collection size');
 });
 
 
@@ -1285,7 +1364,7 @@ test('legacy Tools-node state physically drops a persisted locked builtin:uip ro
     sandbox.globalThis = sandbox;
     const context = vm.createContext(sandbox);
     vm.runInContext(read('backend/renderer/nodes/builtin/common.js'), context, { filename: 'backend/renderer/nodes/builtin/common.js' });
-    vm.runInContext(read('backend/renderer/nodes/builtin/tools.js'), context, { filename: 'backend/renderer/nodes/builtin/tools.js' });
+    vm.runInContext(read('backend/renderer/nodes/builtin/loader.js'), context, { filename: 'backend/renderer/nodes/builtin/loader.js' });
     assert.ok(definition && typeof definition.normalizeNode === 'function');
     const node = { params: {
         providers: [
@@ -1296,6 +1375,8 @@ test('legacy Tools-node state physically drops a persisted locked builtin:uip ro
         browserControlToolMigrationVersion: 1,
         timeoutToolMigrationVersion: 1,
         askUserYesNoToolMigrationVersion: 1,
+        generateImageToolMigrationVersion: 1,
+        showImageToolMigrationVersion: 1,
         maxRoundsMigrationVersion: 2,
         maxRounds: 'auto',
         toolChoice: 'auto',
@@ -1306,7 +1387,7 @@ test('legacy Tools-node state physically drops a persisted locked builtin:uip ro
     assert.deepEqual(Array.from(node.params.providers, (provider) => provider.path), ['custom.py']);
 });
 
-test('existing Tools nodes receive Ask User Yes/No exactly once through the versioned bundled-tool migration', () => {
+test('existing Loader nodes receive Ask User Yes/No exactly once through the versioned bundled-tool migration', () => {
     let definition = null;
     const sandbox = {
         document: { getElementById() { return null; } },
@@ -1315,7 +1396,7 @@ test('existing Tools nodes receive Ask User Yes/No exactly once through the vers
     sandbox.window = sandbox; sandbox.globalThis = sandbox;
     const context = vm.createContext(sandbox);
     vm.runInContext(read('backend/renderer/nodes/builtin/common.js'), context, { filename: 'backend/renderer/nodes/builtin/common.js' });
-    vm.runInContext(read('backend/renderer/nodes/builtin/tools.js'), context, { filename: 'backend/renderer/nodes/builtin/tools.js' });
+    vm.runInContext(read('backend/renderer/nodes/builtin/loader.js'), context, { filename: 'backend/renderer/nodes/builtin/loader.js' });
     const node = { params: {
         providers: [{ kind: 'python', path: 'custom.py', name: 'Custom', toolCount: 1 }],
         browserControlToolMigrationVersion: 1, timeoutToolMigrationVersion: 1, maxRoundsMigrationVersion: 2,
@@ -1328,7 +1409,51 @@ test('existing Tools nodes receive Ask User Yes/No exactly once through the vers
     assert.equal(node.params.providers.filter((provider) => provider.path === 'agent_assets/tools/ask_user_yes_no.py').length, 1, 'migration must be idempotent');
 });
 
-test('Tools node collapses relative/absolute aliases after inspection and preserves the portable workflow reference', async () => {
+test('existing Loader nodes receive Generate Image exactly once through the versioned bundled-tool migration', () => {
+    let definition = null;
+    const sandbox = {
+        document: { getElementById() { return null; } },
+        Darkstar: { nodes: { controls: {}, PORT_TYPES: { TOOLS: 'TOOLS' }, registerNode(value) { definition = value; } } },
+    };
+    sandbox.window = sandbox; sandbox.globalThis = sandbox;
+    const context = vm.createContext(sandbox);
+    vm.runInContext(read('backend/renderer/nodes/builtin/common.js'), context, { filename: 'backend/renderer/nodes/builtin/common.js' });
+    vm.runInContext(read('backend/renderer/nodes/builtin/loader.js'), context, { filename: 'backend/renderer/nodes/builtin/loader.js' });
+    const node = { params: {
+        providers: [{ kind: 'python', path: 'custom.py', name: 'Custom', toolCount: 1 }],
+        browserControlToolMigrationVersion: 1, timeoutToolMigrationVersion: 1, askUserYesNoToolMigrationVersion: 1, maxRoundsMigrationVersion: 2,
+        maxRounds: 'auto', toolChoice: 'auto',
+    } };
+    definition.normalizeNode(node);
+    assert.equal(node.params.generateImageToolMigrationVersion, 1);
+    assert.equal(node.params.providers.filter((provider) => provider.path === 'agent_assets/tools/generate_image.py').length, 1);
+    definition.normalizeNode(node);
+    assert.equal(node.params.providers.filter((provider) => provider.path === 'agent_assets/tools/generate_image.py').length, 1, 'migration must be idempotent');
+});
+
+test('existing Loader nodes receive Show Image exactly once through the versioned bundled-tool migration', () => {
+    let definition = null;
+    const sandbox = {
+        document: { getElementById() { return null; } },
+        Darkstar: { nodes: { controls: {}, PORT_TYPES: { TOOLS: 'TOOLS' }, registerNode(value) { definition = value; } } },
+    };
+    sandbox.window = sandbox; sandbox.globalThis = sandbox;
+    const context = vm.createContext(sandbox);
+    vm.runInContext(read('backend/renderer/nodes/builtin/common.js'), context, { filename: 'backend/renderer/nodes/builtin/common.js' });
+    vm.runInContext(read('backend/renderer/nodes/builtin/loader.js'), context, { filename: 'backend/renderer/nodes/builtin/loader.js' });
+    const node = { params: {
+        providers: [{ kind: 'python', path: 'custom.py', name: 'Custom', toolCount: 1 }],
+        browserControlToolMigrationVersion: 1, timeoutToolMigrationVersion: 1, askUserYesNoToolMigrationVersion: 1, generateImageToolMigrationVersion: 1, maxRoundsMigrationVersion: 2,
+        maxRounds: 'auto', toolChoice: 'auto',
+    } };
+    definition.normalizeNode(node);
+    assert.equal(node.params.showImageToolMigrationVersion, 1);
+    assert.equal(node.params.providers.filter((provider) => provider.path === 'agent_assets/tools/show_image.py').length, 1);
+    definition.normalizeNode(node);
+    assert.equal(node.params.providers.filter((provider) => provider.path === 'agent_assets/tools/show_image.py').length, 1, 'migration must be idempotent');
+});
+
+test('Loader node collapses relative/absolute aliases after inspection and preserves the portable workflow reference', async () => {
     let definition = null;
     const canonical = path.join(root, 'agent_assets', 'tools', 'safe_edit_tool.py');
     const sandbox = {
@@ -1357,7 +1482,7 @@ test('Tools node collapses relative/absolute aliases after inspection and preser
     sandbox.globalThis = sandbox;
     const context = vm.createContext(sandbox);
     vm.runInContext(read('backend/renderer/nodes/builtin/common.js'), context, { filename: 'backend/renderer/nodes/builtin/common.js' });
-    vm.runInContext(read('backend/renderer/nodes/builtin/tools.js'), context, { filename: 'backend/renderer/nodes/builtin/tools.js' });
+    vm.runInContext(read('backend/renderer/nodes/builtin/loader.js'), context, { filename: 'backend/renderer/nodes/builtin/loader.js' });
     const portable = 'agent_assets/tools/safe_edit_tool.py';
     const node = { params: {
         providers: [
@@ -1699,6 +1824,24 @@ registry.register(name=SCHEMA["name"], toolset="test", schema=SCHEMA, handler=ha
         assert.notEqual(real(payload.base), real(payload.prefix));
         assert.equal(real(payload.executable), real(first.executable));
     }
+});
+
+test('Python tool inspection waits for stdio close so launch-time descriptions cannot be lost after process exit', async () => {
+    const { collectProcess } = require(path.join(ROOT, 'backend', 'agent', 'python-tool-inspector.js'));
+    const childScript = [
+        "const { spawn } = require('node:child_process');",
+        "const child = spawn(process.execPath, ['-e', 'setTimeout(() => process.stdout.write(\\\"late-description\\\"), 80)'], { stdio: ['ignore', 1, 'ignore'], windowsHide: true });",
+        'child.unref();',
+    ].join(' ');
+    const result = await collectProcess(process.execPath, ['-e', childScript], { cwd: ROOT, timeoutMs: 5_000 });
+    assert.equal(result.code, 0);
+    assert.equal(result.stdout, 'late-description',
+        'inspection must wait until inherited stdout is drained even when the inspected process exits first');
+
+    const inspectorSource = fs.readFileSync(path.join(ROOT, 'backend', 'agent', 'python-tool-inspector.js'), 'utf8');
+    assert.match(inspectorSource, /child\.once\('close', \(code, signal\) => finish\(null, \{ code, signal, stdout, stderr \}\)\)/u);
+    assert.doesNotMatch(inspectorSource, /child\.once\('exit', \(code, signal\) => finish\(null, \{ code, signal, stdout, stderr \}\)\)/u,
+        'the inspector must never parse output on exit because stdio may still be draining');
 });
 
 test('application wiring stores the shared Python venv in the Darkstar master directory and forbids interpreter fallback after creation', () => {
@@ -2163,6 +2306,206 @@ test('node editor owns the content foreground while permanent app chrome remains
     assert.ok(zIndex(statusRule[1]) > zIndex(nodeRule[1]), 'bottom status/navigation bar must remain above and clickable over Nodes');
 });
 
+
+test('Browser Workspace resize stays draggable without drawing a resize accent line', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'index.html'), 'utf8');
+    const styles = fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'styles.css'), 'utf8');
+    const browser = fs.readFileSync(path.join(ROOT, 'backend', 'Darkstar_Renderer.js'), 'utf8');
+    const handleRule = styles.match(/\.offline-browser-resize-handle\s*\{([^}]*)\}/u);
+    const collapsedRule = styles.match(/body:not\(\.offline-browser-open\) \.offline-browser-resize-handle\s*\{([^}]*)\}/u);
+    const openRule = styles.match(/body\.offline-browser-open \.offline-browser-resize-handle\s*\{([^}]*)\}/u);
+    const visualRule = styles.match(/\.offline-browser-resize-handle::after\s*\{([^}]*)\}/u);
+
+    assert.match(html, /id="offlineBrowserResizeHandle"/u, 'resize hit target must remain in the Browser Workspace shell');
+    assert.ok(handleRule && collapsedRule && openRule && visualRule, 'resize hit-target and visual-suppression rules must exist');
+    assert.match(handleRule[1], /cursor:\s*col-resize/u, 'resize hit target must retain the resize cursor');
+    assert.match(handleRule[1], /width:\s*24px/u, 'open resize hit target must retain a practical drag width');
+    assert.match(collapsedRule[1], /right:\s*0/u, 'collapsed Browser Workspace must keep its resize affordance on the window edge');
+    assert.match(collapsedRule[1], /width:\s*12px/u, 'collapsed resize affordance must stay narrow enough not to steal workspace interactions');
+    assert.match(collapsedRule[1], /pointer-events:\s*auto/u, 'collapsed Browser Workspace must remain reopenable by drag');
+    assert.match(openRule[1], /pointer-events:\s*auto/u, 'open Browser Workspace must keep the resize target interactive');
+    assert.match(visualRule[1], /content:\s*none/u, 'resize handle must not draw a visible accent line');
+    assert.doesNotMatch(styles, /\.offline-browser-resize-handle:hover::after/u, 'hover must not reintroduce resize accent chrome');
+    assert.doesNotMatch(styles, /body\.offline-browser-resizing \.offline-browser-resize-handle::after/u, 'active resize must not reintroduce orange accent chrome');
+    assert.match(styles, /body\.offline-browser-resizing:not\(\.offline-browser-resize-transitioning\) \.offline-browser-sidebar\s*\{[^}]*transition:\s*none/u,
+        'ordinary drag resizing must remain uneased so the boundary stays attached to the pointer');
+    assert.match(styles, /body\.offline-browser-resize-transitioning \.offline-browser-sidebar\s*\{[^}]*transition:\s*transform 170ms/u,
+        'crossing the collapse/reopen threshold must restore the normal Browser Workspace slide animation');
+    assert.match(browser, /var RESIZE_COLLAPSE_GRACE = 160;/u, 'resize collapse must require a deliberate 160px overshoot beyond the hard minimum');
+    assert.match(browser, /function pointerWidth\(pointerX\) \{ return viewportWidth\(\) - pointerX; \}/u,
+        'ordinary resize width must derive from the pointer absolute viewport coordinate');
+    assert.match(browser, /if \(pointerX > minimumEdge\) return;[\s\S]*?animatePhase\('open'\);[\s\S]*?applyRequestedWidth\(pointerWidth\(pointerX\)\)/u,
+        'collapsed reopening must wait for the legal minimum-width edge before making the workspace visible');
+    assert.match(browser, /function animatePhase\(nextPhase\)[\s\S]*?offline-browser-resize-transitioning[\s\S]*?setOpen\(phase === 'open'/u,
+        'collapse/reopen must remain an animated state transition');
+    assert.match(browser, /function beginResize\(event\)[\s\S]*?var phase = startedOpen \? 'open' : 'collapsed'[\s\S]*?setPointerCapture\(pointerId\)/u,
+        'pointer-captured resize behavior must retain explicit open/collapsed gesture state');
+    assert.match(browser, /getElementById\('offlineBrowserResizeHandle'\)\?\.addEventListener\('pointerdown', beginResize\)/u,
+        'resize hit target must remain wired to beginResize');
+});
+
+function createBrowserResizeHarness() {
+    const classes = new Set();
+    const styleValues = new Map();
+    const storage = new Map();
+    const listeners = new Map();
+    let capturedPointer = null;
+
+    const classList = {
+        add(name) { classes.add(name); },
+        remove(name) { classes.delete(name); },
+        toggle(name, force) {
+            const enabled = force === undefined ? !classes.has(name) : Boolean(force);
+            if (enabled) classes.add(name);
+            else classes.delete(name);
+            return enabled;
+        },
+        contains(name) { return classes.has(name); },
+    };
+    const handle = {
+        addEventListener(type, listener) { listeners.set(type, listener); },
+        removeEventListener(type, listener) { if (listeners.get(type) === listener) listeners.delete(type); },
+        setPointerCapture(pointerId) { capturedPointer = pointerId; },
+        hasPointerCapture(pointerId) { return capturedPointer === pointerId; },
+        releasePointerCapture(pointerId) { if (capturedPointer === pointerId) capturedPointer = null; },
+    };
+    const browserSidebar = {
+        classList: { toggle() {} },
+        setAttribute() {},
+        addEventListener() {},
+        getBoundingClientRect() {
+            return { width: Number.parseFloat(styleValues.get('--offline-browser-width')) || 500 };
+        },
+    };
+    const workspaceSidebar = { getBoundingClientRect() { return { right: 100 }; } };
+    const elements = new Map([
+        ['offlineBrowserResizeHandle', handle],
+        ['offlineBrowserSidebar', browserSidebar],
+        ['workspaceSidebar', workspaceSidebar],
+    ]);
+    const context = {
+        console, Promise, Object, Number, String, Boolean, Math, Array,
+        innerWidth: 1000,
+        requestAnimationFrame() { return 1; },
+        cancelAnimationFrame() {},
+        setTimeout() { return 1; },
+        clearTimeout() {},
+        addEventListener() {},
+        localStorage: {
+            getItem(key) { return storage.has(key) ? storage.get(key) : null; },
+            setItem(key, value) { storage.set(key, String(value)); },
+        },
+        document: {
+            readyState: 'complete',
+            hidden: false,
+            activeElement: null,
+            body: { classList },
+            documentElement: { style: { setProperty(name, value) { styleValues.set(name, value); } } },
+            getElementById(id) { return elements.get(id) || null; },
+            addEventListener() {},
+        },
+    };
+    context.globalThis = context;
+    vm.createContext(context);
+    vm.runInContext(fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'offline-browser.js'), 'utf8'), context, { filename: 'offline-browser.js' });
+
+    function dispatch(type, clientX, pointerId = 1) {
+        const listener = listeners.get(type);
+        assert.equal(typeof listener, 'function', `expected ${type} resize listener`);
+        listener({
+            button: 0, pointerId, clientX, currentTarget: handle,
+            preventDefault() {},
+        });
+    }
+
+    return { context, classes, styleValues, storage, dispatch };
+}
+
+test('Browser Workspace resize edge stays exactly on the pointer across normal drag and collapse/reopen', () => {
+    const harness = createBrowserResizeHarness();
+    harness.context.toggleOfflineBrowser(true);
+
+    // The invisible hit target is wider than the visual edge. Starting 16px away
+    // from the edge must not preserve that offset once pointer movement begins.
+    harness.dispatch('pointerdown', 516);
+    harness.dispatch('pointermove', 520);
+    assert.equal(Number.parseFloat(harness.styleValues.get('--offline-browser-width')), 480);
+    assert.equal(1000 - Number.parseFloat(harness.styleValues.get('--offline-browser-width')), 520,
+        'open Browser Workspace edge must equal clientX exactly');
+    harness.dispatch('pointermove', 600);
+    assert.equal(Number.parseFloat(harness.styleValues.get('--offline-browser-width')), 400);
+    assert.equal(1000 - Number.parseFloat(harness.styleValues.get('--offline-browser-width')), 600);
+    harness.dispatch('pointerup', 600);
+    assert.equal(harness.storage.get('darkstar.browser.width'), '400');
+
+    // The existing minimum remains a hard stop, followed by the deliberate
+    // 160px collapse grace band.
+    harness.dispatch('pointerdown', 612, 2);
+    harness.dispatch('pointermove', 640, 2);
+    assert.equal(Number.parseFloat(harness.styleValues.get('--offline-browser-width')), 360);
+    assert.equal(harness.classes.has('offline-browser-open'), true);
+    harness.dispatch('pointermove', 799, 2);
+    assert.equal(harness.classes.has('offline-browser-open'), true, '159px beyond the minimum must not collapse');
+    harness.dispatch('pointermove', 800, 2);
+    assert.equal(harness.classes.has('offline-browser-open'), false, 'the 160px deliberate overshoot collapses');
+    assert.equal(harness.classes.has('offline-browser-resize-transitioning'), true, 'collapse must retain the eased workspace transition');
+
+    // Reversal in the same drag reopens only when the pointer physically reaches
+    // the 360px minimum-width edge, eliminating the old post-reopen cursor offset.
+    harness.dispatch('pointermove', 641, 2);
+    assert.equal(harness.classes.has('offline-browser-open'), false);
+    harness.dispatch('pointermove', 640, 2);
+    assert.equal(harness.classes.has('offline-browser-open'), true);
+    assert.equal(Number.parseFloat(harness.styleValues.get('--offline-browser-width')), 360);
+    assert.equal(1000 - Number.parseFloat(harness.styleValues.get('--offline-browser-width')), 640);
+    harness.dispatch('pointermove', 600, 2);
+    assert.equal(Number.parseFloat(harness.styleValues.get('--offline-browser-width')), 400);
+    assert.equal(1000 - Number.parseFloat(harness.styleValues.get('--offline-browser-width')), 600);
+    harness.dispatch('pointerup', 600, 2);
+
+    // A fresh drag from a collapsed window edge follows the same physical rule:
+    // do not expose a 360px workspace while the cursor is only ~160px from the edge.
+    harness.context.toggleOfflineBrowser(false);
+    harness.dispatch('pointerdown', 995, 3);
+    harness.dispatch('pointermove', 641, 3);
+    assert.equal(harness.classes.has('offline-browser-open'), false);
+    harness.dispatch('pointermove', 640, 3);
+    assert.equal(harness.classes.has('offline-browser-open'), true);
+    assert.equal(1000 - Number.parseFloat(harness.styleValues.get('--offline-browser-width')), 640);
+    harness.dispatch('pointermove', 590, 3);
+    assert.equal(Number.parseFloat(harness.styleValues.get('--offline-browser-width')), 410);
+    assert.equal(1000 - Number.parseFloat(harness.styleValues.get('--offline-browser-width')), 590);
+    harness.dispatch('pointerup', 590, 3);
+
+    // clientX and innerWidth are both CSS pixels, so a 4K-class viewport must
+    // preserve the exact same edge-to-pointer invariant under display scaling.
+    const large = createBrowserResizeHarness();
+    large.context.innerWidth = 3840;
+    large.context.toggleOfflineBrowser(false);
+    large.dispatch('pointerdown', 3835, 4);
+    large.dispatch('pointermove', 3481, 4);
+    assert.equal(large.classes.has('offline-browser-open'), false);
+    large.dispatch('pointermove', 3480, 4);
+    assert.equal(large.classes.has('offline-browser-open'), true);
+    assert.equal(3840 - Number.parseFloat(large.styleValues.get('--offline-browser-width')), 3480);
+    large.dispatch('pointermove', 3380, 4);
+    assert.equal(Number.parseFloat(large.styleValues.get('--offline-browser-width')), 460);
+    assert.equal(3840 - Number.parseFloat(large.styleValues.get('--offline-browser-width')), 3380);
+    large.dispatch('pointerup', 3380, 4);
+});
+
+test('Nodes sidebar does not expose the retired Tidy control', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'index.html'), 'utf8');
+    const renderer = fs.readFileSync(path.join(ROOT, 'backend', 'Darkstar_Renderer.js'), 'utf8');
+
+    assert.doesNotMatch(html, /nodeAutoLayoutButton|Tidy settings sections|>Tidy</u,
+        'Nodes sidebar must not render the retired Tidy control');
+    assert.doesNotMatch(renderer, /bindClickById\('nodeAutoLayoutButton'/u,
+        'renderer must not retain a click binding for a removed Tidy control');
+    assert.match(renderer, /function autoArrangeNodeGraph\(\)/u,
+        'removing the sidebar button must not delete the internal workflow ordering helper');
+});
+
 test('foreground ownership is reason-based so one UI overlay cannot accidentally expose the browser under another', async () => {
     const calls = [];
     const context = {
@@ -2266,7 +2609,9 @@ test('the default workflow uses canonical provider paths and automatic round bud
     const snapshot = decodeWorkflowSnapshot(fs.readFileSync(WORKFLOW));
     const editor = snapshot.editor && typeof snapshot.editor === 'object' ? snapshot.editor : snapshot;
     const toolsNode = editor.nodes.find((node) => node?.type === 'tools');
-    assert.ok(toolsNode, 'default workflow must contain a Tools node');
+    assert.ok(toolsNode, 'default workflow must contain the Loader node');
+    assert.equal(toolsNode.title, 'Loader');
+    assert.deepEqual(toolsNode.params.skills, []);
     assert.equal(toolsNode.params.maxRounds, 'auto');
 
     const paths = bundledPythonProviders().map((provider) => provider.path);
@@ -2290,6 +2635,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const vm = require('node:vm');
 
 const root = path.resolve(__dirname, '..', '..', '..');
 const read = (file) => fs.readFileSync(path.join(root, file), 'utf8');
@@ -2303,7 +2649,7 @@ test('settings and view buttons retain their exact visibility/foreground ownersh
     has('backend/renderer/views.js', /function switchView\(view\)[\s\S]*?setNodeViewNativeOverlayBlocked\(enteringNodeView\)[\s\S]*?tabBar\.style\.display = 'none'[\s\S]*?chatContainer\.style\.display = 'none'[\s\S]*?workspaceSidebar\.style\.display = 'none'/u);
     has('backend/renderer/views.js', /function toggleStatusView\(\)[\s\S]*?classList\.contains\('active'\) \? 'chat' : 'settings'[\s\S]*?switchView\(currentView\)/u);
     has('backend/renderer/views.js', /statusSettings\.setAttribute\('aria-label', 'Return to chat'\)/u);
-    has('backend/renderer/views.js', /statusSettings\.setAttribute\('aria-label', 'Open node editor'\)/u);
+    has('backend/renderer/views.js', /statusSettings\.setAttribute\('aria-label', 'Open settings'\)/u);
 });
 
 test('workflow save/load buttons remain connected to the native in-app workflow picker and binary snapshot persistence', () => {
@@ -2317,15 +2663,17 @@ test('workflow save/load buttons remain connected to the native in-app workflow 
     assert.match(modal, /api\.load\(\{ fileName: fileName \}\)[\s\S]*?await root\.restoreWorkflowDocument[\s\S]*?await root\.restoreWorkflowSnapshot[\s\S]*?scheduleWorkflowSessionSave\(0\)[\s\S]*?Workflow loaded:/u);
 });
 
-test('reset and tidy graph buttons preserve canonical-default/layout/save semantics', () => {
+test('restore-default preserves canonical workflow data while the internal section-ordering helper only reorders presentation', () => {
     const core = read('backend/renderer/nodes/editor/core.js');
-    assert.match(core, /async function resetNodeGraph\(\)[\s\S]*?restoreCanonicalDefaultWorkflow\(\)[\s\S]*?scheduleWorkflowSessionSave\(\)[\s\S]*?Emergency fallback[\s\S]*?createDefaultNodePipeline\(60, 22\)[\s\S]*?arrangeDefaultNodePipeline\(60, 22, 52\)/u);
+    assert.match(core, /async function resetNodeGraph\(\)[\s\S]*?restoreCanonicalDefaultWorkflow\(\)[\s\S]*?scheduleWorkflowSessionSave\(\)[\s\S]*?Emergency fallback[\s\S]*?createDefaultNodePipeline\(60, 22\)[\s\S]*?renderAllNodes\(\)/u);
+    assert.doesNotMatch(core, /async function resetNodeGraph\(\)[\s\S]*?arrangeDefaultNodePipeline\(/u);
     const workflow = read('backend/renderer/workflow.js');
     assert.match(workflow, /DEFAULT_WORKFLOW_FILE = 'darkstar-workflow\.dswf'/u);
     assert.match(workflow, /async function loadCanonicalDefaultWorkflow\(\)[\s\S]*?bridge\.load\(\{ fileName: DEFAULT_WORKFLOW_FILE \}\)/u);
     assert.match(workflow, /async function restoreWorkflowSession\(\)[\s\S]*?loadCanonicalDefaultWorkflow\(\)[\s\S]*?bridge\.loadSession\(\)[\s\S]*?restoreCanonicalDefaultWorkflow\(\)/u);
     const layout = read('backend/renderer/nodes/editor/layout.js');
-    assert.match(layout, /function autoArrangeNodeGraph\(\)[\s\S]*?cancelNodeLayoutGestures\(\)[\s\S]*?arrangeNodeGraph\(60, 40, AUTO_LAYOUT_HORIZONTAL_GAP, AUTO_LAYOUT_VERTICAL_GAP\)[\s\S]*?scheduleWorkflowSessionSave\(\)[\s\S]*?showNodeEditorToast\('Nodes arranged', 'success', 1800\)/u);
+    assert.match(layout, /function autoArrangeNodeGraph\(\)[\s\S]*?workflowSectionsScroll[\s\S]*?scrollTo\(\{ top: 0, behavior: 'smooth' \}\)[\s\S]*?Workflow sections ordered by execution/u);
+    assert.doesNotMatch(layout, /function autoArrangeNodeGraph\(\)[\s\S]*?arrangeNodeGraph\(/u);
 });
 
 test('clear-context button remains an explicit clear-chat operation with toast feedback', () => {
@@ -2333,10 +2681,11 @@ test('clear-context button remains an explicit clear-chat operation with toast f
     has('backend/renderer/send.js', /function clearChat\(options\)[\s\S]*?tab\.history = \[\][\s\S]*?tab\.scheduled = \[\][\s\S]*?renderChat\(\)[\s\S]*?scheduleChatSessionSave\(0\)/u);
 });
 
-test('chat-autosave button still clears persisted session when disabled and forces a save when enabled', () => {
+test('chat-autosave toggle preserves persisted project chats when disabled and forces a save when enabled', () => {
     const source = read('backend/renderer/chat-session.js');
     assert.match(source, /function toggleChatAutosave\(\) \{\s*return setChatAutosaveEnabled\(!chatAutosaveEnabled\);\s*\}/u);
-    assert.match(source, /async function setChatAutosaveEnabled\(enabled\)[\s\S]*?if \(!next\)[\s\S]*?bridge\.clear\(\)[\s\S]*?Chat autosave disabled and saved chat session cleared/u);
+    assert.match(source, /async function setChatAutosaveEnabled\(enabled\)[\s\S]*?if \(!next\)[\s\S]*?Existing saved project chats preserved/u);
+    assert.doesNotMatch(source, /if \(!next\)[\s\S]*?bridge\.clear\(\)/u);
     assert.match(source, /chatSessionRevision \+= 1;[\s\S]*?saveChatSessionNow\(\{ force: true \}\)[\s\S]*?Chat autosave enabled/u);
 });
 
@@ -2349,6 +2698,111 @@ test('browser navigation/session buttons retain the exact backend command mappin
     assert.match(source, /root\.resetBrowser = function\(\) \{ return invoke\('reset'\); \};/u);
     assert.match(source, /root\.openOfflineBrowserAddress = openAddress;/u);
     assert.match(source, /root\.chooseOfflineBrowserFile = chooseFile;/u);
+});
+
+test('Browser Workspace is browser-only and browser tools preserve per-tab opening semantics', () => {
+    const workspace = read('backend/renderer/browser-workspace.js');
+    const send = read('backend/renderer/send.js');
+    const html = read('backend/shell/index.html');
+    const styles = read('backend/shell/styles.css');
+    const offlineBrowser = read('backend/renderer/offline-browser.js');
+    assert.match(html, /<aside class="offline-browser-sidebar" id="offlineBrowserSidebar" aria-label="Browser Workspace"/u);
+    assert.doesNotMatch(html, /workshopImage|workshop-image|Image Editor|workshopModeTabs|workshopBrowserModeTab|workshopImageModeTab/u,
+        'Browser Workspace must not retain Image Editor UI or mode-switching chrome');
+    assert.doesNotMatch(styles, /workshop-image|workshop-mode-tab/u,
+        'removed Image Editor and mode selector must not retain dead presentation CSS');
+    assert.match(workspace, /function browserWorkspaceTool\(name\)[\s\S]*?browser_control[\s\S]*?screenshot_html[\s\S]*?open_side_browser/u);
+    assert.match(workspace, /var pendingOpenByTab = Object\.create\(null\)/u);
+    assert.match(workspace, /activateOfflineBrowserForTab[\s\S]*?pendingOpenByTab\[key\][\s\S]*?toggleOfflineBrowser\(true\)/u,
+        'a browser tool started in a background tab must request opening when that tab becomes active');
+    assert.match(send, /payload\.type === 'start'[\s\S]*?openBrowserWorkspaceForTool\(payload\.activity\.name, session\.tabId\)/u);
+    assert.doesNotMatch(send, /addWorkshopContextImage|refreshWorkshopContextImages|openWorkshopForTool/u,
+        'tool-produced images must no longer be diverted into a browser-side image editor');
+    assert.match(offlineBrowser, /String\(event\.key \|\| ''\) === 'Tab'[\s\S]*?root\.toggleOfflineBrowser\(\)/u);
+    assert.doesNotMatch(offlineBrowser, /ctrlKey[\s\S]{0,120}shiftKey[\s\S]{0,120}=== 'b'/u,
+        'Browser Workspace should retain the requested plain Tab shortcut');
+});
+
+test('chat images open a modal inpainting editor that blocks BrowserView and owns selection/brush geometry', () => {
+    const html = read('backend/shell/index.html');
+    const styles = read('backend/shell/styles.css');
+    const editor = read('backend/renderer/image-lightbox.js');
+    const chat = read('backend/renderer/chat.js');
+    const queue = read('backend/renderer/queue.js');
+    assert.match(html, /id="imageLightbox"[\s\S]*?role="dialog" aria-modal="true" aria-label="Image editor"[\s\S]*?id="imageLightboxSelectMode"[\s\S]*?id="imageLightboxBrushMode"[\s\S]*?id="imageLightboxBrushColor"[\s\S]*?id="imageLightboxBrushSize"[\s\S]*?id="imageLightboxUseEdit"[\s\S]*?id="imageLightboxClose"/u);
+    assert.doesNotMatch(html, /imageLightboxTitle|Mask edits are applied|image-lightbox-footer|imageLightboxCaption/u,
+        'the image editor must keep only the centered control bar and image canvas as visible chrome');
+    assert.match(styles, /--window-titlebar-height:\s*40px;/u);
+    assert.match(styles, /\.image-lightbox\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?inset:\s*var\(--window-titlebar-height\) 0 0 0;[\s\S]*?z-index:\s*13100;/u,
+        'the image editor must begin below the native title-bar overlay and never cover window controls');
+    assert.match(styles, /\.image-lightbox-dialog\s*\{[\s\S]*?height:\s*min\(1160px, calc\(100vh - var\(--window-titlebar-height\) - 48px\)\)/u,
+        'the editor dialog height must be bounded by the viewport area below the title bar');
+    assert.match(styles, /\.image-lightbox-header\s*\{[\s\S]*?justify-content:\s*center;[\s\S]*?padding:\s*8px 50px;/u,
+        'image editor tools should remain centered independently of the close button');
+    assert.match(styles, /\.image-lightbox-canvas-wrap\s*\{[\s\S]*?position:\s*relative;/u);
+    assert.match(styles, /\.image-lightbox-overlay\s*\{[\s\S]*?touch-action:\s*none;/u);
+    assert.match(styles, /\.image-lightbox-stage\s*\{[\s\S]*?background:\s*var\(--image-editor-canvas-bg,[^;]+\);/u);
+    const stageCss = styles.match(/\.image-lightbox-stage\s*\{([\s\S]*?)\}/u)?.[1] || '';
+    assert.doesNotMatch(stageCss, /gradient|background-image/u, 'image editor stage must use a plain theme-owned canvas color');
+    const editorCanvasPalette = {
+        light: '#e5e7eb',
+        quantum: '#000000',
+        terminal: '#090909',
+        arctic: '#08080c',
+        space: '#000000',
+    };
+    for (const [theme, color] of Object.entries(editorCanvasPalette)) {
+        const escapedTheme = theme.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+        const escapedColor = color;
+        assert.match(styles, new RegExp(`html\\[data-theme='${escapedTheme}'\\] \\{[\\s\\S]*?--image-editor-canvas-bg:\\s*${escapedColor};`, 'u'),
+            `${theme} must own the intended plain editor canvas color`);
+    }
+    assert.match(editor, /TRIGGER_SELECTOR = '[^']*message-image[^']*context-image-frame img[^']*queue-image'/u);
+    assert.match(editor, /setOfflineBrowserOverlayBlockReason\('image-lightbox', blocked === true\)/u,
+        'the editor must explicitly block BrowserView foreground ownership while visible');
+    assert.match(editor, /function brushBounds\(strokes, width, height\)[\s\S]*?side = Math\.ceil\(Math\.max\(boxWidth, boxHeight\)\)[\s\S]*?width: side, height: side/u,
+        'brush mode must derive one minimum square from all stroke extents');
+    assert.match(editor, /setPointerCapture\(event\.pointerId\)[\s\S]*?editorState\.mode === 'selection'[\s\S]*?editorState\.strokes\.push/u);
+    assert.match(editor, /function onStageWheel\(event\)[\s\S]*?getBoundingClientRect\(\)[\s\S]*?anchorX[\s\S]*?Math\.exp\(-delta \* 0\.0015\)[\s\S]*?scrollLeft \+=/u,
+        'wheel zoom must preserve the image point under the cursor while changing scale');
+    assert.match(editor, /function onStagePointerDown\(event\)[\s\S]*?event\.button !== 1[\s\S]*?editorState\.pan = \{[\s\S]*?scrollLeft:[\s\S]*?setPointerCapture\(event\.pointerId\)/u,
+        'middle mouse must own a captured pan gesture without interfering with left-button edit gestures');
+    assert.match(editor, /addEventListener\('wheel', onStageWheel, \{ passive: false \}\)[\s\S]*?addEventListener\('pointerdown', onStagePointerDown\)[\s\S]*?addEventListener\('auxclick', onStageAuxClick\)/u);
+    assert.match(editor, /edit:\s*\{ version: 1, mode: editorState\.mode, sourceBase64: sourceBase64[\s\S]*?region:/u,
+        'arming an edit must retain a pristine source and a user-owned region separate from the guide image');
+    assert.match(editor, /pendingImage = attachment/u);
+    assert.match(editor, /event\.key === 'Escape'[\s\S]*?close\(\)/u);
+    assert.match(editor, /event\.key === 'Tab'[\s\S]*?focusableControls[\s\S]*?focus/u,
+        'keyboard focus must remain inside the editor');
+    assert.match(editor, /event\.key !== 'Enter' && event\.key !== ' '/u,
+        'focused images must support keyboard activation as well as pointer clicks');
+    assert.match(chat, /class="message-image image-lightbox-trigger"[\s\S]*?data-message-index=/u);
+    assert.match(chat, /image\.className = 'image-lightbox-trigger'[\s\S]*?setAttribute\('aria-label', 'Open image in image editor'\)/u);
+    assert.match(queue, /queue-image image-lightbox-trigger/u);
+});
+
+test('brush inpainting geometry is the minimum enclosing square and fails closed when no in-image square can contain every mark', () => {
+    const source = read('backend/renderer/image-lightbox.js');
+    const sandbox = {
+        document: { readyState: 'loading', addEventListener() {} },
+        requestAnimationFrame(callback) { callback(); return 1; },
+        ResizeObserver: null,
+        Darkstar: {},
+    };
+    sandbox.globalThis = sandbox;
+    vm.createContext(sandbox);
+    vm.runInContext(source, sandbox, { filename: 'backend/renderer/image-lightbox.js' });
+    const bounds = sandbox.imageEditRegionForBrushStrokes([
+        { size: 10, points: [{ x: 10, y: 20 }, { x: 30, y: 50 }] },
+    ], 100, 80);
+    assert.equal(bounds.impossible, false);
+    assert.equal(bounds.width, 40); assert.equal(bounds.height, 40);
+    assert.ok(bounds.x <= 5 && bounds.y <= 15);
+    assert.ok(bounds.x + bounds.width >= 35 && bounds.y + bounds.height >= 55);
+    const impossible = sandbox.imageEditRegionForBrushStrokes([
+        { size: 8, points: [{ x: 4, y: 25 }, { x: 116, y: 25 }] },
+    ], 120, 50);
+    assert.equal(impossible.impossible, true, 'Darkstar must not silently crop brush marks just to force a square into the image');
 });
 
 test('workspace expand/choose-directory buttons retain layout persistence and required-project semantics', () => {
@@ -2432,30 +2886,30 @@ function sendContext() {
     return context;
 }
 
-test('Load Model releases a stopped renderer generation immediately while the serialized main-process load may finish later', async () => {
+test('Invoke Language Model releases a stopped renderer generation while projector detection may finish later', async () => {
     let definition = null;
-    let loadStarted = false;
-    let resolveLoad = null;
-    let projectorCalls = 0;
+    let detectionStarted = false;
+    let resolveDetection = null;
     const bridge = {
-        async detectProjector() { projectorCalls += 1; return { success: true, projectors: [], projectorPath: '' }; },
-        loadModel() {
-            loadStarted = true;
-            return new Promise((resolve) => { resolveLoad = resolve; });
+        detectProjector() {
+            detectionStarted = true;
+            return new Promise((resolve) => { resolveDetection = resolve; });
         },
     };
     const context = {
         console, Promise, Object, Array, String, Number, Boolean, Math, RegExp, AbortController,
-        setContextContractRuntimeContextReady() {},
         Darkstar: {
+            modelInventory: [],
             nodes: {
                 builtinCommon: {
                     getLlamaBridge() { return bridge; },
                     baseNode() { return {}; },
                     modelDropdown() { return ''; },
+                    modelInventoryRecord() { return null; },
+                    isAbsoluteModelPath() { return false; },
                 },
                 controls: { dropdown() { return ''; }, button() { return ''; }, status() { return ''; } },
-                PORT_TYPES: { SERVER: 'server', MODEL: 'model' },
+                PORT_TYPES: { MODEL_CONFIG: 'model-config' },
                 registerNode(value) { definition = value; },
             },
         },
@@ -2469,26 +2923,21 @@ test('Load Model releases a stopped renderer generation immediately while the se
 
     const controller = new AbortController();
     const node = { id: 4, selectedModel: 'model.gguf', params: {} };
-    const pending = definition.execute({ server: { running: true, parallelSlots: 1 } }, node, { abortSignal: controller.signal });
-    for (let index = 0; index < 8 && !loadStarted; index += 1) await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(loadStarted, true, 'the renderer must actually be waiting on the model-load IPC operation');
+    const pending = definition.execute({}, node, { abortSignal: controller.signal });
+    for (let index = 0; index < 8 && !detectionStarted; index += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(detectionStarted, true, 'the renderer must be waiting on projector discovery');
     controller.abort('user-stopped');
     await assert.rejects(pending, (error) => error && error.name === 'AbortError' && /user-stopped/u.test(error.message));
 
-    // The IPC promise is intentionally not cancelled here: LlamaRuntime serializes
-    // model lifecycle operations in the main process. Its eventual completion must
-    // not keep the cancelled renderer generation registered or produce an unhandled rejection.
-    resolveLoad({ success: true, modelId: 'model.gguf', contextSizePerSlot: 4096, parallelSlots: 1 });
+    resolveDetection({ success: true, projectors: [], projectorPath: '' });
     await Promise.resolve();
 
     const alreadyStopped = new AbortController();
     alreadyStopped.abort('user-stopped');
-    const callsBefore = projectorCalls;
     await assert.rejects(
-        definition.execute({ server: { running: true } }, { id: 5, selectedModel: 'other.gguf', params: {} }, { abortSignal: alreadyStopped.signal }),
+        definition.execute({}, { id: 5, selectedModel: 'other.gguf', params: {} }, { abortSignal: alreadyStopped.signal }),
         (error) => error && error.name === 'AbortError'
     );
-    assert.equal(projectorCalls, callsBefore, 'an already-stopped generation must not start a new projector/model operation');
 });
 
 test('native continuation disables generation-prompt insertion at the llama.cpp protocol boundary', () => {
@@ -2844,6 +3293,7 @@ test('continuation reasoning keeps the existing assistant answer visible before 
     context.window = context;
     context.globalThis = context;
     vm.createContext(context);
+    vm.runInContext(read('backend/renderer/generation-stream-surface.js'), context, { filename: 'generation-stream-surface.js' });
     vm.runInContext(read('backend/renderer/generation-ui.js'), context, { filename: 'generation-ui.js' });
     context.__session = {
         id: 12,
@@ -2974,6 +3424,7 @@ test('restart snapshot replaces an in-flight continuation by message id rather t
         };
         generationSessionsByTab.set(0, __continuationSession);
     `, context);
+    vm.runInContext(read('backend/renderer/chat-session-snapshot.js'), context, { filename: 'chat-session-snapshot.js' });
     vm.runInContext(read('backend/renderer/chat-session.js'), context, { filename: 'chat-session.js' });
     const snapshot = vm.runInContext('createChatSessionSnapshot()', context);
     const assistants = snapshot.tabs[0].history.filter((m) => m.role === 'assistant');
@@ -3008,6 +3459,7 @@ test('restart snapshot never persists a half-tool and keeps only preceding assis
         };
         generationSessionsByTab.set(0, __toolSession);
     `, context);
+    vm.runInContext(read('backend/renderer/chat-session-snapshot.js'), context, { filename: 'chat-session-snapshot.js' });
     vm.runInContext(read('backend/renderer/chat-session.js'), context, { filename: 'chat-session.js' });
     const snapshot = vm.runInContext('createChatSessionSnapshot()', context);
     const interrupted = snapshot.tabs[0].history.at(-1);
@@ -3492,6 +3944,7 @@ test('adversary continuation mounts and paints into the existing adversary bubbl
     context.window = context;
     context.globalThis = context;
     vm.createContext(context);
+    vm.runInContext(read('backend/renderer/generation-stream-surface.js'), context, { filename: 'generation-stream-surface.js' });
     vm.runInContext(read('backend/renderer/generation-ui.js'), context, { filename: 'generation-ui.js' });
     const session = { id: 91, continuationMessageId: 'adv-live', assistantIndex: 0, responseText: 'old critique', continuationBaseText: 'old critique', agentTimeline: [] };
     const coordinator = context.Darkstar.generationUi.createCoordinator({
@@ -3598,9 +4051,12 @@ const vm = require('node:vm');
 
 const projectRoot = path.resolve(__dirname, '..', '..', '..');
 const sendSource = fs.readFileSync(path.join(projectRoot, 'backend', 'renderer', 'send.js'), 'utf8');
+const chatSessionSnapshotSource = fs.readFileSync(path.join(projectRoot, 'backend', 'renderer', 'chat-session-snapshot.js'), 'utf8');
 const chatSessionSource = fs.readFileSync(path.join(projectRoot, 'backend', 'renderer', 'chat-session.js'), 'utf8');
 const workflowSource = fs.readFileSync(path.join(projectRoot, 'backend', 'renderer', 'workflow.js'), 'utf8');
 const agentLoopSource = fs.readFileSync(path.join(projectRoot, 'backend', 'runtime', 'agent-loop.js'), 'utf8');
+const chatSource = fs.readFileSync(path.join(projectRoot, 'backend', 'renderer', 'chat.js'), 'utf8');
+const chatStylesSource = fs.readFileSync(path.join(projectRoot, 'backend', 'shell', 'styles.css'), 'utf8');
 
 function sourceBetween(source, startMarker, endMarker) {
     const start = source.indexOf(startMarker);
@@ -3609,6 +4065,36 @@ function sourceBetween(source, startMarker, endMarker) {
     assert.notEqual(end, -1, `Missing source marker: ${endMarker}`);
     return source.slice(start, end);
 }
+
+test('normal chat autosave snapshot construction yields between bounded renderer work slices', () => {
+    assert.match(chatSessionSource, /snapshotBuilder\.createAsync\(\)/u);
+    assert.match(chatSessionSnapshotSource, /sliceMs/u);
+    assert.match(chatSessionSnapshotSource, /await yieldRendererTurn\(\)/u);
+    assert.match(chatSessionSnapshotSource, /root\.setTimeout\(resolve, 0\)/u);
+    assert.doesNotMatch(chatSessionSource, /await createChatSessionSnapshot\(\)/u);
+});
+
+test('chat persistence stores one canonical image payload and derives data URLs only for presentation', () => {
+    const normalizedImageBlock = sourceBetween(chatSessionSource, 'function normalizedImage(image) {', 'function normalizedMessage(message) {');
+    assert.match(normalizedImageBlock, /base64:\s*normalizedSource\.base64/u);
+    assert.doesNotMatch(normalizedImageBlock, /dataUrl\s*:/u);
+    assert.match(chatSessionSource, /Darkstar\.imageData\.safeDataUrl\(state\.image/u);
+});
+
+test('full chat reconstruction commits historical message DOM in one fragment instead of one layout per message', () => {
+    const renderChatBlock = sourceBetween(chatSource, 'function renderChat() {', 'function compactVisibleContent');
+    assert.match(renderChatBlock, /document\.createDocumentFragment\(\)/u);
+    assert.match(renderChatBlock, /renderTarget:\s*fragment/u);
+    assert.match(renderChatBlock, /deferEffects:\s*fragment !== container/u);
+    assert.match(renderChatBlock, /container\.appendChild\(fragment\)/u);
+});
+
+
+test('off-screen chat history remains fully present but Chromium may skip its layout and paint work', () => {
+    const messageStyle = sourceBetween(chatStylesSource, '.message {', '.message-stack {');
+    assert.match(messageStyle, /content-visibility:\s*auto/u);
+    assert.match(messageStyle, /contain-intrinsic-block-size:\s*auto\s+160px/u);
+});
 
 test('streaming tokens and context heartbeats never trigger chat autosaves', () => {
     const contextUsage = sourceBetween(
@@ -3693,7 +4179,7 @@ test('runtime chat safety timer is installed at exactly 300000 ms', async () => 
         console: { warn() {}, log() {}, error() {} },
         structuredClone,
         localStorage: {
-            getItem(key) { return key === 'darkstar.chat.autosave.enabled' ? 'true' : null; },
+            getItem(key) { return key === 'darkstar.chat.autosave.enabled' ? (options.autosaveValue === undefined ? 'true' : options.autosaveValue) : null; },
             setItem() {},
             removeItem() {},
         },
@@ -3702,7 +4188,7 @@ test('runtime chat safety timer is installed at exactly 300000 ms', async () => 
                 async load() { return { success: true, found: false }; },
                 async save() { return { success: true, bytes: 1 }; },
                 saveSync() { return { success: true, bytes: 1 }; },
-                async clear() { return { success: true, removed: false }; },
+                async clear() { clearCalls += 1; return { success: true, removed: false }; },
             },
         },
         document: {
@@ -3727,6 +4213,7 @@ test('runtime chat safety timer is installed at exactly 300000 ms', async () => 
     context.window = context;
     context.globalThis = context;
     vm.createContext(context);
+    vm.runInContext(chatSessionSnapshotSource, context, { filename: 'backend/renderer/chat-session-snapshot.js' });
     vm.runInContext(chatSessionSource, context, { filename: 'backend/renderer/chat-session.js' });
     await context.restoreChatSession();
     assert.equal(intervalDelay, 300000);
@@ -3816,13 +4303,14 @@ const test = require('node:test');
 
 const {
     decodeChatSessionSnapshot,
+    encodeChatSessionSnapshot,
     encodeChatSessionSnapshotAsync,
 } = require('../../chat/chat-session-codec');
-const { ChatSessionStore } = require('../../preferences/chat-session-store');
+const { AsyncChatSessionEncoder, ChatSessionStore } = require('../../preferences/chat-session-store');
 const { registerChatSessionIpc } = require('../../ipc/register-chat-session-ipc');
 const CHANNELS = require('../../protocol/channels');
 
-function snapshot(content) {
+function snapshot(content, rootPath = null) {
     return {
         format: 'darkstar-chat-session',
         version: 2,
@@ -3835,7 +4323,7 @@ function snapshot(content) {
         messageIdentitySequence: 0,
         workspaceSidebarCollapsed: false,
         composer: { tabId: 0, text: '', image: null },
-        projects: [{ id: 0, title: 'Project', activeTabId: 0, workspace: null }],
+        projects: [{ id: 0, title: 'Project', activeTabId: 0, workspace: rootPath ? { rootPath, expandedDirectories: [''], selectedPath: null } : null }],
         tabs: [{
             id: 0,
             projectId: 0,
@@ -3892,14 +4380,28 @@ test('asynchronous chat-session encoding remains fully compatible with the exist
     assert.equal(decoded.version, 2);
 });
 
+
+test('normal chat-session partitioning and DSCS serialization execute in the dedicated encoder worker', async (t) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-chat-worker-'));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    const encoder = new AsyncChatSessionEncoder({ corePath: path.join(__dirname, '..', '..', 'Darkstar_Core.js') });
+    t.after(() => encoder.close());
+    const records = await encoder.encode(snapshot('worker-owned round trip', directory), [{ projectId: 0, rootPath: directory }]);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].rootPath, fs.realpathSync(directory));
+    const decoded = decodeChatSessionSnapshot(records[0].envelope);
+    assert.equal(decoded.tabs[0].history[0].content, 'worker-owned round trip');
+    assert.equal(decoded.projects[0].workspace.rootPath, fs.realpathSync(directory));
+});
+
 test('an older async save can never overwrite a newer synchronous durable save', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-chat-save-order-'));
     const filePath = path.join(directory, 'chat-session.dscs');
     const store = new ChatSessionStore({ filePath });
     try {
         // gzip() is asynchronous, so this save yields before its write phase.
-        const olderSave = store.saveAsync(snapshot('older async state ' + 'x'.repeat(256 * 1024)));
-        store.save(snapshot('newer synchronous state'));
+        const olderSave = store.saveAsync(snapshot('older async state ' + 'x'.repeat(256 * 1024), directory));
+        store.save(snapshot('newer synchronous state', directory));
         await olderSave;
 
         const restored = store.load();
@@ -3915,11 +4417,11 @@ test('clearing autosave cannot be undone by an older async save finishing afterw
     const filePath = path.join(directory, 'chat-session.dscs');
     const store = new ChatSessionStore({ filePath });
     try {
-        store.save(snapshot('existing state'));
-        const pendingSave = store.saveAsync(snapshot('stale state ' + 'y'.repeat(256 * 1024)));
+        store.save(snapshot('existing state', directory));
+        const pendingSave = store.saveAsync(snapshot('stale state ' + 'y'.repeat(256 * 1024), directory));
         assert.equal(store.clear(), true);
         await pendingSave;
-        assert.equal(fs.existsSync(filePath), false);
+        assert.equal(fs.existsSync(path.join(directory, '.darkstar', 'chat-session.dscs')), false);
     } finally {
         fs.rmSync(directory, { recursive: true, force: true });
     }
@@ -3944,7 +4446,7 @@ test('main-process chat store coalesces a burst of async snapshots instead of en
     try {
         const saves = [];
         for (let index = 0; index < 32; index += 1) {
-            saves.push(store.saveAsync(snapshot(`burst-${index}-` + 'z'.repeat(256 * 1024))));
+            saves.push(store.saveAsync(snapshot(`burst-${index}-` + 'z'.repeat(256 * 1024), directory)));
         }
         await Promise.all(saves);
 
@@ -3957,6 +4459,319 @@ test('main-process chat store coalesces a burst of async snapshots instead of en
         const restored = store.load();
         assert.ok(restored);
         assert.match(restored.tabs[0].history[0].content, /^burst-31-/u);
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('project-owned chat persistence writes one DSCS session into each project root and merges them on restore', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-project-chat-store-'));
+    const projectA = path.join(directory, 'Project A');
+    const projectB = path.join(directory, 'Project B');
+    fs.mkdirSync(projectA, { recursive: true });
+    fs.mkdirSync(projectB, { recursive: true });
+    const legacyFilePath = path.join(directory, 'user-data', 'chat-session.dscs');
+    fs.mkdirSync(path.dirname(legacyFilePath), { recursive: true });
+    const store = new ChatSessionStore({ legacyFilePath, baseDir: path.join(directory, 'app') });
+    try {
+        const value = snapshot('project-a', projectA);
+        value.projects.push({ id: 1, title: 'Project B', activeTabId: 1, workspace: { rootPath: projectB, expandedDirectories: [''], selectedPath: null } });
+        value.tabs.push({ ...value.tabs[0], id: 1, projectId: 1, title: 'Chat B', history: [{ role: 'assistant', content: 'project-b' }] });
+        value.activeProjectId = 1;
+        value.activeTabId = 1;
+        value.nextProjectId = 2;
+        value.nextTabId = 2;
+
+        const result = store.save(value);
+        assert.equal(result.projectFiles, 2);
+        assert.equal(fs.existsSync(legacyFilePath), false, 'new saves must never recreate the legacy global chat-session file');
+        assert.equal(fs.existsSync(path.join(projectA, '.darkstar', 'chat-session.dscs')), true);
+        assert.equal(fs.existsSync(path.join(projectB, '.darkstar', 'chat-session.dscs')), true);
+
+        const restored = store.load();
+        assert.ok(restored);
+        assert.equal(restored.projects.length, 2);
+        assert.equal(restored.tabs.length, 2);
+        assert.deepEqual(restored.tabs.map((tab) => tab.history[0].content).sort(), ['project-a', 'project-b']);
+        assert.equal(restored.activeProjectId, 1);
+        assert.equal(restored.activeTabId, 1);
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+
+test('project chat saves use the Core-owned workspace root instead of renderer-supplied paths', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-project-chat-authority-'));
+    const authoritativeRoot = path.join(directory, 'Authoritative');
+    const rendererClaimedRoot = path.join(directory, 'Renderer Claimed');
+    fs.mkdirSync(authoritativeRoot, { recursive: true });
+    fs.mkdirSync(rendererClaimedRoot, { recursive: true });
+    const legacyFilePath = path.join(directory, 'user-data', 'chat-session.dscs');
+    fs.mkdirSync(path.dirname(legacyFilePath), { recursive: true });
+    const store = new ChatSessionStore({
+        legacyFilePath,
+        baseDir: path.join(directory, 'app'),
+        rootForProject(projectId) { return Number(projectId) === 0 ? authoritativeRoot : ''; },
+    });
+    try {
+        store.save(snapshot('authoritative root', rendererClaimedRoot));
+        assert.equal(fs.existsSync(path.join(authoritativeRoot, '.darkstar', 'chat-session.dscs')), true);
+        assert.equal(fs.existsSync(path.join(rendererClaimedRoot, '.darkstar', 'chat-session.dscs')), false,
+            'renderer state must not redirect Core persistence outside the registered project workspace');
+        const restored = store.load();
+        assert.equal(restored.tabs[0].history[0].content, 'authoritative root');
+        assert.equal(restored.projects[0].workspace.rootPath, fs.realpathSync(authoritativeRoot));
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('legacy global chat-session migrates into project roots while retaining the recovery copy', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-project-chat-migration-'));
+    const projectRoot = path.join(directory, 'Project');
+    const userData = path.join(directory, 'user-data');
+    fs.mkdirSync(projectRoot, { recursive: true });
+    fs.mkdirSync(userData, { recursive: true });
+    const legacyFilePath = path.join(userData, 'chat-session.dscs');
+    const legacy = snapshot('legacy conversation', projectRoot);
+    fs.writeFileSync(legacyFilePath, encodeChatSessionSnapshot(legacy));
+    const store = new ChatSessionStore({ legacyFilePath, baseDir: path.join(directory, 'app') });
+    try {
+        const restored = store.load();
+        assert.ok(restored);
+        assert.equal(restored.tabs[0].history[0].content, 'legacy conversation');
+        assert.equal(fs.existsSync(path.join(projectRoot, '.darkstar', 'chat-session.dscs')), true);
+        assert.equal(fs.existsSync(legacyFilePath), false);
+        assert.equal(fs.existsSync(legacyFilePath + '.migrated-backup'), true, 'migration must retain the original global session as a recovery backup');
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+});
+
+// ============================================================================
+// TEST MODULE: backend/Dev/tests/workflow-session-save-pressure-regression.test.js
+// ============================================================================
+TEST_FACTORIES.set("backend/Dev/tests/workflow-session-save-pressure-regression.test.js", function(module, exports, require, __filename, __dirname) {
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+const CHANNELS = require('../../protocol/channels');
+const { registerUiIpc } = require('../../ipc/register-ui-ipc');
+const { WorkflowSessionStore } = require('../../preferences/workflow-session-store');
+const { protectPayload, protectPayloadAsync, unprotectPayload } = require('../../preferences/protected-payload');
+const {
+    decodeWorkflowSnapshot,
+    encodeWorkflowSnapshot,
+    encodeWorkflowSnapshotAsync,
+} = require('../../workflow/workflow-snapshot-codec');
+
+function snapshot(label = '') {
+    return {
+        format: 'darkstar-workflow-session-test',
+        editor: {
+            nodes: [{ id: 1, type: 'test', params: { label } }],
+            connections: [],
+        },
+    };
+}
+
+test('normal workflow autosaves use the asynchronous store while shutdown durability stays synchronous', async () => {
+    const handlers = new Map();
+    const listeners = new Map();
+    const calls = [];
+    const ipcMain = {
+        handle(channel, handler) { handlers.set(channel, handler); },
+        on(channel, handler) { listeners.set(channel, handler); },
+    };
+    const store = {
+        async saveAsync(value) {
+            calls.push(['async', value.editor.nodes[0].params.label]);
+            return { bytes: 123 };
+        },
+        save(value) {
+            calls.push(['sync', value.editor.nodes[0].params.label]);
+            return { bytes: 456 };
+        },
+        load() { return null; },
+    };
+
+    registerUiIpc({ ipcMain, dialog: {}, getWindow: () => null, runtime: null, workflowSessionStore: store });
+    const asyncResult = await handlers.get(CHANNELS.WORKFLOW_SESSION_SAVE)({}, { snapshot: snapshot('async') });
+    assert.deepEqual(asyncResult, { success: true, bytes: 123 });
+
+    const syncEvent = {};
+    listeners.get(CHANNELS.WORKFLOW_SESSION_SAVE_SYNC)(syncEvent, { snapshot: snapshot('sync') });
+    assert.deepEqual(syncEvent.returnValue, { success: true, bytes: 456 });
+    assert.deepEqual(calls, [['async', 'async'], ['sync', 'sync']]);
+});
+
+test('asynchronous workflow encoding remains compatible with the existing DSWF decoder', async () => {
+    const original = snapshot('round-trip');
+    const encoded = await encodeWorkflowSnapshotAsync(original);
+    const decoded = decodeWorkflowSnapshot(encoded);
+    assert.equal(decoded.editor.nodes[0].params.label, 'round-trip');
+});
+
+test('parameter-only workflow autosaves use the node-patch IPC instead of retransmitting the full snapshot', async () => {
+    const handlers = new Map();
+    const ipcMain = {
+        handle(channel, handler) { handlers.set(channel, handler); },
+        on() {},
+    };
+    const calls = [];
+    const store = {
+        load() { return null; },
+        async saveAsync() { throw new Error('full workflow save should not be used for a node patch'); },
+        async patchNodesAsync(nodes) {
+            calls.push(nodes.map((node) => node.params.label));
+            return { bytes: 77, needsSnapshot: false };
+        },
+    };
+    registerUiIpc({ ipcMain, dialog: {}, getWindow: () => null, runtime: null, workflowSessionStore: store });
+    const result = await handlers.get(CHANNELS.WORKFLOW_SESSION_PATCH)({}, { nodes: [snapshot('patched').editor.nodes[0]] });
+    assert.deepEqual(result, { success: true, bytes: 77, needsSnapshot: false });
+    assert.deepEqual(calls, [['patched']]);
+});
+
+test('workflow node patches are applied and encoded entirely inside the persistence worker mirror', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-workflow-node-patch-'));
+    const filePath = path.join(directory, 'workflow-session.dswf');
+    const store = new WorkflowSessionStore({ filePath });
+    try {
+        await store.saveAsync(snapshot('baseline'));
+        const result = await store.patchNodesAsync([{ id: 1, type: 'test', params: { label: 'patched' } }]);
+        assert.equal(result.needsSnapshot, undefined);
+        const restored = store.load();
+        assert.ok(restored && restored.snapshot);
+        assert.equal(restored.snapshot.editor.nodes[0].params.label, 'patched');
+    } finally {
+        store.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('renderer parameter changes schedule lightweight node persistence rather than a full workflow snapshot', () => {
+    const controlsSource = fs.readFileSync(path.join(__dirname, '..', '..', 'renderer', 'nodes', 'editor', 'controls.js'), 'utf8');
+    const workflowSource = fs.readFileSync(path.join(__dirname, '..', '..', 'renderer', 'workflow.js'), 'utf8');
+    const setter = controlsSource.slice(controlsSource.indexOf('function setNodeParamValue'), controlsSource.indexOf('function setNodeModelValue'));
+    assert.match(setter, /scheduleWorkflowNodeSessionSave\(nodeId\)/u);
+    assert.match(setter, /scheduleWorkflowNodeSessionSave\(nodeId\)[\s\S]*?else if \(typeof scheduleWorkflowSessionSave/u);
+    assert.match(workflowSource, /function scheduleWorkflowNodeSessionSave\(nodeId, delayMs, markChanged\)/u);
+    assert.match(workflowSource, /bridge\.patchSession\(\{ nodes: nodes \}\)/u);
+});
+
+test('normal workflow autosave delegates sanitizer and DSWF serialization away from the Electron main thread', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-workflow-worker-offload-'));
+    const filePath = path.join(directory, 'workflow-session.dswf');
+    const encodedByWorker = encodeWorkflowSnapshot(snapshot('worker-owned'));
+    let encoderCalls = 0;
+    const poison = snapshot('poison');
+    Object.defineProperty(poison.editor.nodes[0].params, 'providers', {
+        enumerable: true,
+        get() { throw new Error('main-thread sanitizer traversed workflow state'); },
+    });
+    const store = new WorkflowSessionStore({
+        filePath,
+        encoder: {
+            async encode(value) {
+                encoderCalls += 1;
+                assert.equal(value, poison);
+                return encodedByWorker;
+            },
+            close() {},
+        },
+    });
+    try {
+        await store.saveAsync(poison);
+        assert.equal(encoderCalls, 1);
+        const restored = store.load();
+        assert.ok(restored && restored.snapshot);
+        assert.equal(restored.snapshot.editor.nodes[0].params.label, 'worker-owned');
+    } finally {
+        store.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('asynchronous protected workflow payloads wrap only a small safeStorage key and remain backward-readable', async () => {
+    const calls = [];
+    const protector = {
+        isEncryptionAvailable() { return true; },
+        encryptString(value) {
+            calls.push(['encrypt', String(value).length]);
+            return Buffer.from(String(value), 'utf8');
+        },
+        decryptString(value) {
+            calls.push(['decrypt', Buffer.from(value).length]);
+            return Buffer.from(value).toString('utf8');
+        },
+    };
+    const source = Buffer.alloc(2 * 1024 * 1024, 0x5a);
+    const protectedPayload = await protectPayloadAsync(source, protector);
+    assert.ok(protectedPayload.length > source.length);
+    assert.ok(calls[0][1] < 128, `safeStorage should wrap only the data key, got ${calls[0][1]} chars`);
+    assert.deepEqual(unprotectPayload(protectedPayload, protector), source);
+    const legacy = protectPayload(Buffer.from('legacy-v1', 'utf8'), protector);
+    assert.equal(unprotectPayload(legacy, protector).toString('utf8'), 'legacy-v1');
+});
+
+test('an older asynchronous workflow save cannot overwrite a newer synchronous shutdown save', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-workflow-save-order-'));
+    const filePath = path.join(directory, 'workflow-session.dswf');
+    const store = new WorkflowSessionStore({ filePath });
+    try {
+        const older = store.saveAsync(snapshot('older-' + 'x'.repeat(512 * 1024)));
+        store.save(snapshot('newer-sync'));
+        await older;
+
+        const restored = store.load();
+        assert.ok(restored && restored.snapshot);
+        assert.equal(restored.snapshot.editor.nodes[0].params.label, 'newer-sync');
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('workflow autosave bursts coalesce to the latest pending snapshot', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-workflow-save-burst-'));
+    const filePath = path.join(directory, 'workflow-session.dswf');
+    const store = new WorkflowSessionStore({ filePath });
+    try {
+        const saves = [];
+        for (let index = 0; index < 24; index += 1) {
+            saves.push(store.saveAsync(snapshot(`burst-${index}-` + 'z'.repeat(256 * 1024))));
+        }
+        await Promise.all(saves);
+        assert.equal(store.asyncSaveInFlight, false);
+        assert.equal(store.pendingAsyncSave, null);
+
+        const restored = store.load();
+        assert.ok(restored && restored.snapshot);
+        assert.match(restored.snapshot.editor.nodes[0].params.label, /^burst-23-/u);
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('workflow async atomic commit guard prevents a stale temp file from replacing the destination', async () => {
+    const { writeFileAtomic } = require('../../persistence/atomic-file');
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-workflow-guard-'));
+    const filePath = path.join(directory, 'guard.bin');
+    fs.writeFileSync(filePath, 'newer', 'utf8');
+    try {
+        let guardCalls = 0;
+        await writeFileAtomic(filePath, Buffer.from('stale', 'utf8'), {
+            commitGuard() { guardCalls += 1; return false; },
+        });
+        assert.equal(guardCalls, 1);
+        assert.equal(fs.readFileSync(filePath, 'utf8'), 'newer');
+        assert.deepEqual(fs.readdirSync(directory), ['guard.bin']);
     } finally {
         fs.rmSync(directory, { recursive: true, force: true });
     }
@@ -3975,12 +4790,14 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
+const CHAT_SESSION_SNAPSHOT_SOURCE = fs.readFileSync(path.join(__dirname, '..', '..', 'renderer', 'chat-session-snapshot.js'), 'utf8');
 const CHAT_SESSION_SOURCE = fs.readFileSync(path.join(__dirname, '..', '..', 'renderer', 'chat-session.js'), 'utf8');
 
-function createHarness() {
+function createHarness(options = {}) {
     let activeSaves = 0;
     let maxActiveSaves = 0;
     let saveCalls = 0;
+    let clearCalls = 0;
     const savedContents = [];
 
     const bridge = {
@@ -3995,7 +4812,7 @@ function createHarness() {
             return { success: true, bytes: 1 };
         },
         saveSync() { return { success: true, bytes: 1 }; },
-        async clear() { return { success: true, removed: false }; },
+        async clear() { clearCalls += 1; return { success: true, removed: false }; },
     };
 
     const elements = {
@@ -4006,7 +4823,7 @@ function createHarness() {
         console,
         structuredClone,
         localStorage: {
-            getItem(key) { return key === 'darkstar.chat.autosave.enabled' ? 'true' : null; },
+            getItem(key) { return key === 'darkstar.chat.autosave.enabled' ? (options.autosaveValue === undefined ? 'true' : options.autosaveValue) : null; },
             setItem() {},
             removeItem() {},
         },
@@ -4043,10 +4860,11 @@ function createHarness() {
         pendingImage: null,
     };
     context.globalThis = context;
+    vm.runInNewContext(CHAT_SESSION_SNAPSHOT_SOURCE, context, { filename: 'backend/renderer/chat-session-snapshot.js' });
     vm.runInNewContext(CHAT_SESSION_SOURCE, context, { filename: 'backend/renderer/chat-session.js' });
     return {
         context,
-        metrics() { return { activeSaves, maxActiveSaves, saveCalls, savedContents: savedContents.slice() }; },
+        metrics() { return { activeSaves, maxActiveSaves, saveCalls, clearCalls, savedContents: savedContents.slice() }; },
     };
 }
 
@@ -4068,6 +4886,18 @@ test('chat autosave remains single-flight when many save requests arrive during 
     assert.equal(metrics.maxActiveSaves, 1, 'full-session IPC saves must never overlap');
     assert.ok(metrics.saveCalls <= 2, `expected the burst to coalesce into at most two physical saves, got ${metrics.saveCalls}`);
     assert.equal(metrics.savedContents.at(-1), 'revision-48');
+});
+
+test('disabled or missing autosave preference still restores saved chats and never clears persistence', async () => {
+    const disabled = createHarness({ autosaveValue: 'false' });
+    disabled.context.darkstar.chatSession.load = async () => ({ success: true, found: false });
+    await disabled.context.restoreChatSession();
+    assert.equal(disabled.metrics().clearCalls, 0);
+
+    const missing = createHarness({ autosaveValue: null });
+    await missing.context.restoreChatSession();
+    assert.equal(missing.context.isChatAutosaveEnabled(), true, 'a relocated file:// renderer must default safely to autosave enabled');
+    assert.equal(missing.metrics().clearCalls, 0);
 });
 });
 
@@ -4101,7 +4931,7 @@ test('chat Schema sidebar remains independent while Nodes reserves enough width 
     assert.match(rule('.workspace-sidebar'), /width:\s*var\(--workspace-sidebar-width\)\s*;/u);
     assert.match(rule('.main-content'), /margin-left:\s*var\(--workspace-sidebar-width\)\s*;/u);
     assert.match(rule('.tab-bar'), /left:\s*var\(--workspace-sidebar-width\)\s*;/u);
-    assert.match(rule('.node-workflow-sidebar'), /width:\s*76px\s*;/u, 'Nodes sidebar must reserve enough width for the full Authorization label');
+    assert.match(rule('.node-workflow-sidebar'), /width:\s*76px\s*;/u, 'Settings sidebar must reserve enough width for the full Authorization label');
     assert.match(rule('.node-editor-sidebar-button'), /width:\s*64px\s*;/u);
 
     assert.match(workspaceSource, /tabBar\.style\.left = collapsed \? '28px' : currentWorkspaceSidebarWidth\(\) \+ 'px'/u);
@@ -4113,7 +4943,7 @@ test('chat Schema sidebar remains independent while Nodes reserves enough width 
 test('Nodes workflow controls start near the top of the usable node surface', () => {
     const sidebar = rule('.node-workflow-sidebar');
     assert.match(sidebar, /padding:\s*8px\s+5px\s*;/u,
-        'Nodes sidebar must not reserve the obsolete 46px top gutter above Save');
+        'Settings sidebar must not reserve the obsolete 46px top gutter above Save');
     assert.doesNotMatch(sidebar, /padding[^;]*46px/u);
 });
 
@@ -4291,17 +5121,27 @@ test('Nodes Traces toggle expands and collapses every chat disclosure family thr
     assert.equal(tool.preview.scrollTop, 90);
 });
 
-test('new reasoning, image, worked, compacting, and tool-call patches inherit the current bulk trace-toggle default', () => {
+test('new chat image patches start collapsed like other traces and render without visible filename chrome', () => {
     const assignments = chatSource.match(/block\.dataset\.userExpanded = chatTraceExpansionEnabled \? 'true' : 'false';/gu) || [];
-    assert.equal(assignments.length, 5, 'all five timeline disclosure constructors must inherit the global trace-toggle state');
+    assert.equal(assignments.length, 5, 'reasoning, worked, compacting, tool-call, and image-patch constructors must inherit the global trace-toggle state');
     assert.match(chatSource, /function createReasoningBlock\(\)[\s\S]*?chatTraceExpansionEnabled \? 'true' : 'false'/u);
-    assert.match(chatSource, /function createImageBlock\(\)[\s\S]*?chatTraceExpansionEnabled \? 'true' : 'false'/u);
+    const imageConstructor = chatSource.match(/function createImageBlock\(\) \{[\s\S]*?\n\}/u);
+    const imageRenderer = chatSource.match(/function renderImageSegment\(block, segment\) \{[\s\S]*?\n\}/u);
+    assert.ok(imageConstructor && imageRenderer, 'context-image constructor and renderer must exist');
+    assert.match(imageConstructor[0], /block\.dataset\.userExpanded = chatTraceExpansionEnabled \? 'true' : 'false'/u,
+        'context-image trace blocks must inherit the same collapsed-by-default trace state as the other patches');
+    assert.doesNotMatch(imageRenderer[0], /context-image-meta|metaText|segment\.imageName \|\| 'Tool image'/u,
+        'tool-produced image patches must not render source filenames as visible metadata');
+    assert.match(imageRenderer[0], /image\.alt = 'Tool image'/u,
+        'image accessibility fallback text must stay descriptive without exposing the source filename');
     assert.match(chatSource, /function createWorkedBlock\(\)[\s\S]*?chatTraceExpansionEnabled \? 'true' : 'false'/u);
     assert.match(chatSource, /function createCompactingBlock\(\)[\s\S]*?chatTraceExpansionEnabled \? 'true' : 'false'/u);
     assert.match(chatSource, /function createToolCallBlock\(\)[\s\S]*?chatTraceExpansionEnabled \? 'true' : 'false'/u);
+    assert.match(chatSource, /if \(disclosureState\.has\(segment\.id\)\) \{[\s\S]*?disclosureState\.get\(segment\.id\) === true \? 'true' : 'false'/u,
+        'an explicit per-image disclosure choice must survive later timeline patches');
 });
 
-test('Nodes sidebar exposes an accessible pressed-state Traces button with a visible active style', () => {
+test('Settings sidebar exposes an accessible pressed-state Traces button with a visible active style', () => {
     assert.match(html, /id="nodeChatTraceButton"[^>]*aria-pressed="false"/u);
     assert.match(fs.readFileSync(path.join(root, 'backend', 'renderer', 'event-listeners.js'), 'utf8'), /bindClickById\('nodeChatTraceButton', toggleChatTraceExpansion\)/u);
     assert.match(html, /id="nodeChatTraceButton"[\s\S]*?<span class="node-editor-sidebar-label">Traces<\/span>/u);
@@ -4387,15 +5227,15 @@ function makeButton() {
     };
 }
 
-test('Nodes sidebar Traces button cannot be removed and its external handler expands then collapses every trace family', () => {
+test('Settings sidebar Traces button cannot be removed and its external handler expands then collapses every trace family', () => {
     const idMatches = html.match(/id="nodeChatTraceButton"/gu) || [];
-    assert.equal(idMatches.length, 1, 'the Nodes sidebar must contain exactly one Traces button');
+    assert.equal(idMatches.length, 1, 'the Settings sidebar must contain exactly one Traces button');
 
     const sidebarMatch = html.match(/<nav class="node-workflow-sidebar"[\s\S]*?<\/nav>/u);
     assert.ok(sidebarMatch, 'the Nodes workflow sidebar must still exist');
 
     const buttonMatch = sidebarMatch[0].match(/<button\b[^>]*id="nodeChatTraceButton"[^>]*>[\s\S]*?<\/button>/u);
-    assert.ok(buttonMatch, 'the Traces button must remain inside the Nodes sidebar');
+    assert.ok(buttonMatch, 'the Traces button must remain inside the Settings sidebar');
     assert.match(buttonMatch[0], /class="[^"]*node-editor-sidebar-button[^"]*"/u);
     assert.match(buttonMatch[0], /aria-pressed="false"/u);
     assert.match(buttonMatch[0], />Traces<\/span>/u);
@@ -4770,20 +5610,19 @@ const EXPECTED_STATIC_BUTTONS = [
     ['mobileClearChatButton', 'btn-clear', '', '', '', false, 'Clear conversation'],
     ['nodeWorkflowSaveButton', 'node-editor-sidebar-button', '', 'Save workflow (Ctrl+S)', 'Save workflow', false, 'Save'],
     ['nodeWorkflowLoadButton', 'node-editor-sidebar-button', '', 'Load workflow', 'Load workflow', false, 'Load'],
-    ['nodeAutoLayoutButton', 'node-editor-sidebar-button', '', 'Tidy node layout', 'Tidy node layout', false, 'Tidy'],
     ['nodeClearContextButton', 'node-editor-sidebar-button', '', 'Clear active chat context', 'Clear active chat context', false, 'Clear'],
     ['nodeChatTraceButton', 'node-editor-sidebar-button', '', 'Expand all chat traces', 'Expand all chat traces', false, 'Traces'],
     ['nodePermissionPolicyButton', 'node-editor-sidebar-button', '', 'Model action permissions', 'Model action permissions', false, 'Auth Controls'],
     ['nodeFilesystemAccessButton', 'node-editor-sidebar-button', '', 'Filesystem Access · Level 2 · User Profile', 'Filesystem Access · Level 2 · User Profile', false, 'Filesystem Access'],
+    ['nodeInternetAccessButton', 'node-editor-sidebar-button is-active', '', 'Disable Internet Access', 'Disable Internet Access', false, 'Internet Access'],
     ['nodeChatAutosaveButton', 'node-editor-sidebar-button', '', 'Autosave Chats: On · Click to stop saving open chat tabs', 'Autosave Chats: On', false, 'Autosave Chats'],
     ['nodeMuteButton', 'node-editor-sidebar-button', '', 'Mute interface sounds', 'Mute interface sounds', false, 'Mute'],
-    ['nodeThemeButton', 'node-editor-sidebar-button', '', 'Current: Deep Blue · Next: Light', 'Current theme: Deep Blue. Switch to Light', false, 'Deep Blue'],
+    ['nodeThemeButton', 'node-editor-sidebar-button', '', 'Current: Space · Next: Light', 'Current theme: Space. Switch to Light', false, 'Space'],
     ['permissionPolicyClose', 'permission-policy-close', '', '', 'Close permission settings', false, '×'],
     ['filesystemAccessClose', 'permission-policy-close', '', '', 'Close Filesystem Access settings', false, '×'],
-    ['nodeResetGraphButton', 'toolbar-btn', '', '', '', false, 'Reset Graph'],
-    ['tabNav', 'tab-nav', '', '', 'Open node editor', false, ''],
+    ['workflowAddSectionButton', 'workflow-add-section-button', '', '', '', false, '+ Add custom section Add settings exposed by a detected custom node'],
+    ['tabNav', 'tab-nav', '', '', 'Open settings', false, ''],
     ['newTabButton', 'tab-new', '', '', 'New chat tab', false, ''],
-    ['offlineBrowserToggle', 'tab-bar-browser-toggle offline-browser-toggle', '', 'Toggle Browser (Ctrl+Shift+B)', 'Toggle Browser', false, 'Browser'],
     ['workspaceToggle', 'workspace-toggle', '', '', '', false, ''],
     ['workspaceOpenFolder', 'workspace-open-folder', '', 'Choose Directory', 'Choose Directory', false, ''],
     ['uipAddButton', 'schema-project-add uip-add-button', '', 'Connect application window', 'Connect application window', false, ''],
@@ -4794,8 +5633,14 @@ const EXPECTED_STATIC_BUTTONS = [
     ['offlineBrowserOpenButton', 'offline-browser-open-button', '', 'Open address', '', false, 'Go'],
     ['offlineBrowserChooseFileButton', 'offline-browser-icon-button', '', 'Choose local HTML', 'Choose local HTML', false, '⌂'],
     ['offlineBrowserReset', 'offline-browser-icon-button', '', 'Restart online browser session', 'Restart online browser session', true, '◇'],
-    ['offlineBrowserCloseButton', 'offline-browser-icon-button close', '', 'Close browser', 'Close browser', false, '×'],
     ['offlineBrowserFocusAddressButton', '', '', '', '', false, 'Enter address'],
+    ['imageLightboxViewMode', 'image-editor-mode', '', '', '', false, 'View'],
+    ['imageLightboxSelectMode', 'image-editor-mode', '', '', '', false, 'Select'],
+    ['imageLightboxBrushMode', 'image-editor-mode', '', '', '', false, 'Brush'],
+    ['imageLightboxUndo', 'image-editor-action', '', '', '', true, 'Undo'],
+    ['imageLightboxReset', 'image-editor-action', '', '', '', true, 'Clear'],
+    ['imageLightboxUseEdit', 'image-editor-primary', '', '', '', true, 'Use for inpainting'],
+    ['imageLightboxClose', 'image-lightbox-close', '', 'Close image editor', 'Close image editor', false, '×'],
     ['queueToggle', 'queue-toggle', '', '', '', false, ''],
     ['removeImageButton', 'btn-remove-image', '', '', '', false, ''],
     ['projectDirectoryChooseButton', '', '', '', '', false, 'Choose Directory'],
@@ -4804,7 +5649,7 @@ const EXPECTED_STATIC_BUTTONS = [
     ['imageUploadButton', 'btn-upload', '', 'Upload image', '', false, ''],
     ['scheduleBtn', 'btn-schedule', '', 'Insert this user message into the current generation', 'Insert this user message into the current generation', false, ''],
     ['sendBtn', 'btn-send', '', 'Send message', 'Send message', false, ''],
-    ['statusSettings', 'status-item settings-btn', '', '', 'Open node editor', false, ''],
+    ['statusSettings', 'status-item settings-btn', '', '', 'Open settings', false, ''],
     ['uipWindowPickerClose', '', '', '', 'Close window picker', false, '×'],
     ['projectDeleteCancelButton', 'project-delete-modal-button project-delete-modal-cancel', '', '', '', false, 'Cancel'],
     ['projectDeleteConfirmButton', 'project-delete-modal-button project-delete-modal-confirm', '', '', '', false, 'Delete Project'],
@@ -4828,6 +5673,19 @@ test('every static button is explicitly locked to its state, label, and accessib
         'Static button surface changed. Add/update an explicit regression contract for every changed control.');
 });
 
+
+test('Browser Workspace contains only browser controls and the image lightbox is a separate application overlay', () => {
+    const html = read('backend/shell/index.html');
+    const styles = read('backend/shell/styles.css');
+    const browserWorkspace = read('backend/renderer/browser-workspace.js');
+    assert.doesNotMatch(html, /workshopModeTabs|workshopBrowserModeTab|workshopImageModeTab|workshopImageEditor|Image Editor/u);
+    assert.doesNotMatch(styles, /workshop-mode-tab|workshop-image-editor|workshop-image-rail/u);
+    assert.doesNotMatch(browserWorkspace, /image|editor|zoom|drop/i,
+        'browser workspace routing should contain no image-editor responsibilities');
+    assert.match(html, /<\/aside>\s*<div class="image-lightbox" id="imageLightbox"/u,
+        'image enlargement must be an application overlay, not content embedded inside Browser Workspace');
+});
+
 test('renderer HTML contains no inline JavaScript and uses a strict script CSP', () => {
     const html = read('backend/shell/index.html');
     assert.doesNotMatch(html, /\son[a-z]+\s*=/iu);
@@ -4842,11 +5700,11 @@ test('static controls are externally wired instead of embedding behavior in mark
     const listeners = read('backend/renderer/event-listeners.js');
     for (const id of [
         'btnSettings', 'mobileClearChatButton', 'nodeWorkflowSaveButton', 'nodeWorkflowLoadButton',
-        'nodeAutoLayoutButton', 'nodeClearContextButton', 'nodeChatTraceButton', 'nodeChatAutosaveButton',
-        'nodeMuteButton', 'nodeThemeButton', 'nodeResetGraphButton', 'tabNav', 'newTabButton',
-        'offlineBrowserToggle', 'workspaceToggle', 'projectAddButton', 'offlineBrowserBack',
+        'nodeClearContextButton', 'nodeChatTraceButton', 'nodeChatAutosaveButton',
+        'nodeMuteButton', 'nodeThemeButton', 'workflowAddSectionButton', 'tabNav', 'newTabButton',
+        'workspaceToggle', 'projectAddButton', 'offlineBrowserBack',
         'offlineBrowserForward', 'offlineBrowserReload', 'offlineBrowserOpenButton',
-        'offlineBrowserChooseFileButton', 'offlineBrowserReset', 'offlineBrowserCloseButton',
+        'offlineBrowserChooseFileButton', 'offlineBrowserReset',
         'offlineBrowserFocusAddressButton', 'queueToggle', 'removeImageButton', 'projectDirectoryChooseButton',
         'imageUploadButton', 'scheduleBtn', 'sendBtn', 'statusSettings',
         'projectDeleteCancelButton', 'projectDeleteConfirmButton', 'workspaceDeleteCancelButton',
@@ -4913,11 +5771,11 @@ test('every dynamically generated button family uses declarative action metadata
 
 test('every current node-editor action button is named in the regression surface', () => {
     const contracts = [
-        ['backend/renderer/nodes/builtin/skills.js', 'remove-skill-file:'],
-        ['backend/renderer/nodes/builtin/skills.js', "controls.button('Add SKILL.md Files…', node.id, 'add-skill-file')"],
+        ['backend/renderer/nodes/builtin/loader.js', 'remove-skill-file:'],
+        ['backend/renderer/nodes/builtin/loader.js', "controls.button('Add SKILL.md Files…', node.id, 'add-skill-file')"],
         ['backend/renderer/nodes/builtin/load-tool.js', "controls.button('Browse…', node.id, 'choose-python-tool')"],
-        ['backend/renderer/nodes/builtin/tools.js', 'remove-tool-file:'],
-        ['backend/renderer/nodes/builtin/tools.js', "controls.button('Add Tool Files…', node.id, 'add-tool-file')"],
+        ['backend/renderer/nodes/builtin/loader.js', 'remove-tool-file:'],
+        ['backend/renderer/nodes/builtin/loader.js', "controls.button('Add Tool Files…', node.id, 'add-tool-file')"],
         ['backend/renderer/nodes/builtin/load-model.js', "controls.button('Unload model', node.id, 'unload-model'"],
         ['backend/renderer/nodes/builtin/load-model.js', "'browse-local-model'"],
         ['backend/renderer/nodes/builtin/load-model.js', "'browse-local-projector'"],
@@ -5148,7 +6006,6 @@ test('composer uses Chromium native caret blinking instead of transparent CSS an
 
 test('every shipped theme defines an explicit high-contrast composer caret token', () => {
     const expected = new Map([
-        ['deep-blue', '#ffffff'],
         ['light', '#111827'],
         ['quantum', '#ffffff'],
         ['terminal', '#d8ffe2'],
@@ -5571,7 +6428,6 @@ test('context-contract safety margin stops above 99% and locks only the affected
     assert.match(css, /\.composer-context-contract-notice[\s\S]*backdrop-filter: blur\(22px\)[\s\S]*color: var\(--context-contract-notice-text\)/u, 'the blocked composer notice should create a strong blur layer and derive its colors from theme variables');
     assert.doesNotMatch(css, /\.composer-context-contract-notice::before/u, 'the blocked composer should not render an inner inset panel that creates a double outline');
     assert.match(css, /html\[data-theme='light'\] \{[\s\S]*--context-contract-notice-text: rgba\(24, 55, 105, 0\.98\)/u, 'light mode needs a high-contrast blue-forward context-contract treatment');
-    assert.match(css, /html\[data-theme='deep-blue'\] \{[\s\S]*--context-contract-notice-bg: rgba\(8, 24, 45, 0\.90\)[\s\S]*--context-contract-notice-text: rgba\(218, 244, 255, 0\.98\)/u, 'deep-blue needs a dedicated legible context-contract foreground/background pair');
     assert.match(css, /html\[data-theme='terminal'\] \{[\s\S]*--context-contract-notice-bg: rgba\(2, 16, 7, 0\.72\)[\s\S]*--context-contract-notice-text: rgba\(188, 255, 205, 0\.95\)/u, 'terminal mode needs theme-honest foreground and background colors');
     assert.match(css, /html\[data-theme='arctic'\] \{[\s\S]*--context-contract-notice-text: rgba\(221, 230, 255, 0\.96\)/u, 'arctic mode needs its own cool-toned context-contract colors');
     assert.match(css, /html\[data-theme='space'\] \{[\s\S]*--context-contract-notice-text: rgba\(228, 233, 239, 0\.94\)/u, 'space mode needs its own neutral context-contract colors');
@@ -5663,6 +6519,7 @@ function loadDefinition(relative, portTypes) {
     let definition = null;
     const controls = new Proxy({}, { get(_target, property) {
         if (property === 'status') return () => '[status]';
+        if (property === 'group') return (_title, _description, content) => String(content || '');
         return (label, value, _id, param) => `[${String(property)}:${label}:${value}:${param}]`;
     } });
     const nodes = {
@@ -5694,6 +6551,11 @@ test('Top/Middle context shifting and image pruning modules are physically absen
 
 test('Context node has no overflow dropdown or hidden overflow policy and preserves its remaining behavior', () => {
     const definition = loadDefinition('backend/renderer/nodes/builtin/context.js', { MODEL: 'model', TEXT: 'text', IMAGE: 'image' });
+    assert.equal(definition.inputs.length, 0);
+    assert.equal(definition.outputs.length, 1);
+    assert.equal(definition.outputs[0].name, 'context');
+    assert.equal(definition.outputs[0].label, 'Context');
+    assert.equal(definition.outputs.some((output) => output.name === 'image'), false);
     const node = definition.factory('context-1', 0, 0);
     assert.deepEqual(Object.keys(node.params).sort(), ['includeHistory', 'systemPrompt']);
     const html = definition.buildContentHTML(node);
@@ -5701,42 +6563,54 @@ test('Context node has no overflow dropdown or hidden overflow policy and preser
     assert.match(html, /Full chat context/u);
     assert.doesNotMatch(html, /Context overflow|truncate-top|truncate-middle/u);
 
-    const legacy = { id: 'legacy', params: { systemPrompt: 'system', includeHistory: false, contextOverflowPolicy: 'truncate-middle' } };
+    const legacy = { id: 'legacy', params: { systemPrompt: 'system', includeHistory: false, contextOverflowPolicy: 'truncate-middle' }, inputs: [{ name: 'model', label: 'model' }] };
     definition.normalizeNode(legacy);
     assert.deepEqual(JSON.parse(JSON.stringify(legacy.params)), { systemPrompt: 'system', includeHistory: false });
+    assert.equal(legacy.inputs.length, 0);
+    assert.equal(legacy.outputs.length, 1);
+    assert.equal(legacy.outputs[0].name, 'context');
+    assert.equal(legacy.outputs[0].label, 'Context');
 });
 
 test('Control node has no Image Pruning toggle or persisted pruning parameter', async () => {
     const definition = loadDefinition('backend/renderer/nodes/builtin/control.js', { CONTROL: 'control' });
     const node = definition.factory('control-1', 0, 0);
-    assert.deepEqual(Object.keys(node.params).sort(), ['autoCompact', 'modelIdleUnloadEnabled', 'nameConversations']);
+    assert.deepEqual(Object.keys(node.params).sort(), ['autoCompact', 'dynamicVramEnabled', 'modelIdleUnloadEnabled', 'nameConversations', 'negativePromptEnabled']);
     const html = definition.buildContentHTML(node);
     assert.match(html, /Name Conversations/u);
     assert.match(html, /Auto-compact/u);
+    assert.match(html, /Negative Prompt/u);
+    assert.doesNotMatch(html, /Dynamic VRAM affects only image generation|Model restoration is guaranteed|Pending Authorization decisions pause automatic unloading/u);
     assert.doesNotMatch(html, /Image Pruning|imagePruning/u);
 
     const legacy = { id: 'legacy', params: { nameConversations: false, autoCompact: true, imagePruning: true } };
     definition.normalizeNode(legacy);
-    assert.deepEqual(JSON.parse(JSON.stringify(legacy.params)), { nameConversations: false, autoCompact: true, modelIdleUnloadEnabled: false });
+    assert.deepEqual(JSON.parse(JSON.stringify(legacy.params)), { nameConversations: false, autoCompact: true, modelIdleUnloadEnabled: false, dynamicVramEnabled: false, negativePromptEnabled: false });
     const output = await definition.execute({}, legacy);
-    assert.deepEqual(JSON.parse(JSON.stringify(output.while)), { nameConversations: false, autoCompact: true, modelIdleUnloadSeconds: 0 });
+    assert.deepEqual(JSON.parse(JSON.stringify(output.while)), { nameConversations: false, autoCompact: true, modelIdleUnloadSeconds: 0, dynamicVramEnabled: false, negativePromptEnabled: false });
 });
 
 
-test('bundled workflow contains only the surviving Context and Control settings', () => {
+test('bundled workflow stores local Context and strategic Control settings on Orchestrator', () => {
     const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(root, 'workflows', 'darkstar-workflow.dswf')));
     const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : snapshot.editor.nodes;
-    const contextNode = nodes.find((node) => node.type === 'context');
-    const controlNode = nodes.find((node) => node.type === 'control');
-    assert.deepEqual(contextNode.params, { systemPrompt: '', includeHistory: true });
-    assert.deepEqual(controlNode.params, { nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: false });
+    assert.equal(nodes.some((node) => node.type === 'context'), false);
+    assert.equal(nodes.some((node) => node.type === 'control'), false);
+    const orchestrator = nodes.find((node) => node.type === 'sampler');
+    const localSampler = nodes.find((node) => node.type === 'localSampler');
+    assert.deepEqual(orchestrator.params, {
+        systemPrompt: '', includeHistory: true, nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: false, dynamicVramEnabled: false, negativePromptEnabled: false, imageCountOverride: 0,
+    });
+    assert.equal(localSampler.params.stop, '');
+    assert.equal(localSampler.params.cachePrompt, true);
+    assert.equal(localSampler.params.ignoreEos, false);
 });
 
-test('canonical default workflow enables Flash Attention on Load Server', () => {
+test('canonical default workflow enables Flash Attention on LlamaCPP Server', () => {
     const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(root, 'workflows', 'darkstar-workflow.dswf')));
     const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : snapshot.editor.nodes;
     const loadServer = nodes.find((node) => node && node.type === 'loadServer');
-    assert.ok(loadServer, 'canonical workflow must contain a Load Server node');
+    assert.ok(loadServer, 'canonical workflow must contain a LlamaCPP Server node');
     assert.equal(loadServer.params.flashAttention, true, 'Flash Attention must default to enabled');
 });
 
@@ -5744,7 +6618,8 @@ test('canonical default workflow uses portable model and MMProj placeholders wit
     const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(root, 'workflows', 'darkstar-workflow.dswf')));
     const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : snapshot.editor.nodes;
     const loader = nodes.find((node) => node && node.type === 'modelLoader');
-    assert.ok(loader, 'canonical workflow must contain a Load Model node');
+    assert.ok(loader, 'canonical workflow must contain an Invoke Language Model node');
+    assert.equal(loader.title, 'Invoke Language Model (GGUF)');
     assert.equal(loader.selectedModel, '', 'the model placeholder must not become an active model selection');
     assert.equal(loader.params.projectorPath, '', 'the MMProj placeholder must not become an active projector selection');
     assert.equal(loader.params.modelPathPlaceholder, 'C:/Your/Model/Path');
@@ -5752,9 +6627,17 @@ test('canonical default workflow uses portable model and MMProj placeholders wit
     assert.deepEqual(loader.params.projectorCandidates, []);
 });
 
-test('Load Model renders default path placeholders as inert empty selections', () => {
+test('Invoke Language Model keeps default path examples as display-only empty-state placeholders', () => {
     const definition = loadDefinition('backend/renderer/nodes/builtin/load-model.js', { SERVER: 'server', MODEL: 'model' });
+    assert.equal(definition.title, 'Invoke Language Model (GGUF)');
+    assert.equal(definition.outputs[0].label, 'Language Model');
+    const legacy = { title: 'Load Model (GGUF)', selectedModel: '', params: {}, outputs: [{ name: 'model', label: 'model' }] };
+    definition.normalizeNode(legacy, { title: 'Load Model (GGUF)' });
+    assert.equal(legacy.title, 'Invoke Language Model (GGUF)');
+    assert.equal(legacy.outputs[0].label, 'Language Model');
+    assert.equal(legacy.uiWidth, 520, 'legacy workflow nodes must normalize to the bounded production width');
     const node = definition.factory('loader-1', 0, 0);
+    assert.equal(node.uiWidth, 520, 'new Invoke Language Model nodes must reserve enough width for both socket rails and controls');
     assert.equal(node.selectedModel, '');
     assert.equal(node.params.projectorPath, '');
     assert.equal(node.params.modelPathPlaceholder, 'C:/Your/Model/Path');
@@ -5827,7 +6710,7 @@ const {
 const { memorySafeServerConfig, refreshEffectiveContext } = require('../../runtime/model-lifecycle');
 const { startServer } = require('../../runtime/server-process');
 const { publicModelRecord } = require('../../ipc/register-llama-ipc');
-const { readGgufModelMetadata } = require('../../runtime/gguf-metadata');
+const { readGgufMemoryMetadata, readGgufModelMetadata } = require('../../runtime/gguf-metadata');
 
 const dependencies = {
     defaultHost: '127.0.0.1',
@@ -5904,7 +6787,8 @@ test('manual context bypasses router mode so the model-owning process receives t
         process: null, processMode: null, server: null, loadedModelId: null,
         async normalizeServerConfig() { return structuredClone(normalized); },
         async detectCapabilities() { return { router: true, mtp: null }; },
-        resolveModelSelection() { return { local: { id: 'model.gguf', mtp: null } }; },
+        resolveModelSelection() { throw new Error('first-send lifecycle must not resolve GGUF metadata synchronously on Electron Main'); },
+        async resolveModelSelectionAsync() { return { local: { id: 'model.gguf', mtp: null } }; },
         buildRouterArgs() { throw new Error('manual context must not enter router mode'); },
         async spawnAndWait(...args) { launches.push(args); },
         getStatus() { return { running: false, port: this.server?.port || null, contextSizePerSlot: this.server?.config?.contextSize || null }; },
@@ -6075,13 +6959,19 @@ test('GGUF discovery reads architecture-specific context_length and block_count'
     const u32 = (value) => { const b = Buffer.alloc(4); b.writeUInt32LE(value); return b; };
     const u64 = (value) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(value)); return b; };
     const str = (value) => { const b = Buffer.from(value, 'utf8'); return Buffer.concat([u64(b.length), b]); };
-    parts.push(Buffer.from('GGUF'), u32(3), u64(0), u64(3));
+    parts.push(Buffer.from('GGUF'), u32(3), u64(0), u64(8));
     parts.push(str('general.architecture'), u32(8), str('test'));
     parts.push(str('test.block_count'), u32(4), u32(48));
     parts.push(str('test.context_length'), u32(4), u32(262144));
+    parts.push(str('test.embedding_length'), u32(4), u32(4096));
+    parts.push(str('test.attention.head_count'), u32(4), u32(32));
+    parts.push(str('test.attention.head_count_kv'), u32(4), u32(8));
+    parts.push(str('test.attention.key_length'), u32(4), u32(128));
+    parts.push(str('test.attention.value_length'), u32(4), u32(128));
     fs.writeFileSync(file, Buffer.concat(parts));
     try {
         assert.deepEqual(readGgufModelMetadata(file), { layerCount: 48, contextLength: 262144, reasoning: null, mtp: null });
+        assert.deepEqual(readGgufMemoryMetadata(file), { architecture: 'test', layerCount: 48, embeddingLength: 4096, headCount: 32, headCountKv: 8, keyLength: 128, valueLength: 128 });
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -6132,12 +7022,15 @@ test('local llama streaming transport preserves AbortController cancellation bef
     }
 });
 
-test('Load Server keeps model-aware context enforcement without exposing a competing context control', () => {
-    const source = fs.readFileSync(path.join(__dirname, '..', '..', 'renderer', 'nodes', 'builtin', 'load-server.js'), 'utf8');
-    assert.doesNotMatch(source, /contextSliderHTML\(node\)/);
-    assert.match(source, /context && context\.localModelContextSize/u);
-    assert.match(source, /KV cache location/);
-    assert.match(source, /modelContextLength/);
+test('LlamaCPP Server owns model-aware context sizing while L_Sampler owns Reasoning Effort and request sampling', () => {
+    const serverSource = fs.readFileSync(path.join(__dirname, '..', '..', 'renderer', 'nodes', 'builtin', 'load-server.js'), 'utf8');
+    const samplerSource = fs.readFileSync(path.join(__dirname, '..', '..', 'renderer', 'nodes', 'builtin', 'local-sampler.js'), 'utf8');
+    assert.match(serverSource, /contextSliderHTML\(node\)/u);
+    assert.match(serverSource, /data-param="contextPercent"/u);
+    assert.match(serverSource, /KV cache location/u);
+    assert.doesNotMatch(serverSource, /samplerParameters\.contextSize|controls\.select\('Reasoning Effort'|controls\.slider\('Temperature'/u);
+    assert.match(samplerSource, /controls\.select\('Reasoning Effort'/u);
+    assert.doesNotMatch(samplerSource, /contextSliderHTML\(node\)|contextPercent|contextSize/u);
 });
 
 
@@ -6306,10 +7199,10 @@ test('UI-wide readability pass raises representative chat, composer, workspace, 
     assert.match(cssRule(css, '.message-content'), /font-size:\s*16px/u);
     assert.match(cssRule(css, '.input-wrapper textarea'), /font-size:\s*16px/u);
     assert.match(cssRule(css, '.workspace-file-item'), /font-size:\s*14px/u);
-    assert.match(cssRule(css, '.node-param-label'), /font-size:\s*11px/u);
+    assert.match(cssRule(css, '.node-param-label'), /font-size:\s*13px/u);
     assert.match(cssRule(css, '.slash-command-description'), /font:\s*11\.5px\//u);
     assert.match(cssRule(css, '.status-item'), /height:\s*28px/u);
-    assert.match(cssRule(nodeCss, '.node-editor-view .node-port-input,\n.node-editor-view input.node-port-input,\n.node-editor-view textarea.node-port-input'), /font-size:\s*12px/u);
+    assert.match(cssRule(nodeCss, '.node-editor-view .node-port-input,\n.node-editor-view input.node-port-input,\n.node-editor-view textarea.node-port-input'), /font:\s*500 13px/u);
 });
 
 test('Quantum theme keeps agent patches and File Explorer legible without flattening the activity sheen to white', () => {
@@ -6383,83 +7276,336 @@ const read = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8');
 const rendererSource = read('backend/renderer/nodes/editor/renderer.js');
 const controlSource = read('backend/renderer/nodes/builtin/control.js');
 const loadServerSource = read('backend/renderer/nodes/builtin/load-server.js');
+const loadModelSource = read('backend/renderer/nodes/builtin/load-model.js');
+const nodeEditorCss = read('backend/renderer/node-editor.css');
 
-test('Control node opts into renderer-level stable width instead of viewport shrink-to-fit', () => {
+test('workflow sections ignore legacy node widths and fill the available document width', () => {
     assert.match(controlSource, /lockRenderedWidth:\s*true/u,
-        'Control must opt into stable rendered width');
-    assert.match(rendererSource,
-        /if \(created\) \{\s*captureDefinitionStableNodeWidth\(element, node\);\s*notifyNodeMounted\(element, node\);\s*\}/u,
-        'stable width must be captured after the node has been attached and rendered');
+        'serialized node definitions may retain legacy width metadata for compatibility');
+    assert.match(rendererSource, /function updateNodeElement\(element, node\)[\s\S]*?element\.style\.removeProperty\('width'\)/u,
+        'section projection must discard legacy inline node widths');
+    assert.match(rendererSource, /if \(created\) notifyNodeMounted\(element, node\);/u,
+        'new sections mount without recapturing legacy floating-node widths');
+    const styles = read('backend/shell/styles.css');
+    assert.match(styles, /\.node-editor-view \.workflow-section\s*\{[\s\S]*?width:\s*100% !important;[\s\S]*?max-width:\s*none/u,
+        'every workflow section must span the workflow document width');
 });
 
-test('stable-width capture preserves the Control node width when the viewport later contracts', () => {
-    let measuredWidth = 384.5;
-    const sandbox = {
-        Number,
-        Math,
-        parseFloat,
-        getNodeDef(type) {
-            return type === 'control' ? { lockRenderedWidth: true } : { lockRenderedWidth: false };
+test('LlamaCPP Server is reorganized into semantic Settings groups without changing its stable node contract', () => {
+    assert.match(loadServerSource, /var LOAD_SERVER_UI_WIDTH = 760;/u,
+        'legacy workflow snapshots may continue carrying the stable node width');
+    assert.match(loadServerSource, /controls\.group\('Runtime'[\s\S]*?controls\.group\('Memory'[\s\S]*?controls\.group\('Acceleration'[\s\S]*?controls\.group\('Performance'/u,
+        'the server presentation must expose deliberate runtime, memory, acceleration, and performance groups');
+    assert.match(nodeEditorCss, /\.workflow-section \.node-param\s*\{[\s\S]*?grid-template-columns:\s*minmax\(190px, 250px\) minmax\(0, 1fr\)/u,
+        'Settings rows must share one stable label/control alignment system');
+    assert.match(read('backend/shell/styles.css'), /\.settings-section-inner\s*\{[\s\S]*?grid-template-columns:\s*minmax\(190px, 224px\) minmax\(0, 1fr\)/u,
+        'each full-width execution section should use a bounded summary/preferences composition');
+});
+
+test('Invoke Language Model keeps its controls while socket rails are deliberately absent from section presentation', () => {
+    assert.match(loadModelSource, /var MODEL_LOADER_UI_WIDTH = 520;/u,
+        'legacy workflow model-loader width remains serialization-compatible');
+    assert.match(rendererSource, /function buildNodeDOM\(node\)[\s\S]*?workflow-section/u);
+    assert.doesNotMatch(rendererSource, /function buildNodeDOM\(node\)[\s\S]*?createSocketPort/u,
+        'section DOM must not render graph socket rails');
+    const styles = read('backend/shell/styles.css');
+    assert.match(styles, /\.workflow-section \.node-ports-left,[\s\S]*?\.workflow-section \.socket-label\s*\{\s*display:\s*none !important;/u,
+        'any compatibility socket markup must remain invisible in section mode');
+});
+
+});
+
+// ============================================================================
+// TEST MODULE: backend/Dev/tests/workflow-section-presentation-regression.test.js
+// ============================================================================
+TEST_FACTORIES.set("backend/Dev/tests/workflow-section-presentation-regression.test.js", function(module, exports, require, __filename, __dirname) {
+'use strict';
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+const vm = require('node:vm');
+const root = path.resolve(__dirname, '..', '..', '..');
+const read = (file) => fs.readFileSync(path.join(root, file), 'utf8');
+
+test('workflow graph is projected as a tabbed Settings property sheet without graph chrome', () => {
+    const html = read('backend/shell/index.html');
+    const styles = read('backend/shell/styles.css');
+    const renderer = read('backend/renderer/nodes/editor/renderer.js');
+    assert.match(html, /class="settings-page-header"[\s\S]*?<h1 class="settings-page-title">Settings<\/h1>[\s\S]*?id="settingsPropertyTabs"[^>]*role="tablist"[\s\S]*?id="nodesLayer"[\s\S]*?id="workflowAddSectionButton"/u);
+    assert.match(styles, /\.workflow-sections-scroll\s*\{[\s\S]*?padding:\s*0 0 88px/u);
+    assert.match(styles, /\.settings-property-sheet\s*\{[\s\S]*?max-width:\s*var\(--settings-shell-width\)[\s\S]*?padding:\s*0 var\(--settings-gutter\) 28px/u);
+    assert.match(styles, /\.settings-property-tabs-shell\s*\{[\s\S]*?position:\s*sticky;[\s\S]*?top:\s*0;[\s\S]*?z-index:\s*5;[\s\S]*?border:\s*1px solid var\(--settings-line\);[\s\S]*?border-radius:\s*14px 14px 0 0/u,
+        'the polished tab rail should remain reachable and visually frame the property sheet');
+    assert.match(styles, /\.settings-property-tabs\s*\{[\s\S]*?display:\s*flex;[\s\S]*?overflow-x:\s*auto;[\s\S]*?border-bottom:\s*1px solid/u,
+        'many workflow sections must remain navigable without wrapping or widening the window');
+    assert.match(styles, /\.settings-property-tab:hover:not\(\[aria-selected='true'\]\)[\s\S]*?background:\s*var\(--settings-tab-hover\)/u,
+        'idle tabs should have a restrained hover surface without disturbing the selected property page');
+    assert.match(styles, /\.settings-property-tab\[aria-selected='true'\]\s*\{[\s\S]*?border-bottom-color:\s*var\(--settings-sheet-surface\);[\s\S]*?background:\s*var\(--settings-sheet-surface\);[\s\S]*?box-shadow:/u,
+        'the selected tab must read as a raised, attached property-sheet tab');
+    assert.match(styles, /\.settings-property-tab\[aria-selected='true'\]::before\s*\{[\s\S]*?background:\s*var\(--settings-tab-accent\)/u,
+        'the active tab should use one theme-aware accent rule rather than decorative animation');
+    assert.doesNotMatch(styles, /@keyframes\s+settings|animation[^;]*settings-property|backdrop-filter[^;]*settings-property/u,
+        'Settings tab polish must remain static/compositor-safe and must not reintroduce expensive continuous effects');
+    assert.match(styles, /\.workflow-sections-layer\s*\{[\s\S]*?border:\s*1px solid var\(--settings-line\);[\s\S]*?border-top:\s*0;[\s\S]*?border-radius:\s*0 0 14px 14px/u);
+    assert.match(styles, /\.node-editor-view \.workflow-section\[hidden\]\s*\{\s*display:\s*none !important;/u,
+        'only the selected property panel may participate in layout');
+    assert.match(styles, /\.settings-section-inner\s*\{[\s\S]*?grid-template-columns:\s*minmax\(190px, 224px\) minmax\(0, 1fr\)[\s\S]*?padding:\s*36px 34px 40px/u,
+        'the active property page must preserve the established summary/control composition');
+    assert.match(styles, /\.workflow-add-section-button\s*\{[\s\S]*?width:\s*100%;[\s\S]*?background:\s*transparent/u);
+    assert.match(styles, /\.workflow-sections-canvas \.connections-svg\s*\{\s*display:\s*none/u);
+    assert.doesNotMatch(html, /nodeResetGraphButton|Restore Default/u, 'Settings must not expose the obsolete restore-default graph control');
+    assert.match(renderer, /document\.createElement\('section'\)[\s\S]*?settings-section-inner/u);
+    assert.doesNotMatch(renderer, /function buildNodeDOM\(node\)[\s\S]*?createSocketPort/u);
+});
+
+test('Settings property tabs are state-safe, accessible, keyboard navigable, and expose exactly one active panel', () => {
+    const renderer = read('backend/renderer/nodes/editor/renderer.js');
+    const start = renderer.indexOf('var activeWorkflowSectionTabId = null;');
+    const end = renderer.indexOf('function updateSocketConnectionClasses', start);
+    assert.ok(start >= 0 && end > start, 'property-sheet navigation must remain owned by the node renderer');
+    const source = renderer.slice(start, end);
+    assert.match(source, /function workflowPropertyTabLabel\(node\)[\s\S]*?title\.replace/u,
+        'custom tabs should stay compact while their full custom identity remains in the panel heading and tooltip');
+    assert.match(source, /setAttribute\('role', 'tab'\)[\s\S]*?setAttribute\('aria-controls'[\s\S]*?setAttribute\('aria-selected'/u);
+    assert.match(source, /panel\.setAttribute\('role', 'tabpanel'\)[\s\S]*?panel\.setAttribute\('aria-labelledby'[\s\S]*?panel\.hidden = key !== activeId/u);
+    assert.match(source, /event\.key === 'ArrowRight'[\s\S]*?event\.key === 'ArrowLeft'[\s\S]*?event\.key === 'Home'[\s\S]*?event\.key === 'End'/u,
+        'property tabs must implement the standard roving keyboard navigation contract');
+    assert.doesNotMatch(source, /localStorage|scheduleWorkflowSessionSave|nodeEditorState\.selectedNode\s*=/u,
+        'switching settings tabs is presentation-only and must not mutate workflow persistence or graph selection');
+
+    function classList() { const values = new Set(); return { toggle(name, on) { on ? values.add(name) : values.delete(name); }, values }; }
+    function button() {
+        return { dataset: {}, className: '', classList: classList(), attributes: {}, tabIndex: -1, offsetLeft: 0, offsetWidth: 80,
+            setAttribute(name, value) { this.attributes[name] = String(value); }, focus() { this.focused = true; }, remove() { this.removed = true; } };
+    }
+    function panel(id) {
+        return { dataset: { nodeId: String(id) }, attributes: {}, hidden: false, tabIndex: -1,
+            setAttribute(name, value) { this.attributes[name] = String(value); } };
+    }
+    const panels = new Map([[1, panel(1)], [2, panel(2)]]);
+    const listeners = {};
+    const tablist = {
+        children: [], scrollLeft: 0, clientWidth: 220,
+        appendChild(child) { this.children = this.children.filter((item) => item !== child); this.children.push(child); child.parentElement = this; return child; },
+        querySelector(selector) { const match = selector.match(/data-workflow-tab-node="([^"]+)"/u); return match ? this.children.find((item) => item.dataset.workflowTabNode === match[1] && !item.removed) || null : null; },
+        querySelectorAll() { return this.children.filter((item) => !item.removed); },
+        addEventListener(type, handler) { listeners[type] = handler; },
+    };
+    const shell = { getBoundingClientRect() { return { top: 120 }; } }; tablist.parentElement = shell;
+    const layer = { querySelector(selector) { const match = selector.match(/data-node-id="([^"]+)"/u); return match ? panels.get(Number(match[1])) || null : null; } };
+    const scroller = { scrollTop: 30, getBoundingClientRect() { return { top: 40 }; } };
+    const nodes = [{ id: 1, type: 'modelLoader' }, { id: 2, type: 'loadServer' }];
+    const document = {
+        createElement() { return button(); },
+        getElementById(id) {
+            if (id === 'settingsPropertyTabs') return tablist;
+            if (id === 'nodesLayer') return layer;
+            if (id === 'workflowSectionsScroll') return scroller;
+            return tablist.children.find((item) => item.id === id && !item.removed) || null;
         },
-        window: {
-            getComputedStyle() {
-                return {
-                    width: String(measuredWidth) + 'px',
-                    borderLeftWidth: '1px',
-                    borderRightWidth: '1px'
-                };
-            }
-        }
     };
-    vm.runInNewContext(rendererSource, vm.createContext(sandbox), { filename: 'backend/renderer/nodes/editor/renderer.js' });
-
-    const node = { type: 'control' };
-    const element = { style: {}, offsetWidth: measuredWidth + 2 };
-    const captured = sandbox.captureDefinitionStableNodeWidth(element, node);
-    assert.equal(captured, 384.5);
-    assert.equal(node.uiWidth, 384.5);
-    assert.equal(element.style.width, '384.5px');
-
-    // Simulate Chromium's auto-width box wanting to shrink because the window edge moved closer.
-    measuredWidth = 260;
-    element.style.width = '';
-    sandbox.applyStableNodeWidth(element, node);
-    assert.equal(element.style.width, '384.5px',
-        'the persisted UI width, not the new viewport-dependent shrink-to-fit width, must win');
+    const sandbox = { document, orderedWorkflowSectionNodes() { return nodes; }, isWorkflowCustomSection() { return false; }, closeNodeDropdowns() {}, Array, Math, Number, Object, String };
+    vm.runInNewContext(source, vm.createContext(sandbox), { filename: 'settings-property-tabs-test.js' });
+    sandbox.bindWorkflowPropertyTabs();
+    sandbox.syncWorkflowPropertyTabs(nodes);
+    assert.equal(tablist.children.length, 2);
+    assert.equal(tablist.children[0].attributes['aria-selected'], 'true');
+    assert.equal(panels.get(1).hidden, false);
+    assert.equal(panels.get(2).hidden, true);
+    assert.equal(sandbox.activateWorkflowSectionTab(2, { preserveScroll: true }), true);
+    assert.equal(tablist.children[1].attributes['aria-selected'], 'true');
+    assert.equal(tablist.children[0].tabIndex, -1);
+    assert.equal(tablist.children[1].tabIndex, 0);
+    assert.equal(panels.get(1).hidden, true);
+    assert.equal(panels.get(2).hidden, false);
+    assert.equal(scroller.scrollTop, 30, 'preserveScroll must avoid changing the property document position');
 });
 
-
-test('Load Server owns a compact stable width instead of inheriting descendant max-content width', () => {
-    assert.match(loadServerSource, /var LOAD_SERVER_UI_WIDTH = 420;/u,
-        'Load Server must define one explicit compact UI width');
-    assert.match(loadServerSource, /uiWidth:\s*LOAD_SERVER_UI_WIDTH/u,
-        'new Load Server nodes must start with the stable width');
-    assert.match(loadServerSource, /normalizeNode:\s*function\(node\)\s*\{\s*node\.uiWidth = LOAD_SERVER_UI_WIDTH;/u,
-        'restored workflows must be normalized away from legacy shrink-to-fit sizing');
-
-    const sandbox = { Number, Math, parseFloat };
-    vm.runInNewContext(rendererSource, vm.createContext(sandbox), { filename: 'backend/renderer/nodes/editor/renderer.js' });
-    const node = { type: 'loadServer', uiWidth: 420 };
-    const element = { style: {} };
-    assert.equal(sandbox.applyStableNodeWidth(element, node), true);
-    assert.equal(element.style.width, '420px',
-        'long GPU/MTP labels must wrap or ellipsize inside the node instead of widening its outer box');
+test('Settings uses bounded Chrome-style preference geometry instead of stretched node-era controls', () => {
+    const html = read('backend/shell/index.html');
+    const shellStyles = read('backend/shell/styles.css');
+    const controls = read('backend/renderer/node-editor.css');
+    assert.match(html, /aria-label="Settings controls"/u);
+    assert.match(html, /id="statusSettings"[^>]+aria-label="Open settings"/u);
+    assert.doesNotMatch(html, /aria-label="Open node editor"/u);
+    assert.match(shellStyles, /--settings-shell-width:\s*1120px/u);
+    assert.match(shellStyles, /--settings-control-surface:[^;]+;/u);
+    assert.match(controls, /\.node-editor-view \.settings-control-group-body\s*\{[\s\S]*?border-top:\s*1px solid/u,
+        'semantic groups should own their preference-row separators');
+    assert.match(controls, /\.node-editor-view \.workflow-section \.node-param\s*\{[\s\S]*?grid-template-columns:\s*minmax\(190px, 250px\) minmax\(0, 1fr\)/u);
+    assert.match(controls, /\.node-editor-view \.workflow-section \.node-param-dropdown > \.node-dropdown,[\s\S]*?width:\s*min\(100%, 420px\)/u,
+        'dropdown and text controls must not stretch across the document');
+    assert.match(controls, /\.node-editor-view \.workflow-section \.node-param-slider > \.node-slider,[\s\S]*?width:\s*min\(100%, 320px\)/u,
+        'sliders must use a compact readable measure');
+    assert.match(controls, /\.node-editor-view \.node-number-control > input\.node-port-input\s*\{\s*width:\s*132px/u,
+        'numeric fields should be compact instead of inheriting text-field width');
+    assert.match(controls, /\.node-editor-view \.node-toggle-state-off,[\s\S]*?\.node-toggle-state-on\s*\{\s*display:\s*none;/u,
+        'boolean rows should present one native-looking switch instead of redundant OFF/ON captions');
+    assert.match(controls, /\.node-editor-view \.node-asset-list\s*\{[\s\S]*?border-radius:\s*10px/u,
+        'Loader capabilities may use one contained list surface for dense file collections');
+    assert.match(controls, /\.node-editor-view \.node-gpu-list\s*\{[\s\S]*?border-radius:\s*10px/u,
+        'GPU inventory should use the same compact list treatment');
 });
 
-test('renderer stable-width opt-in does not freeze unrelated dynamic nodes', () => {
+test('numeric Settings controls use external Darkstar steppers instead of browser-native spin buttons', () => {
+    const controls = read('backend/renderer/node-editor.css');
+    const renderer = read('backend/renderer/nodes/control-renderers.js');
+    const editorControls = read('backend/renderer/nodes/editor/controls.js');
+    assert.match(renderer, /class="node-number-control"[\s\S]*?class="node-number-stepper"[\s\S]*?data-number-step="up"[\s\S]*?data-number-step="down"/u,
+        'number renderer must place custom increment/decrement controls outside the numeric field');
+    assert.match(renderer, /function stepNumberInput\(button\)[\s\S]*?input\.stepDown\(\)[\s\S]*?input\.stepUp\(\)[\s\S]*?dispatchEvent\(new Event\('input'/u,
+        'custom steppers must use native numeric stepping semantics and the existing input event path');
+    assert.match(editorControls, /node-number-stepper-button\[data-number-step\][\s\S]*?controls\.stepNumberInput/u,
+        'delegated Settings controls must handle dynamic custom-node steppers without inline handlers');
+    assert.match(controls, /input\[type='number'\]\.node-port-input::-webkit-inner-spin-button,[\s\S]*?-webkit-appearance:\s*none/u,
+        'Chromium native number spinners must be fully suppressed');
+    assert.match(controls, /\.node-number-control\s*\{[\s\S]*?gap:\s*8px[\s\S]*?width:\s*max-content/u,
+        'numeric field and stepper must remain separate visual objects');
+    assert.match(controls, /\.node-number-stepper\s*\{[\s\S]*?width:\s*28px[\s\S]*?height:\s*40px/u,
+        'external stepper should use one compact consistent control rail');
+});
+
+test('Settings headings use product titles while preserving custom-section identity', () => {
+    const renderer = read('backend/renderer/nodes/editor/renderer.js');
+    const start = renderer.indexOf('function workflowSectionDisplayTitle(node)');
+    const end = renderer.indexOf('function updateSocketConnectionClasses', start);
+    assert.ok(start >= 0 && end > start, 'workflow section title projection must remain in the renderer owner');
+    const sandbox = {};
+    vm.runInNewContext(renderer.slice(start, end), vm.createContext(sandbox), { filename: 'workflow-section-title-test.js' });
+    assert.equal(sandbox.workflowSectionDisplayTitle({ type: 'modelLoader', title: 'Invoke Language Model (GGUF)' }), 'Language Model');
+    assert.equal(sandbox.workflowSectionDisplayTitle({ type: 'loadServer', title: 'LlamaCPP Server' }), 'Inference');
+    assert.equal(sandbox.workflowSectionDisplayTitle({ type: 'localSampler', title: 'LM Sampler' }), 'Text Generation');
+    assert.equal(sandbox.workflowSectionDisplayTitle({ type: 'tools', title: 'Loader' }), 'Tools & Skills');
+    assert.equal(sandbox.workflowSectionDisplayTitle({ type: 'sampler', title: 'Orchestrator' }), 'Conversation');
+    assert.equal(sandbox.workflowSectionDisplayTitle({ type: 'com.darkstar.dm-sampler', title: '[ Custom ] DM Sampler' }), '[ Custom ] Image Generation');
+    assert.equal(sandbox.workflowSectionDisplayTitle({ type: 'com.darkstar.diffusion-backend-gguf.setter', title: '[ Custom ] Set Diffusion Backend (GGUF)' }), '[ Custom ] Image Model');
+    assert.equal(sandbox.workflowSectionDisplayTitle({ type: 'third.party.custom', title: '[ Custom ] Example Extension' }), '[ Custom ] Example Extension');
+});
+
+test('Settings section headings stay on the same surface as their controls', () => {
+    const styles = read('backend/shell/styles.css');
+    assert.match(styles, /html\[data-theme\]:not\(\[data-theme='quantum'\]\) \.node-editor-node:not\(\.workflow-section\) \.node-title-bar/u,
+        'legacy node title-bar theming must explicitly exclude Settings workflow sections');
+    assert.doesNotMatch(styles, /html\[data-theme\]:not\(\[data-theme='quantum'\]\) \.node-title-bar \{ background:/u,
+        'no late theme rule may recolor Settings section headings as separate panels');
+    assert.match(styles, /\.node-editor-view \.workflow-section \.node-title-bar\s*\{[\s\S]*?background:\s*transparent/u,
+        'Settings headings must share the section background');
+});
+
+test('workflow document is flush to the sidebar and uses a non-consuming overlay scrollbar', () => {
+    const html = read('backend/shell/index.html');
+    const styles = read('backend/shell/styles.css');
+    const layout = read('backend/renderer/nodes/editor/layout.js');
+    assert.match(styles, /\.node-editor-view \.grid-canvas \{ left: 76px; \}/u,
+        'the workflow must begin exactly where the 76px sidebar ends');
+    assert.match(styles, /\.workflow-sections-scroll\s*\{[\s\S]*?scrollbar-width:\s*none[\s\S]*?-ms-overflow-style:\s*none/u,
+        'native scrollbars must not reserve horizontal workflow width');
+    assert.match(styles, /\.workflow-sections-scroll::-webkit-scrollbar \{ width: 0; height: 0; \}/u);
+    assert.match(html, /id="workflowSectionsScroll"[\s\S]*?id="workflowOverlayScrollbar"[\s\S]*?id="workflowOverlayScrollbarThumb"/u,
+        'the visible scroll affordance must overlay the document instead of consuming layout width');
+    assert.match(styles, /\.workflow-sections-scroll\s*\{[\s\S]*?z-index:\s*1;[\s\S]*?isolation:\s*isolate;/u,
+        'section selection and internal popup z-index values must remain trapped below the scrollbar overlay');
+    assert.match(styles, /\.workflow-overlay-scrollbar\s*\{[\s\S]*?position:\s*absolute;[\s\S]*?right:\s*3px;[\s\S]*?z-index:\s*2;[\s\S]*?pointer-events:\s*none/u,
+        'the Settings scrollbar must remain in its own layer above the scroll document');
+
+    const start = layout.indexOf('var workflowSectionScrollbarBound');
+    const end = layout.indexOf('function autoArrangeNodeGraph()', start);
+    assert.ok(start >= 0 && end > start, 'overlay scrollbar implementation must remain in the layout owner');
+    const scroller = { clientHeight: 500, scrollHeight: 1000, scrollTop: 250 };
+    const track = { clientHeight: 492, hidden: true };
+    const thumb = { style: {} };
     const sandbox = {
-        Number,
+        document: { getElementById(id) { return id === 'workflowSectionsScroll' ? scroller : (id === 'workflowOverlayScrollbar' ? track : thumb); } },
+        ResizeObserver: undefined,
         Math,
-        parseFloat,
-        getNodeDef() { return { lockRenderedWidth: false }; },
-        window: { getComputedStyle() { return { width: '500px', borderLeftWidth: '1px', borderRightWidth: '1px' }; } }
+        Number,
     };
-    vm.runInNewContext(rendererSource, vm.createContext(sandbox), { filename: 'backend/renderer/nodes/editor/renderer.js' });
-    const node = { type: 'sampler' };
-    const element = { style: {}, offsetWidth: 502 };
-    assert.equal(sandbox.captureDefinitionStableNodeWidth(element, node), null);
-    assert.equal(node.uiWidth, undefined);
-    assert.equal(element.style.width, undefined);
+    vm.runInNewContext(layout.slice(start, end), vm.createContext(sandbox), { filename: 'workflow-scrollbar-test.js' });
+    sandbox.updateWorkflowSectionScrollbar();
+    assert.equal(track.hidden, false);
+    assert.equal(thumb.style.height, '246px');
+    assert.equal(thumb.style.transform, 'translateY(123px)');
+    scroller.scrollHeight = 500;
+    sandbox.updateWorkflowSectionScrollbar();
+    assert.equal(track.hidden, true, 'overlay thumb disappears when the document does not overflow');
+});
+
+test('custom workflow sections expose persistent removal without making built-in sections removable', () => {
+    const core = read('backend/renderer/nodes/editor/core.js');
+    const renderer = read('backend/renderer/nodes/editor/renderer.js');
+    const controls = read('backend/renderer/nodes/editor/controls.js');
+    assert.match(renderer, /removableCustomSection[\s\S]*?workflow-section-remove[\s\S]*?data-workflow-remove-section/u,
+        'custom section headers must render a visible remove action');
+    assert.match(controls, /workflow-section-remove\[data-workflow-remove-section\][\s\S]*?removeWorkflowCustomSection/u,
+        'the delegated controls owner must route the remove action');
+
+    const start = core.indexOf('function isWorkflowCustomSection(node)');
+    const end = core.indexOf('function removeNode(nodeId)', start);
+    assert.ok(start >= 0 && end > start, 'custom section removal helpers must remain in the node editor core owner');
+    let renders = 0;
+    let saves = 0;
+    const sandbox = {
+        Darkstar: { nodes: { isCustomNodeDefinition(type) { return type === 'plugin.custom'; } } },
+        nodeEditorState: {
+            nodes: [{ id: 10, type: 'builtin' }, { id: 20, type: 'plugin.custom' }],
+            connections: [{ fromNode: 10, toNode: 20 }, { fromNode: 20, toNode: 10 }],
+            selectedNode: 20,
+            executingNodeId: null,
+        },
+        renderAllNodes() { renders++; },
+        renderConnections() { renders++; },
+        scheduleWorkflowSessionSave() { saves++; },
+        showNodeEditorToast() {},
+        Boolean,
+    };
+    vm.runInNewContext(core.slice(start, end), vm.createContext(sandbox), { filename: 'custom-section-remove-test.js' });
+    assert.equal(sandbox.removeWorkflowCustomSection(10), false, 'built-in sections are not removable through the custom-section affordance');
+    assert.equal(sandbox.removeWorkflowCustomSection(20), true);
+    assert.deepEqual(Array.from(sandbox.nodeEditorState.nodes, (node) => node.id), [10]);
+    assert.equal(sandbox.nodeEditorState.connections.length, 0, 'all links owned by the removed custom section are deleted');
+    assert.equal(sandbox.nodeEditorState.selectedNode, null);
+    assert.equal(saves, 1, 'custom section removal persists immediately');
+    assert.equal(renders, 2);
+});
+
+test('workflow section ordering is topological with deterministic legacy-position tie breaking', () => {
+    const source = read('backend/renderer/nodes/editor/renderer.js');
+    const sandbox = { nodeEditorState: { nodes: [], connections: [] } };
+    sandbox.globalThis = sandbox;
+    vm.runInNewContext(source, vm.createContext(sandbox), { filename: 'backend/renderer/nodes/editor/renderer.js' });
+    sandbox.nodeEditorState.nodes = [
+        { id: 5, x: 1510, y: 700 },
+        { id: 7, x: 2110, y: 520 },
+        { id: 9, x: 670, y: 1210 },
+        { id: 8, x: 670, y: 820 },
+        { id: 1, x: 670, y: 22 },
+        { id: 2, x: 60, y: 22 },
+    ];
+    sandbox.nodeEditorState.connections = [
+        { fromNode: 2, toNode: 1 }, { fromNode: 1, toNode: 8 },
+        { fromNode: 8, toNode: 7 }, { fromNode: 9, toNode: 7 }, { fromNode: 5, toNode: 7 },
+    ];
+    const ids = sandbox.orderedWorkflowSectionNodes().map((node) => node.id);
+    assert.deepEqual(Array.from(ids), [2, 1, 8, 9, 5, 7]);
+});
+
+test('custom definitions are tagged at plugin registration and bottom add search filters to those definitions', () => {
+    const plugins = read('backend/renderer/nodes/plugin-loader.js');
+    const interactions = read('backend/renderer/nodes/editor/interactions.js');
+    assert.match(plugins, /customDefinitionOwners[\s\S]*?tagPluginDefinitions\(plugin, beforeIds\)/u);
+    assert.match(plugins, /nodes\.isCustomNodeDefinition = function isCustomNodeDefinition\(type\)/u);
+    assert.match(interactions, /function openWorkflowSectionSearch\(\)[\s\S]*?customOnly: true/u);
+    assert.match(interactions, /searchCustomOnly !== true[\s\S]*?isCustomNodeDefinition\(definition\.id\)/u);
+});
+
+test('custom section insertion preserves graph storage and only auto-connects unambiguous compatible sockets', () => {
+    const core = read('backend/renderer/nodes/editor/core.js');
+    assert.match(core, /function autoConnectWorkflowSection\(node\)[\s\S]*?preferredUniqueSocketCandidate[\s\S]*?addConnection/u);
+    assert.match(core, /function preferredUniqueSocketCandidate\(candidates, socketName\)[\s\S]*?exact\.length === 1[\s\S]*?candidates\.length === 1/u);
+    assert.match(core, /function connectionWouldCycle\(fromNodeId, toNodeId\)/u);
+    assert.match(core, /function addWorkflowSection\(type\)[\s\S]*?createNode\(type[\s\S]*?autoConnectWorkflowSection\(node\)[\s\S]*?activateWorkflowSectionTab\(node\.id, \{ focus: true \}\)[\s\S]*?scheduleWorkflowSessionSave/u,
+        'new custom sections should become the active property tab immediately after insertion');
 });
 });
 
@@ -6521,7 +7667,7 @@ function run(file, context) {
     return context;
 }
 
-test('theme button cycles all six themes in order, updates chrome/UI labels, and persists each choice', async () => {
+test('theme button defaults to Space, cycles all five themes in order, and persists through the native preference bridge', async () => {
     const label = element();
     const themeButton = element({ querySelector: (selector) => selector === '.node-editor-sidebar-label' ? label : null });
     const meta = element();
@@ -6536,8 +7682,9 @@ test('theme button cycles all six themes in order, updates chrome/UI labels, and
         localStorage: {
             getItem(key) { return stored.get(key) ?? null; },
             setItem(key, value) { stored.set(key, String(value)); },
+            removeItem(key) { stored.delete(key); },
         },
-        darkstar: { app: { async setTheme(value) { nativeThemes.push(value); } } },
+        darkstar: { app: { initialTheme: 'space', async setTheme(value) { nativeThemes.push(value); } } },
         document: {
             body,
             documentElement,
@@ -6548,17 +7695,17 @@ test('theme button cycles all six themes in order, updates chrome/UI labels, and
     run('backend/renderer/core-utils.js', context);
     run('backend/renderer/preferences.js', context);
 
-    assert.equal(context.getDarkstarTheme(), 'deep-blue');
-    const expected = ['light', 'quantum', 'terminal', 'arctic', 'space', 'deep-blue'];
+    assert.equal(context.getDarkstarTheme(), 'space');
+    const expected = ['light', 'quantum', 'terminal', 'arctic', 'space'];
     for (const theme of expected) assert.equal(context.toggleDarkstarTheme(), theme);
-    assert.deepEqual(Array.from(stored.entries()), [['darkstar.ui.theme', 'deep-blue']]);
-    assert.equal(documentElement.attributes['data-theme'], 'deep-blue');
-    assert.equal(body.attributes['data-theme'], 'deep-blue');
-    assert.equal(label.textContent, 'Deep Blue');
+    assert.deepEqual(Array.from(stored.entries()), [], 'theme persistence must not maintain a competing localStorage copy');
+    assert.equal(documentElement.attributes['data-theme'], 'space');
+    assert.equal(body.attributes['data-theme'], 'space');
+    assert.equal(label.textContent, 'Space');
     assert.equal(themeButton.dataset.nextTheme, 'light');
-    assert.equal(themeButton.attributes['aria-label'], 'Current theme: Deep Blue. Switch to Light');
-    assert.equal(meta.attributes.content, '#03060c');
-    assert.deepEqual(nativeThemes.slice(-6), expected);
+    assert.equal(themeButton.attributes['aria-label'], 'Current theme: Space. Switch to Light');
+    assert.equal(meta.attributes.content, '#000000');
+    assert.deepEqual(nativeThemes.slice(-5), expected);
 });
 
 test('mute button toggles persisted audio state and its pressed/accessibility labels exactly', () => {
@@ -6934,11 +8081,15 @@ test('chat-session persistence leaves phase breadcrumbs around serialization/com
         filePath: path.join(root, 'chat-session.dscs'),
         onDiagnosticEvent: (phase, details) => phases.push({ phase, details }),
     });
+    const projectRoot = path.join(root, 'Project');
+    fs.mkdirSync(projectRoot, { recursive: true });
     const snapshot = {
         format: 'darkstar-chat-session',
         version: 2,
-        tabs: [{ id: 1, history: [{ role: 'user', content: 'hello' }, { role: 'assistant', content: 'world' }] }],
-        projects: [],
+        activeProjectId: 1,
+        activeTabId: 1,
+        tabs: [{ id: 1, projectId: 1, history: [{ role: 'user', content: 'hello' }, { role: 'assistant', content: 'world' }] }],
+        projects: [{ id: 1, title: 'Project', activeTabId: 1, workspace: { rootPath: projectRoot } }],
     };
 
     const result = store.save(snapshot);
@@ -7133,7 +8284,7 @@ test('--darkstar-debug reaches the sandboxed renderer through an explicit Browse
     assert.match(channels, /DIAGNOSTICS_EVENT:\s*['"]darkstar:diagnostics:event['"]/u);
     assert.match(preload, /const diagnosticsEnabled = Array\.isArray\(process\.argv\) && process\.argv\.includes\(['"]--darkstar-debug['"]\)/u);
     assert.doesNotMatch(preload, /process\.argv\.includes\(['"]--debug['"]\)/u);
-    assert.match(mainWindow, /additionalArguments:\s*options\.diagnosticsEnabled \? \[DARKSTAR_DEBUG_FLAG\] : \[\]/u);
+    assert.match(mainWindow, /\.\.\.\(options\.diagnosticsEnabled \? \[DARKSTAR_DEBUG_FLAG\] : \[\]\)/u);
     assert.match(preload, /diagnostics:\s*diagnosticsApi/u);
     assert.match(preload, /ipcRenderer\.send\(CHANNELS\.DIAGNOSTICS_EVENT/u);
     assert.match(rendererState, /globalThis\.DARKSTAR_DEBUG = darkstarDiagnosticsEnabled/u);
@@ -7342,49 +8493,37 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 const ROOT = path.resolve(__dirname, '..', '..', '..');
-const samplerPath = path.join(ROOT, 'backend', 'renderer', 'nodes', 'builtin', 'sampler.js');
+const samplerPath = path.join(ROOT, 'backend', 'renderer', 'nodes', 'builtin', 'local-sampler.js');
 const { normalizeChatRequest } = require(path.join(ROOT, 'backend', 'runtime', 'chat-request.js'));
 
-function loadSampler() {
+function loadLocalSampler() {
     let definition = null;
-    let streamed = null;
-    const controls = new Proxy({}, {
-        get() {
-            return () => '';
-        },
+    const controls = new Proxy({ escapeHtml(value) { return String(value); } }, {
+        get(target, key) { return target[key] || (() => ''); },
     });
     const contextObject = {
-        globalThis: null,
+        console, structuredClone,
         Darkstar: {
             nodes: {
                 builtinCommon: {
-                    baseNode(_definition, nodeId, x, y, extra) {
-                        return { id: nodeId, x, y, ...extra };
+                    baseNode(nodeDefinition, nodeId, x, y, extra) {
+                        return { id: nodeId, type: nodeDefinition.id, title: nodeDefinition.title, x, y, ...structuredClone(extra) };
                     },
                 },
                 controls,
-                PORT_TYPES: {
-                    MODEL: 'MODEL', TEXT: 'TEXT', IMAGE: 'IMAGE', SKILLS: 'SKILLS', TOOLS: 'TOOLS', CONTROL: 'CONTROL',
-                },
-                services: {
-                    async streamChat(request) {
-                        streamed = request;
-                        return { text: '', reasoning: '', usage: null, finishReason: 'stop' };
-                    },
-                },
-                registerNode(value) {
-                    definition = value;
-                },
+                PORT_TYPES: { SAMPLER_PARAMETERS: 'SAMPLER_PARAMETERS' },
+                registerNode(value) { definition = value; },
             },
         },
     };
+    contextObject.window = contextObject;
     contextObject.globalThis = contextObject;
     vm.runInNewContext(fs.readFileSync(samplerPath, 'utf8'), vm.createContext(contextObject), { filename: samplerPath });
-    return { definition, getStreamed: () => streamed };
+    return definition;
 }
 
-test('new sampler nodes default DRY last N to zero and the control no longer allows negatives', () => {
-    const { definition } = loadSampler();
+test('L_Sampler owns DRY last N, defaults it to zero, and never allows a negative value', () => {
+    const definition = loadLocalSampler();
     assert.ok(definition);
     const node = definition.factory('sampler-1', 0, 0);
     assert.equal(node.params.dryPenaltyLastN, 0);
@@ -7393,52 +8532,24 @@ test('new sampler nodes default DRY last N to zero and the control no longer all
     assert.match(source, /dryPenaltyLastN:\s*0,/u);
     assert.match(source, /'DRY last N'[\s\S]*?\{ min: 0,/u);
     assert.doesNotMatch(source, /dryPenaltyLastN:\s*-1,/u);
-});
-
-test('legacy saved sampler nodes with -1 migrate to zero before rendering or execution', async () => {
-    const { definition, getStreamed } = loadSampler();
-    const node = definition.factory('sampler-2', 0, 0);
-    node.params.dryPenaltyLastN = -1;
-    definition.normalizeNode(node);
-    assert.equal(node.params.dryPenaltyLastN, 0);
 
     node.params.dryPenaltyLastN = -1;
-    await definition.execute({
-        model: { id: 'model' },
-        text: [{ role: 'user', content: 'test' }],
-        while: {},
-    }, node, { parallelSlots: 1, workspaceId: 'default' });
-    assert.equal(node.params.dryPenaltyLastN, 0);
-    assert.equal(getStreamed().dryPenaltyLastN, 0);
+    definition.buildContentHTML(node);
+    assert.equal(node.params.dryPenaltyLastN, 0, 'render normalization must clamp legacy negative state');
+    node.params.dryPenaltyLastN = -1;
+    const output = definition.execute({}, node, {});
+    assert.equal(node.params.dryPenaltyLastN, 0, 'execution normalization must clamp legacy negative state');
+    assert.equal(output.samplerParameters.dryPenaltyLastN, 0);
 });
 
 test('backend request normalization never emits a negative dry_penalty_last_n', () => {
-    const legacy = normalizeChatRequest({
-        model: 'model',
-        messages: [{ role: 'user', content: 'test' }],
-        dryPenaltyLastN: -1,
-    });
+    const legacy = normalizeChatRequest({ model: 'model', messages: [{ role: 'user', content: 'test' }], dryPenaltyLastN: -1 });
     assert.equal(legacy.dry_penalty_last_n, 0);
-
-    const zero = normalizeChatRequest({
-        model: 'model',
-        messages: [{ role: 'user', content: 'test' }],
-        dryPenaltyLastN: 0,
-    });
+    const zero = normalizeChatRequest({ model: 'model', messages: [{ role: 'user', content: 'test' }], dryPenaltyLastN: 0 });
     assert.equal(zero.dry_penalty_last_n, 0);
-
-    const positive = normalizeChatRequest({
-        model: 'model',
-        messages: [{ role: 'user', content: 'test' }],
-        dryPenaltyLastN: 4096,
-    });
+    const positive = normalizeChatRequest({ model: 'model', messages: [{ role: 'user', content: 'test' }], dryPenaltyLastN: 4096 });
     assert.equal(positive.dry_penalty_last_n, 4096);
-
-    const tooLarge = normalizeChatRequest({
-        model: 'model',
-        messages: [{ role: 'user', content: 'test' }],
-        dryPenaltyLastN: 9_999_999_999,
-    });
+    const tooLarge = normalizeChatRequest({ model: 'model', messages: [{ role: 'user', content: 'test' }], dryPenaltyLastN: 9_999_999_999 });
     assert.equal(tooLarge.dry_penalty_last_n, 2_147_483_647);
 });
 });
@@ -7768,7 +8879,7 @@ const contracts = [
     ['dynamic tab row click switches tab', 'backend/renderer/tabs.js', /div\.addEventListener\('click'[\s\S]*?switchTab\(tab\.id\)/u],
     ['dynamic tab close affordance stops propagation and closes exact tab', 'backend/renderer/tabs.js', /class="tab-close" data-ui-action="close-tab" data-tab-id="' \+ tab\.id/u],
 
-    ['dynamic node-search result click adds selected node and closes search', 'backend/renderer/nodes/editor/interactions.js', /item\.addEventListener\('click',[\s\S]*?addNodeEditorNode\(type,[\s\S]*?closeNodeSearch\(\)/u],
+    ['dynamic node-search result click adds a custom section (or legacy node) and closes search', 'backend/renderer/nodes/editor/interactions.js', /item\.addEventListener\('click',[\s\S]*?addWorkflowSection\(type\)[\s\S]*?addNodeEditorNode\(type\)[\s\S]*?closeNodeSearch\(\)/u],
     ['node-search Enter activates first result', 'backend/renderer/nodes/editor/interactions.js', /e\.key === 'Enter'[\s\S]*?firstItem\.click\(\)/u],
     ['node-search Escape closes search', 'backend/renderer/nodes/editor/interactions.js', /e\.key === 'Escape'[\s\S]*?closeNodeSearch\(\)/u],
     ['dynamic graph context Add Node action creates selected node type', 'backend/renderer/nodes/editor/interactions.js', /getAllUserNodeTypes\(\)[\s\S]*?addNodeEditorNode\(def\.id\)/u],
@@ -7783,15 +8894,15 @@ const contracts = [
     ['node dropdown option keyboard is delegated', 'backend/renderer/nodes/editor/controls.js', /onNodeDropdownOptionKeydown\(event, option\)/u],
     ['node file drop delegates to runNodeFileDrop', 'backend/renderer/nodes/editor/controls.js', /function onNodeFileDrop\(event\)[\s\S]*?runNodeFileDrop\(event, dropZone\)/u],
 
-    ['Skills remove-file button encodes its exact index', 'backend/renderer/nodes/builtin/skills.js', /data-action="remove-skill-file:' \+ index/u],
-    ['Skills Add SKILL.md Files action is rendered', 'backend/renderer/nodes/builtin/skills.js', /controls\.button\('Add SKILL\.md Files…', node\.id, 'add-skill-file'\)/u],
+    ['Skills remove-file button encodes its exact index', 'backend/renderer/nodes/builtin/loader.js', /data-action="remove-skill-file:' \+ index/u],
+    ['Skills Add SKILL.md Files action is rendered', 'backend/renderer/nodes/builtin/loader.js', /controls\.button\('Add SKILL\.md Files…', node\.id, 'add-skill-file'\)/u],
     ['Load Tool Browse action is rendered', 'backend/renderer/nodes/builtin/load-tool.js', /controls\.button\('Browse…', node\.id, 'choose-python-tool'\)/u],
-    ['Tools remove-file button encodes its exact index', 'backend/renderer/nodes/builtin/tools.js', /data-action="remove-tool-file:' \+ index/u],
-    ['Tools Add Tool Files action is rendered', 'backend/renderer/nodes/builtin/tools.js', /controls\.button\('Add Tool Files…', node\.id, 'add-tool-file'\)/u],
+    ['Tools remove-file button encodes its exact index', 'backend/renderer/nodes/builtin/loader.js', /data-action="remove-tool-file:' \+ index/u],
+    ['Tools Add Tool Files action is rendered', 'backend/renderer/nodes/builtin/loader.js', /controls\.button\('Add Tool Files…', node\.id, 'add-tool-file'\)/u],
     ['Load Model Unload model action is rendered and disabled with no selection', 'backend/renderer/nodes/builtin/load-model.js', /controls\.button\('Unload model', node\.id, 'unload-model',[\s\S]*?disabled: !node\.selectedModel/u],
     ['Load Model local browser buttons render beside model and projector fields', 'backend/renderer/nodes/builtin/load-model.js', /localBrowseField\(common\.modelDropdown\(node\), node\.id, 'browse-local-model', 'Model'\)[\s\S]*?localBrowseField\(controls\.dropdown\('Projector'[\s\S]*?node\.id, 'browse-local-projector', 'Projector'\)/u],
-    ['Load Server per-GPU toggle action encodes CUDA device index', 'backend/renderer/nodes/builtin/load-server.js', /data-action="toggle-gpu:' \+ escape\(device\.index\)/u],
-    ['Load Server Refresh GPU button routes to refresh-gpus', 'backend/renderer/nodes/builtin/load-server.js', /class="node-action-button node-gpu-refresh"[\s\S]*?data-action="refresh-gpus"/u],
+    ['GGUF Server per-GPU toggle action encodes CUDA device index', 'backend/renderer/nodes/builtin/load-server.js', /data-action="toggle-gpu:' \+ escape\(device\.index\)/u],
+    ['GGUF Server Refresh GPU button routes to refresh-gpus', 'backend/renderer/nodes/builtin/load-server.js', /class="node-action-button node-gpu-refresh"[\s\S]*?data-action="refresh-gpus"/u],
 ];
 
 for (const [name, file, pattern] of contracts) {
@@ -7827,6 +8938,8 @@ const features = [
     ['shared renderer async utilities', 'backend/renderer/core-utils.js', ['runBestEffort', 'namespace.async = Object.freeze']],
     ['shared renderer DOM utilities', 'backend/renderer/core-utils.js', ['bindInlineCommitInput', 'escapeHtml', 'namespace.dom = Object.freeze']],
     ['validated renderer image data URLs', 'backend/renderer/image-data.js', ['normalizeSource', 'safeDataUrl']],
+    ['live image-generation preview renderer', 'backend/renderer/image-generation-preview.js', ['imageGenerationPreview', 'stageHtml', 'safeDataUrl', 'function render(block, segment, isActive, setText)']],
+    ['incremental generation stream surface', 'backend/renderer/generation-stream-surface.js', ['function create(options)', 'surface.appendChild(root.document.createTextNode(delta))', 'renderedStreamLength = live.length', 'STREAM_PREFIX_GUARD_CHARS = 64', 'namespace.generationStreamSurface']],
     ['generation token-rate metrics', 'backend/renderer/generation-ui.js', ['createTokenRateTracker', 'recordTokenTiming', 'resetRound', 'finalize']],
     ['coalesced generation UI rendering', 'backend/renderer/generation-ui.js', ['createCoordinator', 'queueAnswer', 'queueTimeline', 'queueTokenCounter', 'showTyping']],
     ['shared modal lifecycle coordinator', 'backend/renderer/modal-coordinator.js', ['function createModalCoordinator(options)', 'blockBackground:', 'setNativeOverlayBlocked:', 'restoreFocus:']],
@@ -7853,8 +8966,8 @@ const features = [
     ['node graph runtime execution', 'backend/renderer/nodes/graph-runtime.js', ['function GraphRuntime(options)', 'GraphRuntime.prototype.execute', 'GraphExecutionError']],
     ['node SDK registry and port types', 'backend/renderer/nodes/sdk.js', ['function NodeRegistry()', 'PORT_TYPES', 'registerNode: function registerNode(definition)']],
     ['renderer node backend services', 'backend/renderer/nodes/services.js', ['var serviceApi = Object.freeze', 'namespace.chatRuntime = serviceApi', 'nodes.services = serviceApi', 'streamChat:', 'getBridge:', 'getAgentBridge:']],
-    ['generation parameter compatibility facade', 'backend/renderer/params.js', ['function getGenerationParams()', "n.type === 'sampler'", 'repeat_penalty: parseFloat(sampler.params.repeatPenalty)']],
-    ['model inventory refresh/status', 'backend/renderer/server.js', ['async function loadModelList(options)', 'function applyModelInventory(records, projectorRecords)', 'function startAutomaticModelRefresh()']],
+    ['generation parameter compatibility facade', 'backend/renderer/params.js', ['function getGenerationParams()', "n.type === 'localSampler'", 'repeat_penalty: parseFloat(localSampler.params.repeatPenalty)']],
+    ['model inventory refresh/status', 'backend/renderer/server.js', ['async function loadModelList(options)', 'function applyModelInventory(records, projectorRecords, diffusionModelRecords)', 'function startAutomaticModelRefresh()']],
     ['startup UI readiness gate', 'backend/renderer/init.js', ['function setDarkstarStartupUiReady(ready)', "input.setAttribute('placeholder', isReady ? input.dataset.readyPlaceholder : 'Starting Darkstar...')", 'input.disabled = !isReady']],
     ['mobile settings panel toggle', 'backend/renderer/views.js', ['function toggleSettings()', "panel.classList.toggle('visible')", "btn.classList.toggle('active')"]],
     ['chat/node view switching', 'backend/renderer/views.js', ['function switchView(view)', "view === 'settings'", "settingsView.classList.add('active')", "settingsView.classList.remove('active')"]],
@@ -7864,10 +8977,12 @@ const features = [
     ['theme persistence', 'backend/renderer/preferences.js', ['darkstar.ui.theme', 'function toggleDarkstarTheme()', 'localStorage.setItem']],
     ['model action permission slider with workflow-owned persistence', 'backend/renderer/permission-policy.js', ['function initializePermissionPolicyUi()', "document.getElementById('nodePermissionPolicyButton')", 'scheduleWorkflowSessionSave(0)', 'workflowSecuritySnapshot']],
     ['filesystem access slider with workflow-owned persistence', 'backend/renderer/filesystem-access-policy.js', ['function initializeFilesystemAccessUi()', "document.getElementById('nodeFilesystemAccessButton')", 'scheduleWorkflowSessionSave(0)', 'restoreFilesystemAccessLevel']],
-    ['six-theme cycle', 'backend/renderer/preferences.js', ["'deep-blue'", "'light'", "'quantum'", "'terminal'", "'arctic'", "'space'"]],
+    ['internet access slider with Core-owned enforcement', 'backend/renderer/internet-access-policy.js', ['function initializeInternetAccessUi()', "document.getElementById('nodeInternetAccessButton')", 'commitEnabled']],
+    ['five-theme cycle', 'backend/renderer/preferences.js', ["'light'", "'quantum'", "'terminal'", "'arctic'", "'space'"]],
     ['mute persistence', 'backend/renderer/preferences.js', ['darkstar.ui.muted', 'function toggleDarkstarUiMuted()', "aria-pressed"]],
+    ['cooperative chat-session snapshot construction', 'backend/renderer/chat-session-snapshot.js', ['function createBuilder(options)', 'async function mapItems(items, mapper)', 'await yieldRendererTurn()', 'createAsync: createAsync, createSync: createSync']],
     ['chat autosave persistence toggle', 'backend/renderer/chat-session.js', ['function toggleChatAutosave()', 'function setChatAutosaveEnabled(enabled)', 'saveChatSessionNow({ force: true })']],
-    ['chat autosave disable clears persisted session', 'backend/renderer/chat-session.js', ['bridge.clear()', 'Chat autosave disabled and saved chat session cleared']],
+    ['chat autosave disable preserves persisted session', 'backend/renderer/chat-session.js', ['Existing saved project chats preserved', 'Autosave controls future writes only']],
     ['chat session save scheduling', 'backend/renderer/chat-session.js', ['function scheduleChatSessionSave', 'chatSessionRevision']],
     ['chat session restoration', 'backend/renderer/chat-session.js', ['async function restoreChatSession()', 'function restoreChatSessionSnapshot(snapshot)']],
 
@@ -7956,6 +9071,7 @@ const features = [
     ['edit save regenerates from edited turn', 'backend/renderer/edit.js', ['sendMessage(idx + 1', "cancelReason: 'message-edited'"]],
     ['inline edit keyboard handling', 'backend/renderer/edit.js', ["event.key === 'Escape'", "event.ctrlKey || event.metaKey", 'saveEdit()']],
 
+    ['local pipeline workflow migration', 'backend/renderer/workflow-local-pipeline-migration.js', ['function migrate(request)', "getDefinition('localSampler')", "fromSocket: 'gguf'", "toSocket: 'samplerParameters'"]],
     ['workflow snapshot creation', 'backend/renderer/workflow.js', ['function createWorkflowSnapshot()', 'nodeEditorState.nodes', 'nodeEditorState.connections']],
     ['workflow snapshot restoration', 'backend/renderer/workflow.js', ['function restoreWorkflowSnapshot', 'restoreWorkflowDocument']],
     ['workflow manual save', 'backend/renderer/workflow.js', ['async function saveNodeWorkflow()', 'files.openSave()']],
@@ -7966,11 +9082,12 @@ const features = [
 
     ['default node graph pipeline', 'backend/renderer/nodes/editor/core.js', ['function createDefaultNodePipeline', 'modelLoader', 'sampler']],
     ['Reset Graph reconstruction', 'backend/renderer/nodes/editor/core.js', ['async function resetNodeGraph()', 'restoreCanonicalDefaultWorkflow', 'createDefaultNodePipeline']],
-    ['node auto-arrange', 'backend/renderer/nodes/editor/layout.js', ['function autoArrangeNodeGraph()', 'arrangeNodeGraph', "Nodes arranged"]],
+    ['workflow section execution ordering', 'backend/renderer/nodes/editor/renderer.js', ['function orderedWorkflowSectionNodes()', 'inDegree', 'applyWorkflowSectionOrder']],
+    ['workflow section tidy action', 'backend/renderer/nodes/editor/layout.js', ['function autoArrangeNodeGraph()', 'workflowSectionsScroll', 'Workflow sections ordered by execution']],
     ['node creation from registry', 'backend/renderer/nodes/editor/core.js', ['function addNodeEditorNode', 'getNodeDef']],
     ['node deletion', 'backend/renderer/nodes/editor/core.js', ['function removeNode(nodeId)', 'nodeEditorState.connections = nodeEditorState.connections.filter']],
     ['node search', 'backend/renderer/nodes/editor/interactions.js', ['function renderNodeSearchResults(query)', 'getAllUserNodeTypes()']],
-    ['node graph pan/zoom', 'backend/renderer/nodes/editor/interactions.js', ['function updateGridTransform()', 'nodeEditorState.panX', 'nodeEditorState.zoom']],
+    ['workflow section native scrolling', 'backend/shell/styles.css', ['.workflow-sections-scroll', 'overflow-y: auto', '.workflow-sections-layer']],
     ['node connection creation', 'backend/renderer/nodes/editor/interactions.js', ['function addConnection(fromNodeId, fromSocket, toNodeId, toSocket)', 'nodeEditorState.connections.push']],
     ['node socket disconnection', 'backend/renderer/nodes/editor/interactions.js', ['function disconnectSocket', 'nodeEditorState.connections']],
     ['node parameter edits', 'backend/renderer/nodes/editor/controls.js', ['function onNodeParamChange', 'el.dataset.paramKind']],
@@ -7979,52 +9096,52 @@ const features = [
     ['node file drop execution', 'backend/renderer/nodes/editor/controls.js', ['async function runNodeFileDrop(event, dropZone)', 'definition.onFilesDropped(node, filePaths)']],
     ['custom node plugin loading', 'backend/renderer/nodes/plugin-loader.js', ['async function loadCustomNodes()', 'hostWindow.darkstar.customNodes.list()', 'await loadScript(plugins[i].rendererUrl)', 'nodes.onBackendEvent']],
 
-    ['Load Server node', 'backend/renderer/nodes/builtin/load-server.js', ["title: 'Load Server'", "outputs: [{ name: 'server'", 'onAction: async function(node, action)']],
-    ['Load Server backend control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.select('llama.cpp backend'", 'LLAMA_BACKENDS', "backend: 'cuda'"]],
-    ['Load Server port control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.numberInput('Port (0 = auto)'", "node.id, 'port'"]],
-    ['Load Server KV cache location control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.select('KV cache location'", 'kvCacheLocation']],
-    ['Load Server CUDA device mode control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.select('CUDA devices'", 'gpuMode']],
-    ['Load Server multi-GPU loading mode control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.select('Multi-GPU loading'", 'multiGpuMode', "value: 'sequential'", "value: 'parallel'"]],
-    ['Load Server parallel slots control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.numberInput('Parallel Slots'", 'parallel']],
-    ['Load Server Flash Attention control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.booleanSelect('Flash Attention'", 'flashAttention']],
-    ['Load Model GGUF node', 'backend/renderer/nodes/builtin/load-model.js', ["title: 'Load Model (GGUF)'", "outputs: [{ name: 'model'", 'projectorPath']],
+    ['LlamaCPP Server node', 'backend/renderer/nodes/builtin/load-server.js', ["title: 'LlamaCPP Server'", "{ name: 'model', label: 'Language Model'", "outputs: [{ name: 'gguf', label: 'Language Model'", 'onAction: async function(node, action)']],
+    ['GGUF Server backend control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.select('llama.cpp backend'", 'LLAMA_BACKENDS', "backend: 'cuda'"]],
+    ['GGUF Server port control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.numberInput('Port (0 = auto)'", "node.id, 'port'"]],
+    ['GGUF Server context-length control', 'backend/renderer/nodes/builtin/load-server.js', ['contextSliderHTML(node)', 'CONTEXT_PERCENT_STEP = 10', 'contextPercent', 'modelContextLengthForServer']],
+    ['GGUF Server KV cache location control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.select('KV cache location'", 'kvCacheLocation']],
+    ['GGUF Server CUDA device mode control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.select('CUDA devices'", 'gpuMode']],
+    ['GGUF Server multi-GPU loading mode control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.select('Multi-GPU loading'", 'multiGpuMode', "value: 'sequential'", "value: 'parallel'"]],
+    ['GGUF Server parallel slots control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.numberInput('Parallel Slots'", 'parallel']],
+    ['GGUF Server Flash Attention control', 'backend/renderer/nodes/builtin/load-server.js', ["controls.booleanSelect('Flash Attention'", 'flashAttention']],
+    ['Invoke Language Model GGUF node', 'backend/renderer/nodes/builtin/load-model.js', ["title: 'Invoke Language Model (GGUF)'", "outputs: [{ name: 'model', label: 'Language Model'", 'projectorPath']],
     ['Load Model projector selection', 'backend/renderer/nodes/builtin/load-model.js', ["controls.dropdown('Projector'", 'projectorOptions(node)']],
     ['Load Model unload action', 'backend/renderer/nodes/builtin/load-model.js', ["action !== 'unload-model'", 'unloadModel']],
-    ['Context node system prompt', 'backend/renderer/nodes/builtin/context.js', ["title: 'Context'", "controls.textarea('System prompt'", 'systemPrompt']],
+    ['Context node system prompt', 'backend/renderer/nodes/builtin/context.js', ["title: 'Context'", 'inputs: []', "outputs: [{ name: 'context', label: 'Context'", "controls.textarea('System prompt'", 'systemPrompt']],
     ['Context node full-history toggle', 'backend/renderer/nodes/builtin/context.js', ["controls.booleanSelect('Full chat context'", 'includeHistory']],
-    ['Context node image content', 'backend/renderer/nodes/builtin/context.js', ['image_url', 'multimodal projector']],
+    ['Context node image content', 'backend/renderer/nodes/builtin/context.js', ['image_url', 'preparedImages']],
     ['Control node conversation naming toggle', 'backend/renderer/nodes/builtin/control.js', ["controls.toggle('Name Conversations'", 'nameConversations']],
-    ['Skills collection node', 'backend/renderer/nodes/builtin/skills.js', ["title: 'Skills'", 'add-skill-file', 'remove-skill-file:']],
-    ['Skills drag-and-drop', 'backend/renderer/nodes/builtin/skills.js', ['onFilesDropped: async function(node, filePaths)']],
+    ['Loader node owns tool and skill collections', 'backend/renderer/nodes/builtin/loader.js', ["title: 'Loader'", 'add-tool-file', 'remove-tool-file:', 'add-skill-file', 'remove-skill-file:', "{ name: 'tools', label: 'Tools'", "{ name: 'skills', label: 'Skills'"]],
+    ['Loader mixed asset drag-and-drop', 'backend/renderer/nodes/builtin/loader.js', ['onFilesDropped: async function(node, filePaths)', 'isPythonFile', 'isMarkdownFile']],
     ['Load Tool node', 'backend/renderer/nodes/builtin/load-tool.js', ["title: 'Load Tool'", 'choose-python-tool', 'Python file']],
-    ['Tools collection node', 'backend/renderer/nodes/builtin/tools.js', ["title: 'Tools'", 'add-tool-file', 'remove-tool-file:']],
-    ['Tools drag-and-drop', 'backend/renderer/nodes/builtin/tools.js', ['onFilesDropped: async function(node, filePaths)']],
-    ['Tools maximum rounds control', 'backend/renderer/nodes/builtin/tools.js', ["controls.dropdown('Maximum tool rounds'", 'maxRounds']],
-    ['Tools choice control', 'backend/renderer/nodes/builtin/tools.js', ["controls.dropdown('Tool choice'", "value: 'required'"]],
-    ['Sampler node', 'backend/renderer/nodes/builtin/sampler.js', ["title: 'Autoregressive Sampler'", "required: true", 'buildContentHTML: function(node)', 'execute: async function(inputs, node, context)']],
-    ['Sampler reasoning control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.select('Reasoning'", 'reasoningOptions(capability)', 'capability.efforts', "value: 'on'", "value: 'off'"]],
-    ['Sampler seed control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.numberInput('Seed (-1 = random)'", 'seed']],
-    ['Sampler context-length control', 'backend/renderer/nodes/builtin/sampler.js', ['contextSliderHTML(node)', 'CONTEXT_PERCENT_STEP = 10', 'contextPercent', 'localModelContextSize']],
-    ['Sampler temperature control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.slider('Temperature'", 'temperature']],
-    ['Sampler Top K control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.numberInput('Top K'", 'topK']],
-    ['Sampler Top P control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.slider('Top P'", 'topP']],
-    ['Sampler Min P control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.slider('Min P'", 'minP']],
-    ['Sampler Typical P control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.slider('Typical P'", 'typicalP']],
-    ['Sampler repeat penalty control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.slider('Repeat penalty'", 'repeatPenalty']],
-    ['Sampler repeat-last-N control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.numberInput('Repeat last N'", 'repeatLastN']],
-    ['Sampler presence penalty control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.slider('Presence penalty'", 'presencePenalty']],
-    ['Sampler frequency penalty control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.slider('Frequency penalty'", 'frequencyPenalty']],
-    ['Sampler DRY multiplier control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.slider('DRY multiplier'", 'dryMultiplier']],
-    ['Sampler DRY base control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.slider('DRY base'", 'dryBase']],
-    ['Sampler DRY allowed-length control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.numberInput('DRY allowed length'", 'dryAllowedLength']],
-    ['Sampler DRY last-N control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.numberInput('DRY last N'", 'dryPenaltyLastN']],
-    ['Sampler Mirostat control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.select('Mirostat'", 'mirostat']],
-    ['Sampler Mirostat tau control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.slider('Mirostat tau'", 'mirostatTau']],
-    ['Sampler Mirostat eta control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.slider('Mirostat eta'", 'mirostatEta']],
-    ['Sampler chain control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.textInput('Sampler chain'", 'samplers']],
-    ['Sampler stop strings control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.textarea('Stop strings'", 'stop']],
-    ['Sampler prompt-cache control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.booleanSelect('Reuse prompt cache'", 'cachePrompt']],
-    ['Sampler Ignore EOS control', 'backend/renderer/nodes/builtin/sampler.js', ["controls.booleanSelect('Ignore EOS'", 'ignoreEos']],
+    ['Loader keeps stable tool and skill columns when either collection is empty', 'backend/renderer/nodes/builtin/loader.js', ["assetSection('Skills', state.skills.length", "'No skills loaded.'", 'node-asset-column', 'data-node-control=\"true\"']],
+    ['Tools maximum rounds control', 'backend/renderer/nodes/builtin/loader.js', ["controls.dropdown('Maximum tool rounds'", 'maxRounds']],
+    ['Tools choice control', 'backend/renderer/nodes/builtin/loader.js', ["controls.dropdown('Tool choice'", "value: 'required'"]],
+    ['Orchestrator node', 'backend/renderer/nodes/builtin/sampler.js', ["title: 'Orchestrator'", "{ name: 'samplerParameters', label: 'LM Sampler'", "{ name: 'dmSampler', label: 'DM Sampler'", "{ name: 'skills', label: 'Skills'", "{ name: 'tools', label: 'Tools'", 'contextBuilder.buildControls(node)', 'controlPolicy.buildControls(node)', 'execute: async function(inputs, node, context)']],
+    ['L_Sampler reasoning-effort control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.select('Reasoning Effort'", 'reasoningOptions(capability, displayedReasoning)', 'capability.efforts', "value: 'on'", "value: 'off'"]],
+    ['L_Sampler seed control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.numberInput('Seed (-1 = random)'", 'seed']],
+    ['L_Sampler temperature control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.slider('Temperature'", 'temperature']],
+    ['L_Sampler Top K control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.numberInput('Top K'", 'topK']],
+    ['L_Sampler Top P control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.slider('Top P'", 'topP']],
+    ['L_Sampler Min P control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.slider('Min P'", 'minP']],
+    ['L_Sampler Typical P control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.slider('Typical P'", 'typicalP']],
+    ['L_Sampler repeat penalty control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.slider('Repeat penalty'", 'repeatPenalty']],
+    ['L_Sampler repeat-last-N control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.numberInput('Repeat last N'", 'repeatLastN']],
+    ['L_Sampler presence penalty control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.slider('Presence penalty'", 'presencePenalty']],
+    ['L_Sampler frequency penalty control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.slider('Frequency penalty'", 'frequencyPenalty']],
+    ['L_Sampler DRY multiplier control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.slider('DRY multiplier'", 'dryMultiplier']],
+    ['L_Sampler DRY base control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.slider('DRY base'", 'dryBase']],
+    ['L_Sampler DRY allowed-length control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.numberInput('DRY allowed length'", 'dryAllowedLength']],
+    ['L_Sampler DRY last-N control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.numberInput('DRY last N'", 'dryPenaltyLastN']],
+    ['L_Sampler Mirostat control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.select('Mirostat'", 'mirostat']],
+    ['L_Sampler Mirostat tau control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.slider('Mirostat tau'", 'mirostatTau']],
+    ['L_Sampler Mirostat eta control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.slider('Mirostat eta'", 'mirostatEta']],
+    ['L_Sampler sampler-chain control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.textInput('Sampler chain'", 'samplers']],
+    ['L_Sampler sampling ownership metadata', 'backend/renderer/nodes/builtin/local-sampler.js', ['samplingParamKeys: SAMPLING_PARAM_KEYS.slice()', "outputs: [{ name: 'samplerParameters', label: 'LM Sampler'"]],
+    ['L_Sampler stop strings control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.textarea('Stop strings'", 'stop']],
+    ['L_Sampler prompt-cache control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.booleanSelect('Reuse prompt cache'", 'cachePrompt']],
+    ['L_Sampler Ignore EOS control', 'backend/renderer/nodes/builtin/local-sampler.js', ["controls.booleanSelect('Ignore EOS'", 'ignoreEos']],
 
     ['browser open/close', 'backend/renderer/offline-browser.js', ['root.toggleOfflineBrowser = function(force)', 'setOpen']],
     ['browser per-tab ownership', 'backend/renderer/offline-browser.js', ['activeBrowserId', 'activateOfflineBrowserForTab']],
@@ -8038,7 +9155,9 @@ const features = [
     ['browser mode badge', 'backend/renderer/offline-browser.js', ["badge.textContent = isOnline() ? 'ONLINE' : 'LOCAL'", "offlineBrowserModeBadge"]],
     ['browser resizable width persistence', 'backend/renderer/offline-browser.js', ['function setWidth(value, persist, snapped)', 'WIDTH_RATIO_KEY', 'SNAP_KEY']],
     ['browser foreground block reasons', 'backend/renderer/offline-browser.js', ['function setOverlayBlockReason(reason, blocked)', 'overlayBlockReasons']],
-    ['browser keyboard shortcut', 'backend/renderer/offline-browser.js', ["(event.ctrlKey || event.metaKey) && event.shiftKey", "String(event.key).toLowerCase() === 'b'"]],
+    ['browser keyboard shortcut', 'backend/renderer/offline-browser.js', ["String(event.key || '') === 'Tab'", "root.toggleOfflineBrowser()"]],
+    ['Browser Workspace tool routing', 'backend/renderer/browser-workspace.js', ['openBrowserWorkspaceForTool', 'pendingOpenByTab', 'browserWorkspaceTool']],
+    ['In-UI inpainting image editor', 'backend/renderer/image-lightbox.js', ['openImageLightbox', 'brushBounds', 'armEdit', 'setOfflineBrowserOverlayBlockReason']],
 
     ['UIP target list rendering', 'backend/renderer/uip.js', ['function renderTargets()', 'uip-target-row']],
     ['UIP window picker', 'backend/renderer/uip.js', ['async function openPicker()', 'api.listWindows()']],
@@ -8051,6 +9170,7 @@ const features = [
     ['token inspector whole-chat run', 'backend/renderer/token-inspector.js', ['async function runTokenInspection()', 'collectAssistantInspectionEntries']],
 
     ['shared filesystem containment and portable paths', 'backend/filesystem/path-utils.js', ['function isWithinRoot(rootPath, candidatePath)', 'function isExistingPathWithinRootSync(rootPath, candidatePath)', 'function portablePath(value)']],
+    ['project-owned hidden metadata paths', 'backend/project/project-storage.js', ['PROJECT_METADATA_DIRECTORY', 'isInternalProjectPath', 'projectChatSessionPath']],
     ['workspace backend containment', 'backend/workspace/workspace-service.js', ['isWithinRoot', 'Requested path is outside the selected workspace.']],
     ['workspace backend directory listing', 'backend/workspace/workspace-service.js', ['listDirectory']],
     ['workspace backend rename', 'backend/workspace/workspace-service.js', ['renameEntry']],
@@ -8066,14 +9186,16 @@ const features = [
     ['chat autosave store', 'backend/preferences/chat-session-store.js', ['class ChatSessionStore']],
     ['protected persisted payloads', 'backend/preferences/protected-payload.js', ['protectPayload', 'unprotectPayload']],
     ['dialog-location persistence', 'backend/preferences/dialog-location-store.js', ['DialogLocationStore']],
-    ['local model/projector history persistence', 'backend/preferences/local-model-history-store.js', ['LocalModelHistoryStore', 'LOCAL_MODEL_HISTORY_KEYS']],
+    ['purpose-specific local model history persistence', 'backend/preferences/local-model-history-store.js', ['LocalModelHistoryStore', 'LOCAL_MODEL_HISTORY_KEYS', 'DIFFUSION_MODELS']],
     ['native window theme application', 'backend/preferences/window-theme.js', ['applyWindowTheme']],
 
     ['GGUF model discovery', 'backend/runtime/models.js', ['walkModels']],
     ['local GGUF filesystem browser', 'backend/runtime/model-filesystem.js', ['browseModelFiles', 'validateModelFilePath', 'filesystemRoots']],
     ['GGUF metadata parsing', 'backend/runtime/gguf-metadata.js', ['readGgufModelMetadata', 'detectReasoningCapabilities', "tokenizer.chat_template"]],
     ['model selection normalization', 'backend/runtime/models.js', ['normalizeModelLoadRequest', 'resolveModelSelection']],
+    ['asynchronous selected-model lifecycle resolution', 'backend/runtime/model-selection-service.js', ['inspectModel', 'resolveSelection', 'listProjectors', 'detectProjector']],
     ['model lifecycle load/unload', 'backend/runtime/model-lifecycle.js', ['loadModel', 'unloadModel']],
+    ['dynamic VRAM external-work lifecycle', 'backend/runtime/external-work-lifecycle.js', ['temporarilyUnloadForExternalWork', 'assertExternalWorkAvailable', 'stopProcessForExternalWork']],
     ['model idle unload lifecycle', 'backend/runtime/model-idle-unload.js', ['class ModelIdleUnloadController', 'normalizeModelIdleUnloadSeconds', 'hasPendingDecision']],
     ['runtime status projection', 'backend/runtime/runtime-status.js', ['runtimeStatus', 'modelIdleUnloadSeconds', 'loadedProjectorPath']],
     ['llama backend runtime selection', 'backend/runtime/backend-selection.js', ['initializeBackendRuntime', 'selectRuntimeBackend', 'prepareBackendLaunch', 'buildBackendEnvironment']],
@@ -8093,6 +9215,8 @@ const features = [
     ['context usage accounting', 'backend/runtime/tokens.js', ['contextUsage']],
     ['exact live llama slot context usage', 'backend/runtime/native-context-usage.js', ['readSlots', 'n_prompt_tokens', 'acquireSlotLease', 'startSlotMonitor']],
     ['parallel stream coordination', 'backend/runtime/parallel-streams.js', ['acquireParallelSlot', 'releaseParallelSlot']],
+    ['PNG RGBA inpainting codec and hard compositor', 'backend/runtime/png-rgba.js', ['decodePngRgba', 'encodePngRgba', 'solidMask', 'compositeRectMasked']],
+    ['stable-diffusion.cpp image runtime', 'backend/runtime/diffusion-runtime.js', ['class DiffusionRuntime', 'normalizeDiffusionConfiguration', '--preview-path', '__darkstarMultimodal']],
     ['tool-call stream parsing', 'backend/runtime/tool-call-stream.js', ['mergeToolCallDelta', 'finalizeToolCalls']],
     ['model-neutral incomplete tool recovery', 'backend/runtime/tool-call-state.js', ['classifyToolArgumentsJson', 'normalizePartialToolCall']],
     ['tool-call preparation tracking', 'backend/runtime/tool-preparation-tracker.js', ['createPreparationTracker']],
@@ -8103,8 +9227,10 @@ const features = [
     ['Python provider registry', 'backend/agent/python-provider-registry.js', ['PythonProviderRegistry']],
     ['Python tool execution host', 'backend/agent/python-tool-host.js', ['PythonToolHost']],
     ['tool schema validation', 'backend/agent/tool-schema.js', ['normalizeDefinition', 'validateToolArguments']],
-    ['model vision tool capability projection', 'backend/agent/tool-capabilities.js', ['projectVisionDefinition', 'runtimeProviderTools', 'VISION_ONLY_ACTIONS']],
+    ['model vision tool capability projection', 'backend/agent/tool-capabilities.js', ['projectVisionDefinition', 'projectDiffusionDefinition', 'runtimeProviderTools', 'VISION_ONLY_ACTIONS']],
     ['tool service execution', 'backend/agent/tool-service.js', ['class ToolService', 'validateToolArguments']],
+    ['sequential image generation action', 'backend/agent/image-generation-action.js', ['resolveGenerateImageAction', 'aggregateImageSequence', 'sequenceProgressHandler', 'MAX_GENERATE_IMAGE_COUNT']],
+    ['response image presentation action', 'backend/agent/presentation-image-action.js', ['resolveShowImageAction', 'registerToolImages', 'SHOW_IMAGE_ACTION', 'PRESENT_IMAGE_MARKER']],
     ['tool-call timeout', 'backend/agent/tool-runtime.js', ['timeoutToolCallTimeoutMs']],
     ['safe tool environment', 'backend/agent/safe-environment.js', ['sanitizedEnvironment', 'sanitizedPythonEnvironment', 'isSensitiveEnvironmentKey']],
     ['Skill frontmatter parsing', 'backend/agent/skill-parser.js', ['parseFrontmatter']],
@@ -8278,14 +9404,14 @@ function makeElement(id, dataset = {}) {
 function harness() {
     const ids = [
         'btnSettings', 'mobileClearChatButton', 'nodeWorkflowSaveButton', 'nodeWorkflowLoadButton',
-        'nodeAutoLayoutButton', 'nodeClearContextButton', 'nodeChatTraceButton', 'nodeChatAutosaveButton',
-        'nodeMuteButton', 'nodeThemeButton', 'nodeResetGraphButton', 'tabNav', 'newTabButton',
-        'offlineBrowserToggle', 'workspaceToggle', 'projectAddButton', 'offlineBrowserBack',
+        'nodeClearContextButton', 'nodeChatTraceButton', 'nodeChatAutosaveButton',
+        'nodeMuteButton', 'nodeThemeButton', 'workflowAddSectionButton', 'tabNav', 'newTabButton',
+        'workspaceToggle', 'projectAddButton', 'offlineBrowserBack',
         'offlineBrowserForward', 'offlineBrowserReload', 'offlineBrowserOpenButton',
-        'offlineBrowserChooseFileButton', 'offlineBrowserReset', 'offlineBrowserCloseButton',
+        'offlineBrowserChooseFileButton', 'offlineBrowserReset',
         'offlineBrowserFocusAddressButton', 'offlineBrowserAddress', 'queueToggle', 'removeImageButton',
         'projectDirectoryChooseButton', 'imageUploadButton', 'imageInput', 'scheduleBtn', 'sendBtn',
-        'statusSettings', 'projectDeleteCancelButton', 'projectDeleteConfirmButton', 'workspaceDeleteCancelButton',
+        'statusSettings', 'workflowAddSectionButton', 'projectDeleteCancelButton', 'projectDeleteConfirmButton', 'workspaceDeleteCancelButton',
         'workspaceDeleteConfirmButton', 'nodeSearchInput', 'messageInput', 'slashCommandMenu',
     ];
     const elements = new Map(ids.map((id) => [id, makeElement(id)]));
@@ -8294,10 +9420,10 @@ function harness() {
     const record = (name) => (...args) => { calls.push({ name, args }); };
     const functionNames = [
         'toggleSettings', 'setThinkingEffort', 'clearChat', 'saveNodeWorkflow', 'loadNodeWorkflow',
-        'autoArrangeNodeGraph', 'clearNodeContext', 'toggleChatTraceExpansion', 'toggleChatAutosave',
+        'clearNodeContext', 'toggleChatTraceExpansion', 'toggleChatAutosave',
         'toggleDarkstarUiMuted', 'toggleDarkstarTheme', 'resetNodeGraph', 'switchView', 'toggleStatusView', 'createNewTab',
-        'toggleOfflineBrowser', 'toggleWorkspace', 'createNewProject', 'offlineBrowserBack',
-        'offlineBrowserForward', 'offlineBrowserReload', 'openOfflineBrowserAddress', 'chooseOfflineBrowserFile',
+        'toggleOfflineBrowser', 'toggleWorkspace', 'createNewProject',
+        'offlineBrowserBack', 'offlineBrowserForward', 'offlineBrowserReload', 'openOfflineBrowserAddress', 'chooseOfflineBrowserFile',
         'resetBrowser', 'toggleQueue', 'removeImage', 'chooseActiveProjectDirectory',
         'handleGenerationAction', 'stopGeneration', 'sendMessage', 'closeProjectDeleteModal',
         'confirmProjectDeleteModal', 'closeWorkspaceDeleteModal', 'confirmWorkspaceDeleteModal',
@@ -8305,7 +9431,7 @@ function harness() {
         'removeQueuedGenerationById', 'toggleUipTarget', 'disconnectUipTarget', 'closeTab',
         'onNodeSearchInput', 'onNodeSearchKeydown', 'onOfflineBrowserAddressKeydown', 'chooseComposerImage',
         'handleKeydown', 'updateScheduleButton', 'handleComposerImagePaste', 'setGenerationControlHeld',
-        'closeEditModal',
+        'closeEditModal', 'openWorkflowSectionSearch',
     ];
     const documentListeners = new Map();
     const windowListeners = new Map();
@@ -8332,16 +9458,14 @@ const staticCases = [
     ['clear conversation', 'mobileClearChatButton', [['clearChat', []], ['toggleSettings', []]]],
     ['workflow Save', 'nodeWorkflowSaveButton', [['saveNodeWorkflow', []]]],
     ['workflow Load', 'nodeWorkflowLoadButton', [['loadNodeWorkflow', []]]],
-    ['workflow Tidy', 'nodeAutoLayoutButton', [['autoArrangeNodeGraph', []]]],
     ['clear active context', 'nodeClearContextButton', [['clearNodeContext', []]]],
     ['chat trace expand/collapse', 'nodeChatTraceButton', [['toggleChatTraceExpansion', []]]],
     ['chat autosave', 'nodeChatAutosaveButton', [['toggleChatAutosave', []]]],
     ['mute', 'nodeMuteButton', [['toggleDarkstarUiMuted', []]]],
     ['theme', 'nodeThemeButton', [['toggleDarkstarTheme', []]]],
-    ['Reset Graph', 'nodeResetGraphButton', [['resetNodeGraph', []]]],
+    ['add custom section', 'workflowAddSectionButton', [['openWorkflowSectionSearch', []]]],
     ['hidden node-editor nav', 'tabNav', [['switchView', ['settings']]]],
     ['new tab', 'newTabButton', [['createNewTab', []]]],
-    ['Browser toggle', 'offlineBrowserToggle', [['toggleOfflineBrowser', []]]],
     ['workspace toggle', 'workspaceToggle', [['toggleWorkspace', []]]],
     ['new project', 'projectAddButton', [['createNewProject', []]]],
     ['browser Back', 'offlineBrowserBack', [['offlineBrowserBack', []]]],
@@ -8350,7 +9474,6 @@ const staticCases = [
     ['browser Go', 'offlineBrowserOpenButton', [['openOfflineBrowserAddress', []]]],
     ['browser choose local HTML', 'offlineBrowserChooseFileButton', [['chooseOfflineBrowserFile', []]]],
     ['browser reset session', 'offlineBrowserReset', [['resetBrowser', []]]],
-    ['browser Close', 'offlineBrowserCloseButton', [['toggleOfflineBrowser', [false]]]],
     ['queue toggle', 'queueToggle', [['toggleQueue', []]]],
     ['remove image', 'removeImageButton', [['removeImage', []]]],
     ['choose active project directory', 'projectDirectoryChooseButton', [['chooseActiveProjectDirectory', []]]],
@@ -8448,7 +9571,7 @@ test('composer CSS avoids the standardized/native scrollbar path while preservin
 test('every composer reset returns overflow to the short-draft hidden state', () => {
     const renderer = fs.readFileSync(path.join(root, 'backend', 'Darkstar_Renderer.js'), 'utf8');
     const resetWrites = [...renderer.matchAll(/(?:input|scheduledInput)\.style\.height = 'auto';([^\n]*)/gu)];
-    assert.ok(resetWrites.length >= 12, 'expected all composer clear/restore paths to remain covered');
+    assert.ok(resetWrites.length >= 11, 'expected all composer clear/restore paths to remain covered after centralizing tab-draft restoration');
     for (const match of resetWrites) {
         assert.match(match[1], /overflowY\s*=\s*'hidden'/u, 'composer height reset must synchronously suppress native vertical scrollbar chrome');
     }
@@ -8491,11 +9614,11 @@ function openingTag(markup) {
 
 const externallyBoundIds = [
     'btnSettings', 'mobileClearChatButton', 'nodeWorkflowSaveButton', 'nodeWorkflowLoadButton',
-    'nodeAutoLayoutButton', 'nodeClearContextButton', 'nodeChatTraceButton', 'nodeChatAutosaveButton',
-    'nodeMuteButton', 'nodeThemeButton', 'nodeResetGraphButton', 'tabNav', 'newTabButton',
-    'offlineBrowserToggle', 'workspaceToggle', 'projectAddButton', 'offlineBrowserBack',
+    'nodeClearContextButton', 'nodeChatTraceButton', 'nodeChatAutosaveButton',
+    'nodeMuteButton', 'nodeThemeButton', 'workflowAddSectionButton', 'tabNav', 'newTabButton',
+    'workspaceToggle', 'projectAddButton', 'offlineBrowserBack',
     'offlineBrowserForward', 'offlineBrowserReload', 'offlineBrowserOpenButton',
-    'offlineBrowserChooseFileButton', 'offlineBrowserReset', 'offlineBrowserCloseButton',
+    'offlineBrowserChooseFileButton', 'offlineBrowserReset',
     'offlineBrowserFocusAddressButton', 'queueToggle', 'removeImageButton', 'projectDirectoryChooseButton',
     'imageUploadButton', 'scheduleBtn', 'sendBtn', 'statusSettings',
     'projectDeleteCancelButton', 'projectDeleteConfirmButton', 'workspaceDeleteCancelButton',
@@ -8584,9 +9707,9 @@ test('buttons: model-attention decisions keep their reusable feature-owned handl
     assert.doesNotMatch(source, /agentAttentionRedirect|beginAgentAttentionRedirect|decision: 'redirect'/u);
 });
 
-test('button inventory: all 59 current static buttons are explicit type=button controls with no inline JavaScript', () => {
+test('button inventory: all 64 current static buttons are explicit type=button controls with no inline JavaScript', () => {
     const buttons = html.match(/<button\b[^>]*>[\s\S]*?<\/button>/gu) || [];
-    assert.equal(buttons.length, 59);
+    assert.equal(buttons.length, 64);
     for (const button of buttons) {
         const tag = openingTag(button);
         assert.match(tag, /\btype="button"/u, `button is missing type=button: ${tag}`);
@@ -8611,14 +9734,14 @@ const read = (file) => fs.readFileSync(path.join(root, file), 'utf8');
 
 test('all eight built-in workflow features remain registered by stable node id and title', () => {
     const expected = [
-        ['loadServer', 'Load Server', 'backend/renderer/nodes/builtin/load-server.js'],
-        ['modelLoader', 'Load Model (GGUF)', 'backend/renderer/nodes/builtin/load-model.js'],
+        ['loadServer', 'LlamaCPP Server', 'backend/renderer/nodes/builtin/load-server.js'],
+        ['localSampler', 'LM Sampler', 'backend/renderer/nodes/builtin/local-sampler.js'],
+        ['modelLoader', 'Invoke Language Model (GGUF)', 'backend/renderer/nodes/builtin/load-model.js'],
         ['context', 'Context', 'backend/renderer/nodes/builtin/context.js'],
-        ['skills', 'Skills', 'backend/renderer/nodes/builtin/skills.js'],
         ['loadTool', 'Load Tool', 'backend/renderer/nodes/builtin/load-tool.js'],
-        ['tools', 'Tools', 'backend/renderer/nodes/builtin/tools.js'],
+        ['tools', 'Loader', 'backend/renderer/nodes/builtin/loader.js'],
         ['control', 'Control', 'backend/renderer/nodes/builtin/control.js'],
-        ['sampler', 'Autoregressive Sampler', 'backend/renderer/nodes/builtin/sampler.js'],
+        ['sampler', 'Orchestrator', 'backend/renderer/nodes/builtin/sampler.js'],
     ];
     for (const [id, title, file] of expected) {
         const src = read(file);
@@ -8635,22 +9758,25 @@ test('renderer loads every current feature module in the dependency-sensitive or
         'backend/renderer/state.js',
         'backend/renderer/core-utils.js',
         'backend/renderer/image-data.js',
+        'backend/renderer/image-generation-preview.js',
         'backend/renderer/message-markup.js',
+        'backend/renderer/generation-stream-surface.js',
         'backend/renderer/generation-ui.js',
         'backend/renderer/modal-coordinator.js',
         'backend/renderer/preferences.js',
         'backend/renderer/permission-policy.js',
         'backend/renderer/filesystem-access-policy.js',
+        'backend/renderer/internet-access-policy.js',
         'backend/renderer/nodes/sdk.js',
         'backend/renderer/nodes/control-renderers.js',
         'backend/renderer/nodes/services.js',
         'backend/renderer/nodes/builtin/common.js',
         'backend/renderer/nodes/builtin/load-server.js',
+        'backend/renderer/nodes/builtin/local-sampler.js',
         'backend/renderer/nodes/builtin/load-model.js',
         'backend/renderer/nodes/builtin/context.js',
-        'backend/renderer/nodes/builtin/skills.js',
         'backend/renderer/nodes/builtin/load-tool.js',
-        'backend/renderer/nodes/builtin/tools.js',
+        'backend/renderer/nodes/builtin/loader.js',
         'backend/renderer/nodes/builtin/control.js',
         'backend/renderer/nodes/builtin/sampler.js',
         'backend/renderer/nodes/plugin-loader.js',
@@ -8660,6 +9786,7 @@ test('renderer loads every current feature module in the dependency-sensitive or
         'backend/renderer/nodes/editor/renderer.js',
         'backend/renderer/nodes/editor/interactions.js',
         'backend/renderer/nodes/editor/controls.js',
+        'backend/renderer/workflow-local-pipeline-migration.js',
         'backend/renderer/workflow.js',
         'backend/renderer/workflow-file-modal.js',
         'backend/renderer/nodes/graph-core.js',
@@ -8672,8 +9799,11 @@ test('renderer loads every current feature module in the dependency-sensitive or
         'backend/renderer/workspace.js',
         'backend/renderer/attention.js',
         'backend/renderer/uip.js',
+        'backend/renderer/chat-session-snapshot.js',
         'backend/renderer/chat-session.js',
         'backend/renderer/offline-browser.js',
+        'backend/renderer/browser-workspace.js',
+        'backend/renderer/image-lightbox.js',
         'backend/renderer/message-deletion.js',
         'backend/renderer/message-actions.js',
         'backend/renderer/chat.js',
@@ -8698,23 +9828,24 @@ test('renderer loads every current feature module in the dependency-sensitive or
     ].map((source) => source.replace(/^backend\/renderer\//u, '../renderer/')));
 });
 
-test('legacy Load Skill graphs migrate into Skills without a live Load Skill node module', () => {
+test('legacy separate Skills and Load Skill graphs migrate into the unified Loader', () => {
     assert.equal(fs.existsSync(path.join(root, 'backend/renderer/nodes/builtin/load-skill.js')), false);
+    assert.equal(fs.existsSync(path.join(root, 'backend/renderer/nodes/builtin/skills.js')), false);
     const html = read('backend/shell/index.html');
-    assert.doesNotMatch(html, /load-skill\.js/u);
-    const workflow = read('backend/renderer/workflow.js');
-    assert.match(workflow, /loader\.type !== 'loadSkill'/u);
-    assert.match(workflow, /node\.params\.skills/u);
-    assert.match(workflow, /removableLoaders/u);
-    assert.match(workflow, /node\.type !== 'loadSkill' \|\| !skillsDefinition/u);
-    assert.match(workflow, /replacement\.params\.skills/u);
+    assert.doesNotMatch(html, /load-skill\.js|builtin\/skills\.js/u);
+    const migration = read('backend/renderer/workflow-local-pipeline-migration.js');
+    assert.match(migration, /node\.type === 'skills'/u);
+    assert.match(migration, /redirectedSkillOwners/u);
+    assert.match(migration, /targetLoader\.params\.skills/u);
+    assert.match(migration, /node\.type !== 'loadSkill'/u);
+    assert.match(migration, /replacement\.params\.skills/u);
 });
 
 test('current keyboard-accessible feature shortcuts remain bound', () => {
     const workflow = read('backend/renderer/workflow.js');
     assert.match(workflow, /\(event\.ctrlKey \|\| event\.metaKey\)[\s\S]*?String\(event\.key\)\.toLowerCase\(\) !== 's'[\s\S]*?saveNodeWorkflow\(\)/u);
     const browser = read('backend/renderer/offline-browser.js');
-    assert.match(browser, /\(event\.ctrlKey \|\| event\.metaKey\) && event\.shiftKey && String\(event\.key\)\.toLowerCase\(\) === 'b'/u);
+    assert.match(browser, /String\(event\.key \|\| ''\) === 'Tab'[\s\S]*?!event\.shiftKey[\s\S]*?root\.toggleOfflineBrowser\(\)/u);
     assert.match(browser, /setOpen\(!state\.open\)/u);
     const edit = read('backend/renderer/edit.js');
     assert.match(edit, /event\.key === 'Escape'[\s\S]*?cancelInlineEdit\(\)/u);
@@ -8726,7 +9857,7 @@ test('current keyboard-accessible feature shortcuts remain bound', () => {
 test('all major feature surfaces remain represented by dedicated renderer modules', () => {
     const required = [
         'backend/renderer/preferences.js', 'backend/renderer/workflow.js', 'backend/renderer/projects.js', 'backend/renderer/workspace.js', 'backend/renderer/uip.js', 'backend/renderer/chat-session.js',
-        'backend/renderer/offline-browser.js', 'backend/renderer/message-deletion.js', 'backend/renderer/message-actions.js', 'backend/renderer/message-markup.js', 'backend/renderer/chat.js', 'backend/renderer/token-inspector.js', 'backend/renderer/queue.js', 'backend/renderer/tabs.js', 'backend/renderer/server.js',
+        'backend/renderer/offline-browser.js', 'backend/renderer/browser-workspace.js', 'backend/renderer/image-lightbox.js', 'backend/renderer/message-deletion.js', 'backend/renderer/message-actions.js', 'backend/renderer/message-markup.js', 'backend/renderer/chat.js', 'backend/renderer/token-inspector.js', 'backend/renderer/queue.js', 'backend/renderer/tabs.js', 'backend/renderer/server.js',
         'backend/renderer/image.js', 'backend/renderer/system-command-api.js', 'backend/renderer/adversary-context.js', 'backend/renderer/send.js', 'backend/renderer/compaction-activity.js', 'backend/renderer/commands.js', 'backend/renderer/edit.js', 'backend/renderer/views.js', 'backend/renderer/nodes/editor/core.js', 'backend/renderer/graph-execution.js', 'backend/renderer/tool-atomicity.js', 'backend/renderer/context-contract.js',
     ];
     for (const file of required) assert.ok(fs.existsSync(path.join(root, file)), `${file} must remain part of the tested feature surface`);
@@ -8747,6 +9878,16 @@ const vm = require('node:vm');
 
 const ROOT = path.join(__dirname, '..', '..', '..');
 function source(rel) { return fs.readFileSync(path.join(ROOT, rel), 'utf8'); }
+
+function localSamplingConfig() {
+    return {
+        seed: -1, temperature: 0.8, topK: 40, topP: 0.95, minP: 0.05, typicalP: 1,
+        repeatPenalty: 1.1, repeatLastN: 64, presencePenalty: 0, frequencyPenalty: 0,
+        dryMultiplier: 0, dryBase: 1.75, dryAllowedLength: 2, dryPenaltyLastN: 0,
+        mirostat: 0, mirostatTau: 5, mirostatEta: 0.1,
+        samplers: ['dry', 'top_k', 'typ_p', 'top_p', 'min_p', 'xtc', 'temperature'],
+    };
+}
 
 function samplerHarness(completeOverrides = {}) {
     let completeListener = null;
@@ -8791,7 +9932,11 @@ function samplerHarness(completeOverrides = {}) {
         dispatchEvent() {},
         document: { getElementById() { return null; } },
         darkstar: { nodes: bridge },
-        Darkstar: { nodes: {} }
+        Darkstar: {
+            nodes: {},
+            imageData: { safeDataUrl(image) { return image && image.base64 ? `data:${image.mimeType || 'image/png'};base64,${image.base64}` : null; } },
+            async: { runBestEffort(operation) { return Promise.resolve().then(operation); } }
+        }
     };
     context.window = context;
     context.globalThis = context;
@@ -8803,7 +9948,7 @@ function samplerHarness(completeOverrides = {}) {
         PORT_TYPES: { MODEL: 'MODEL', TEXT: 'TEXT', IMAGE: 'IMAGE', SKILLS: 'SKILLS', TOOLS: 'TOOLS', CONTROL: 'CONTROL' },
         controls: {
             dropdown() { return ''; }, numberInput() { return ''; }, slider() { return ''; }, textarea() { return ''; },
-            booleanSelect() { return ''; }, status() { return ''; }, select() { return ''; }
+            booleanSelect() { return ''; }, toggle() { return ''; }, textInput() { return ''; }, status() { return ''; }, select() { return ''; }
         },
         builtinCommon: {
             baseNode(def, id, x, y, extra) {
@@ -8812,6 +9957,8 @@ function samplerHarness(completeOverrides = {}) {
         },
         registerNode(def) { definition = def; return def; }
     });
+    vm.runInContext(source('backend/renderer/nodes/builtin/context.js'), context, { filename: 'context.js' });
+    vm.runInContext(source('backend/renderer/nodes/builtin/control.js'), context, { filename: 'control.js' });
     vm.runInContext(source('backend/renderer/nodes/builtin/sampler.js'), context, { filename: 'sampler.js' });
     return { context, bridge, calls, getDefinition: () => definition };
 }
@@ -8828,15 +9975,16 @@ test('core generation captures a stable chat runtime and survives loss of Darkst
     assert.ok(context.Darkstar.chatRuntime);
 
     const node = sampler.factory('sampler-1', 0, 0);
+    node.params.nameConversations = false;
     const messages = [{ role: 'user', content: 'hello' }];
     messages._darkstarContextOverflowPolicy = 'off';
     const result = await sampler.execute({
-        model: { id: 'model.gguf', multimodal: false },
-        text: messages,
-        while: { nameConversations: false },
+        gguf: { id: 'model.gguf', multimodal: false },
+        samplerParameters: localSamplingConfig(),
         tools: { providers: [], maxRounds: 'auto', toolChoice: 'auto' },
         skills: { skills: [] }
     }, node, {
+        history: messages,
         tabId: 1,
         projectId: 1,
         workspaceId: 'workspace',
@@ -8855,10 +10003,12 @@ test('permission decisions stay inside tool execution and are not transported as
     const sampler = getDefinition();
     const messages = [{ role: 'user', content: 'change directory' }];
     messages._darkstarContextOverflowPolicy = 'off';
+    const permissionNode = sampler.factory('sampler-permission-boundary', 0, 0);
+    permissionNode.params.nameConversations = false;
     const sampled = await sampler.execute({
-        model: { id: 'model.gguf', multimodal: false }, text: messages, while: { nameConversations: false },
+        gguf: { id: 'model.gguf', multimodal: false }, samplerParameters: localSamplingConfig(),
         tools: { providers: [], maxRounds: 'auto', toolChoice: 'auto' }, skills: { skills: [] }
-    }, sampler.factory('sampler-permission-boundary', 0, 0), { tabId: 1, projectId: 1, workspaceId: 'workspace', uipScopeId: 'project-1', parallelSlots: 1 });
+    }, permissionNode, { history: messages, tabId: 1, projectId: 1, workspaceId: 'workspace', uipScopeId: 'project-1', parallelSlots: 1 });
     assert.equal(sampled.finishReason, 'stop');
     assert.equal(Object.hasOwn(sampled, 'attentionRequestId'), false);
     const samplerSource = source('backend/renderer/nodes/builtin/sampler.js');
@@ -8907,6 +10057,52 @@ test('tool-context cloning has one runtime owner and deeply isolates nested mess
         'send.js must not grow a second tool-context clone implementation');
 });
 
+
+test('renderer chat runtime publishes the completed reasoning/tool timeline before secondary tool callbacks', async () => {
+    let chunkListener = null;
+    let completeListener = null;
+    let toolListener = null;
+    const bridge = {
+        onChatChunk(listener) { chunkListener = listener; return () => {}; },
+        onChatComplete(listener) { completeListener = listener; return () => {}; },
+        onChatError() { return () => {}; },
+        onChatToolEvent(listener) { toolListener = listener; return () => {}; },
+        async startChat() { return { success: true }; },
+        async cancelChat() { return { success: true }; },
+    };
+    const context = {
+        console, setTimeout, clearTimeout, AbortController, structuredClone,
+        CustomEvent: function CustomEvent(type, init) { this.type = type; this.detail = init && init.detail; },
+        dispatchEvent() {}, document: { getElementById() { return null; } },
+        darkstar: { nodes: bridge }, Darkstar: { nodes: {}, async: { runBestEffort(fn) { Promise.resolve().then(fn).catch(() => undefined); } } },
+    };
+    context.window = context; context.globalThis = context; vm.createContext(context);
+    vm.runInContext(source('backend/renderer/nodes/services.js'), context, { filename: 'services.js' });
+
+    const order = [];
+    const timelines = [];
+    const run = context.Darkstar.chatRuntime.streamChat({}, {
+        requestId: 'reasoning-tool-boundary',
+        onAgentTimeline(timeline) { order.push('timeline'); timelines.push(timeline); },
+        onToolEvent() { order.push('tool-callback'); },
+    });
+    await Promise.resolve();
+    chunkListener({ requestId: 'reasoning-tool-boundary', reasoning: 'thinking', agentRound: 1 });
+    order.length = 0;
+    toolListener({ requestId: 'reasoning-tool-boundary', type: 'start', activity: { id: 'activity-1', toolCallId: 'call-1', name: 'generate_image', status: 'running' } });
+
+    assert.deepEqual(order.slice(0, 2), ['timeline', 'tool-callback']);
+    const boundary = timelines.at(-1);
+    const reasoning = boundary.find((segment) => segment.type === 'reasoning');
+    const tool = boundary.find((segment) => segment.type === 'tool-call');
+    assert.equal(reasoning.state, 'complete');
+    assert.equal(reasoning.status, 'complete');
+    assert.equal(tool.state, 'streaming');
+    assert.equal(tool.status, 'running');
+
+    completeListener({ requestId: 'reasoning-tool-boundary', text: '', reasoning: 'thinking', finishReason: 'stop' });
+    await run;
+});
 
 test('renderer chat runtime freezes model deltas at the exact Stop boundary while waiting for terminal interruption metadata', async () => {
     let chunkListener = null;
@@ -9209,6 +10405,7 @@ test('the project-aware restart snapshot contains exactly one stopped assistant 
             selectedPath: null
         }]]);
     `, context);
+    vm.runInContext(source('backend/renderer/chat-session-snapshot.js'), context, { filename: 'chat-session-snapshot.js' });
     vm.runInContext(source('backend/renderer/chat-session.js'), context, { filename: 'chat-session.js' });
 
     const assertSnapshot = (snapshot) => {
@@ -9575,6 +10772,7 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
+const streamSource = fs.readFileSync(path.join(__dirname, '..', '..', 'renderer', 'generation-stream-surface.js'), 'utf8');
 const source = fs.readFileSync(path.join(__dirname, '..', '..', 'renderer', 'generation-ui.js'), 'utf8');
 
 function fixture(options = {}) {
@@ -9619,6 +10817,7 @@ function fixture(options = {}) {
         },
     };
     sandbox.globalThis = sandbox;
+    vm.runInNewContext(streamSource, sandbox, { filename: 'generation-stream-surface.js' });
     vm.runInNewContext(source, sandbox, { filename: 'generation-ui.js' });
 
     const session = {
@@ -9680,6 +10879,26 @@ test('generation UI mounts once and coalesces answer, timeline, and token-counte
     assert.equal(state.calls.tokens, 1);
     assert.equal(state.calls.scrolls, 1);
     assert.equal(state.calls.add, 1, 'painting should reuse the mounted message');
+});
+
+test('generation UI paints semantic timeline boundaries on the next frame instead of waiting for the streaming throttle', () => {
+    const state = fixture();
+    state.coordinator.mount();
+    state.coordinator.queueTimeline([{ id: 'initial', type: 'reasoning' }]);
+    const initialPaint = state.takeFrame();
+    assert.equal(typeof initialPaint, 'function');
+    initialPaint();
+
+    state.setNow(110);
+    state.coordinator.queueTimeline([{ id: 'coalesced', type: 'reasoning' }]);
+    assert.equal(state.takeFrame(), null, 'ordinary streaming updates should remain throttled');
+
+    const boundary = [{ id: 'tool-1', type: 'tool-call', state: 'streaming', status: 'running' }];
+    state.coordinator.queueTimelineBoundary(boundary);
+    const boundaryPaint = state.takeFrame();
+    assert.equal(typeof boundaryPaint, 'function', 'a reasoning/tool phase boundary must bypass the 50 ms throttle');
+    boundaryPaint();
+    assert.deepEqual(state.calls.timeline.at(-1), boundary);
 });
 
 test('generation UI reasserts the activity spinner idempotently throughout an active generation', () => {
@@ -9776,10 +10995,14 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const vm = require('node:vm');
 
 const projectRoot = path.resolve(__dirname, '..', '..', '..');
 const sendSource = fs.readFileSync(path.join(projectRoot, 'backend', 'renderer', 'send.js'), 'utf8');
+const generationStreamSource = fs.readFileSync(path.join(projectRoot, 'backend', 'renderer', 'generation-stream-surface.js'), 'utf8');
 const generationUiSource = fs.readFileSync(path.join(projectRoot, 'backend', 'renderer', 'generation-ui.js'), 'utf8');
+const servicesSource = fs.readFileSync(path.join(projectRoot, 'backend', 'renderer', 'nodes', 'services.js'), 'utf8');
+const chatSource = fs.readFileSync(path.join(projectRoot, 'backend', 'renderer', 'chat.js'), 'utf8');
 const effectsSource = fs.readFileSync(path.join(projectRoot, 'backend', 'renderer', 'effects.js'), 'utf8');
 const stylesSource = fs.readFileSync(path.join(projectRoot, 'backend', 'shell', 'styles.css'), 'utf8');
 
@@ -9804,11 +11027,90 @@ test('streaming answer, reasoning timeline, and token counter share one frame-co
     assert.match(generationUiSource, /paintTimer/);
     assert.match(generationUiSource, /paintFrame/);
     assert.match(generationUiSource, /requestAnimationFrame\(\(\) => this\.flushPaint\(\)\)/);
-    assert.match(generationUiSource, /this\.contentDiv\.innerHTML\s*=\s*\(hasVisibleAnswer\(answer\)\s*\?\s*this\.formatMessage\(answer\)\s*:\s*''\)\s*\+\s*TYPING_INDICATOR_HTML/);
+    assert.match(generationUiSource, /this\.streamController\.paint\(\)/);
+    assert.match(generationStreamSource, /surface\.appendChild\(root\.document\.createTextNode\(delta\)\)/);
+    assert.match(generationStreamSource, /STREAM_PREFIX_GUARD_CHARS\s*=\s*64/);
+    assert.match(generationStreamSource, /live\.slice\(renderedStreamLength\)/);
+    assert.doesNotMatch(generationStreamSource, /startsWith\(renderedStreamText\)|renderedStreamText\s*=\s*live/u,
+        'streaming must not compare or retain the entire accumulated response on every paint');
     assert.match(generationUiSource, /this\.updateMessageAgentTimeline\(this\.assistantDiv, this\.timelineForDisplay\(this\.pendingTimeline\)\)/);
     assert.match(generationUiSource, /pendingTokenCounter/);
     assert.match(sendSource, /generationUi\.queueTimeline\(session\.agentTimeline\)/);
+    assert.match(sendSource, /payload\.activity \|\| payload\.preparation[\s\S]*session\.phase = 'tool'/u, 'every concrete tool lifecycle event must move presentation out of the model/reasoning phase');
+    assert.match(sendSource, /imagePhaseChanged[\s\S]*generationUi\.queueTimelineBoundary\(session\.agentTimeline\)/u, 'image runtime phase changes must paint as semantic UI boundaries');
     assert.match(sendSource, /generationUi\.queueTokenCounter\(\)/);
+    assert.match(sendSource, /contentDiv\.innerHTML = formatMessage\(fullResponse\)/, 'terminal finalization must retain exact Markdown rendering');
+});
+
+test('live answer streaming appends only new text and never reparses the accumulated response', () => {
+    class Element {
+        constructor(tag) { this.tagName = tag; this.children = []; this.parent = null; this.className = ''; this.attributes = {}; this._text = ''; this.isConnected = true; }
+        appendChild(child) { child.parent = this; this.children.push(child); return child; }
+        insertBefore(child, before) { child.parent = this; const index = this.children.indexOf(before); this.children.splice(index < 0 ? this.children.length : index, 0, child); return child; }
+        querySelector(selector) { const className = selector.startsWith('.') ? selector.slice(1) : ''; return this.children.find((child) => child.className === className) || null; }
+        setAttribute(name, value) { this.attributes[name] = String(value); }
+        remove() { if (this.parent) this.parent.children = this.parent.children.filter((child) => child !== this); this.isConnected = false; }
+        set textContent(value) { this._text = String(value); this.children = []; }
+        get textContent() { return this._text + this.children.map((child) => child.textContent || child.data || '').join(''); }
+    }
+    const createdText = [];
+    const sandbox = {
+        Darkstar: {}, performance: { now() { return 1; } }, setTimeout,
+        document: {
+            createElement(tag) { return new Element(tag); },
+            createTextNode(value) { const node = { data: String(value), textContent: String(value), parent: null }; createdText.push(node.data); return node; },
+        },
+    };
+    sandbox.globalThis = sandbox;
+    vm.runInNewContext(generationStreamSource, sandbox, { filename: 'generation-stream-surface.js' });
+    const session = { responseText: '' };
+    let formatCalls = 0;
+    const controller = sandbox.Darkstar.generationStreamSurface.create({ session, formatMessage(value) { formatCalls += 1; return '<p>' + value + '</p>'; } });
+    const content = new Element('div');
+    controller.attach(content);
+    controller.showTyping();
+    session.responseText = 'hello'; controller.paint();
+    session.responseText = 'hello world'; controller.paint();
+    const surface = content.querySelector('.generation-stream-text');
+    assert.ok(surface);
+    assert.equal(surface.textContent, 'hello world');
+    assert.deepEqual(createdText, ['hello', ' world'], 'only the newly arrived suffix should allocate text nodes');
+
+    // A rewritten prefix is rare but must still fall back to exact replacement,
+    // after which normal suffix-only streaming resumes from the new cursor.
+    session.responseText = 'jello world'; controller.paint();
+    assert.equal(surface.textContent, 'jello world');
+    session.responseText = 'jello world!'; controller.paint();
+    assert.equal(surface.textContent, 'jello world!');
+    assert.deepEqual(createdText, ['hello', ' world', '!']);
+    assert.equal(formatCalls, 0, 'live streaming must not re-run Markdown formatting over accumulated output');
+});
+
+test('reasoning trace identity advances incrementally and remains byte-for-byte compatible with the legacy full hash', () => {
+    const traceFunctions = sourceBetween(servicesSource, 'function traceTextKey(value) {', 'function imageSourceKey(source) {');
+    const sandbox = {};
+    vm.runInNewContext(traceFunctions + '\nthis.__trace = { traceTextKey, extendTraceTextKey };', sandbox, { filename: 'reasoning-trace-key.js' });
+    const chunks = ['Reason ', 'over ', 'a long ', 'sequence ', 'without rescanning it.'];
+    const state = { length: 0, hash: 2166136261 };
+    let incremental = '';
+    for (const chunk of chunks) incremental = sandbox.__trace.extendTraceTextKey(state, chunk);
+    assert.equal(incremental, sandbox.__trace.traceTextKey(chunks.join('')),
+        'incremental hashing must preserve the exact persisted/rendered trace key contract');
+    assert.match(servicesSource, /extendTraceTextKey\(traceState, reasoning\)/u);
+    assert.doesNotMatch(servicesSource, /traceTextKey\(ensured\.segment\.content\)/u,
+        'the growing reasoning buffer must never be re-hashed from the beginning per token');
+});
+
+test('hidden tool preparation does not force an extra synchronous transcript layout per event', () => {
+    const onToolEvent = sourceBetween(sendSource,
+        'onToolEvent: function(payload, working, timeline, toolContext) {',
+        'onAgentTimeline: function(timeline) {');
+    const smartScroll = sourceBetween(chatSource, 'function smartScrollToBottom() {', 'const ADD_MESSAGE_OPTION_NAMES');
+    assert.doesNotMatch(onToolEvent, /smartScrollToBottom\(/u,
+        'tool preparation must use the coalesced timeline painter instead of scrolling immediately');
+    assert.match(smartScroll, /container\.scrollTop\s*=\s*2147483647/u);
+    assert.doesNotMatch(smartScroll, /container\.scrollTop\s*=\s*container\.scrollHeight/u,
+        'follow-mode scrolling must not synchronously read scrollHeight every streamed paint');
 });
 
 test('prompt-processing context heartbeats keep the spinner visible while the token counter advances', () => {
@@ -10626,7 +11928,7 @@ function rendererHarness() {
         document: { getElementById() { return null; } },
         Darkstar: {
             nodes: {
-                PORT_TYPES: { SERVER: 'SERVER', MODEL: 'MODEL' },
+                PORT_TYPES: { SERVER: 'SERVER', MODEL_CONFIG: 'MODEL_CONFIG', MODEL: 'MODEL', SAMPLER_PARAMETERS: 'SAMPLER_PARAMETERS' },
                 controls: {
                     dropdown() { return ''; }, button() { return ''; }, status() { return ''; },
                     numberInput() { return ''; }, select() { return ''; }, escapeHtml(value) { return String(value); }
@@ -10662,7 +11964,7 @@ function rendererHarness() {
     return { context, definitions, calls };
 }
 
-test('Load Server and Load Model do not depend on Darkstar.nodes.services.getBridge', async () => {
+test('GGUF Server and Load Model do not depend on Darkstar.nodes.services.getBridge', async () => {
     const serverSource = source('backend/renderer/nodes/builtin/load-server.js');
     const modelSource = source('backend/renderer/nodes/builtin/load-model.js');
     assert.doesNotMatch(serverSource, /nodes\.services\.getBridge\s*\(/u);
@@ -10684,17 +11986,19 @@ test('normal llama graph nodes execute when Darkstar.nodes.services is absent', 
     modelNode.selectedModel = 'demo.gguf';
     context.nodeEditorState.nodes = [serverNode, modelNode];
     context.nodeEditorState.connections = [{
-        fromNode: 'server-1', fromSocket: 'server', toNode: 'model-1', toSocket: 'server'
+        fromNode: 'model-1', fromSocket: 'model', toNode: 'server-1', toSocket: 'model'
     }];
 
-    const serverOutput = await serverDef.execute({}, serverNode);
-    assert.equal(serverOutput.server.running, true);
-    assert.equal(calls.startServer, 1);
-
-    const modelOutput = await modelDef.execute(serverOutput, modelNode);
+    const modelOutput = await modelDef.execute({}, modelNode, {});
     assert.equal(modelOutput.model.id, 'demo.gguf');
     assert.equal(calls.detectProjector, 1);
-    assert.equal(calls.loadModel, 1);
+    assert.equal(calls.loadModel, 0, 'Invoke Language Model now selects/configures the model without loading it');
+
+    const serverOutput = await serverDef.execute({ ...modelOutput }, serverNode, {});
+    assert.equal(serverOutput.gguf.id, 'demo.gguf');
+    assert.equal(serverOutput.gguf.server.running, true);
+    assert.equal(calls.startServer, 1);
+    assert.equal(calls.loadModel, 1, 'GGUF Server owns the actual llama.cpp model load');
 });
 });
 
@@ -11216,7 +12520,7 @@ test('structured monolith boots the Electron sandboxed preload without unrestric
     const context = {
         console,
         require: restrictedRequire,
-        process: { type: 'renderer', platform: 'win32' },
+        process: { type: 'renderer', platform: 'win32', argv: [] },
         Map,
         Set,
         Object,
@@ -11260,12 +12564,12 @@ const vm = require('node:vm');
 const root = path.resolve(__dirname, '..', '..', '..');
 const read = (file) => fs.readFileSync(path.join(root, file), 'utf8');
 
-test('node-editor wheel zoom is anchored to the pointer rather than the canvas origin', () => {
+test('workflow section document leaves wheel scrolling native and does not bind graph pan/zoom gestures', () => {
     const core = read('backend/renderer/nodes/editor/core.js');
-    const interactions = read('backend/renderer/nodes/editor/interactions.js');
-    assert.match(core, /zoomNodeEditorAtScreenPoint\(e\.clientX, e\.clientY, newZoom\)/u);
-    assert.match(interactions, /function zoomNodeEditorAtScreenPoint\(screenX, screenY, nextZoom\)/u);
-    assert.doesNotMatch(core, /nodeEditorState\.zoom\s*=\s*newZoom;\s*updateGridTransform\(\)/u);
+    assert.match(core, /canvas\.addEventListener\('mousedown', onGridMouseDown\)/u);
+    assert.doesNotMatch(core, /canvas\.addEventListener\('wheel'/u);
+    assert.doesNotMatch(core, /canvas\.addEventListener\('mousemove'/u);
+    assert.doesNotMatch(core, /canvas\.addEventListener\('mouseup'/u);
 });
 
 test('zoom anchor math preserves the graph point under the mouse exactly', () => {
@@ -11329,6 +12633,64 @@ test('tab bar tracks its own launch-time width changes instead of waiting for a 
     observerCallback([{ contentRect: { width: 1175 } }]);
     assert.ok(frames.length > framesBeforeResize, 'tab-bar ResizeObserver should schedule a re-render');
     assert.ok(timers.some((entry) => entry.ms === 260), 'startup should include a post-layout remeasure');
+});
+
+test('chat tabs own unsent composer drafts instead of clearing the shared textarea on tab switches', () => {
+    const tabsSource = read('backend/renderer/tabs.js');
+    const sessionSource = read('backend/renderer/chat-session.js');
+    assert.match(tabsSource, /function captureActiveComposerDraft\(\)/u);
+    assert.match(tabsSource, /function restoreComposerDraftForTab\(tab\)/u);
+    assert.match(tabsSource, /function switchTab\(tabId\)[\s\S]*?captureActiveComposerDraft\(\)[\s\S]*?restoreComposerDraftForTab\(targetTab\)/u);
+    assert.doesNotMatch(tabsSource, /Clear input when switching tabs/u);
+    assert.match(sessionSource, /composerDraft:\s*\{[\s\S]*?text:[\s\S]*?image:/u,
+        'per-tab composer drafts must survive chat-session persistence as well as in-memory tab switches');
+});
+
+test('image enlargement is the canonical inpainting editor with cursor-anchored wheel zoom and middle-button pan', () => {
+    const editor = read('backend/renderer/image-lightbox.js');
+    const styles = read('backend/shell/styles.css');
+    assert.match(editor, /function openFromImage\(image\)[\s\S]*?ui\.root\.hidden = false[\s\S]*?image-lightbox-open/u);
+    assert.match(editor, /function close\(\)[\s\S]*?ui\.root\.hidden = true[\s\S]*?removeAttribute\('src'\)/u);
+    assert.match(editor, /event\.target === ui\.root \|\| event\.target === ui\.close/u,
+        'backdrop and explicit close control must both dismiss the editor');
+    assert.match(editor, /pointerdown[\s\S]*?pointermove[\s\S]*?pointerup/u,
+        'selection and brush editing must use bounded pointer capture on the overlay canvas');
+    assert.match(editor, /function onStageWheel\(event\)[\s\S]*?anchorX[\s\S]*?anchorY[\s\S]*?applyImageScale\(nextScale\)[\s\S]*?scrollLeft \+=/u,
+        'wheel zoom must keep the image point under the cursor stationary while scale changes');
+    assert.match(editor, /function onStagePointerDown\(event\)[\s\S]*?event\.button !== 1[\s\S]*?editorState\.pan[\s\S]*?function onStagePointerMove/u,
+        'middle mouse must pan the native editor viewport independently of left-button editing');
+    assert.match(styles, /\.image-lightbox-stage\s*\{[\s\S]*?display:\s*flex;[\s\S]*?align-items:\s*safe center;[\s\S]*?justify-content:\s*safe center;[\s\S]*?overflow:\s*auto;/u);
+});
+
+test('portable single-exe builder keeps persistent data outside the temporary Electron payload and bundles runtime dependencies', () => {
+    const core = read('backend/app/run-main-app.js');
+    const appIpc = read('backend/ipc/register-app-ipc.js');
+    const builderPath = path.join(root, 'backend', 'scripts', 'build-portable-single-exe.ps1');
+    const wrapperPath = path.join(root, 'Build_Portable_EXE.bat');
+    assert.equal(fs.existsSync(builderPath), true);
+    assert.equal(fs.existsSync(wrapperPath), true);
+    const builder = fs.readFileSync(builderPath, 'utf8');
+    assert.match(core, /DARKSTAR_PORTABLE_DATA_ROOT[\s\S]*?const dataRoot = path\.resolve\(configuredDataRoot \|\| baseDir\)/u);
+    assert.match(core, /runtimeOptions:\s*\{ modelsDir: path\.join\(dataRoot, 'models'\) \}/u);
+    assert.match(core, /new ChatSessionStore\(\{[\s\S]*?baseDir:\s*dataRoot/u);
+    assert.match(core, /registerAppIpc\(\{[^\n]*projectBaseDir:\s*dataRoot/u);
+    assert.match(appIpc, /const projectBaseDir = path\.resolve\(options\.projectBaseDir \|\| baseDir\)/u);
+    assert.match(appIpc, /path\.(?:join|resolve)\(projectBaseDir, 'projects'\)/u);
+    assert.match(builder, /bootstrap-llamacpp\.ps1/u);
+    assert.match(builder, /electron-builder[\s\S]*?target = 'portable'/u);
+    assert.match(builder, /PORTABLE_EXECUTABLE_DIR[\s\S]*?DARKSTAR_PORTABLE_DATA_ROOT/u);
+    assert.match(builder, /must be run from a writable folder/u, 'portable startup must fail closed instead of persisting into Electron temporary extraction');
+    assert.match(builder, /python-portable/u);
+    assert.match(builder, /SourceVenv[\s\S]*?existing Darkstar venv/u);
+    assert.match(builder, /Snapshotting the existing Darkstar venv exactly as currently used/u);
+    assert.doesNotMatch(builder, /-m\s+pip\s+install|portable-python-requirements\.txt/u,
+        'portable builder must not reinstall Python packages');
+    assert.match(builder, /backend\\vendor\\node/u);
+    assert.match(builder, /Darkstar-Portable\.exe/u);
+    assert.match(builder, /Write-Utf8NoBom[\s\S]*?GeneratedPackagePath[\s\S]*?JSON\.parse/u,
+        'portable builder must emit BOM-free strict JSON and preflight it before electron-builder');
+    assert.doesNotMatch(builder, /GeneratedPackagePath[^\n]*Set-Content[^\n]*Encoding UTF8/u,
+        'Windows PowerShell 5.1 UTF-8 BOM output must never be used for generated package.json');
 });
 
 test('startup applies collapsed-sidebar geometry before the first tab render', () => {
@@ -11575,7 +12937,7 @@ test('removed companion speculative-draft integration stays absent from producti
     assert.equal(core.includes('draft-' + removedName), false);
 });
 
-test('Load Server exposes Auto/On/Off MTP and manual controls without moving MTP into the sampler', () => {
+test('GGUF Server exposes Auto/On/Off MTP and manual controls without moving MTP into the sampler', () => {
     const loadServer = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'nodes', 'builtin', 'load-server.js'), 'utf8');
     const sampler = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'nodes', 'builtin', 'sampler.js'), 'utf8');
     assert.match(loadServer, /controls\.select\('MTP',\s*p\.mtpMode/u);
@@ -11588,7 +12950,7 @@ test('Load Server exposes Auto/On/Off MTP and manual controls without moving MTP
     assert.doesNotMatch(sampler, /mtpMode|spec-draft|draft-mtp/iu);
 });
 
-test('Load Server execution forwards model identity and MTP settings through startServer', async () => {
+test('GGUF Server execution forwards model identity and MTP settings through startServer', async () => {
     const source = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'nodes', 'builtin', 'load-server.js'), 'utf8');
     let definition = null;
     let captured = null;
@@ -11599,7 +12961,7 @@ test('Load Server execution forwards model identity and MTP settings through sta
         Darkstar: {
             modelInventory: [{ id: 'mtp.gguf', layerCount: 48, contextLength: 8192, mtp: mtpModel().mtp }],
             nodes: {
-                PORT_TYPES: { SERVER: 'SERVER' },
+                PORT_TYPES: { MODEL_CONFIG: 'MODEL_CONFIG', MODEL: 'MODEL', SAMPLER_PARAMETERS: 'SAMPLER_PARAMETERS' },
                 controls: {
                     numberInput: blank, select: blank, textInput: blank, status: blank, booleanSelect: blank,
                     escapeHtml(value) { return String(value); },
@@ -11616,6 +12978,7 @@ test('Load Server execution forwards model identity and MTP settings through sta
                                     mtp: { enabled: true, autoTuned: true, draftTokens: 3 },
                                 };
                             },
+                            async loadModel(modelId) { return { success: true, modelId, contextSizePerSlot: 8192, totalContextSize: 8192, parallelSlots: 1, metadata: context.Darkstar.modelInventory[0] }; },
                             async listGpus() { return { success: true, devices: [] }; },
                             async listModels() { return { success: true, models: context.Darkstar.modelInventory }; },
                         };
@@ -11637,8 +13000,8 @@ test('Load Server execution forwards model identity and MTP settings through sta
     node.params.mtpDraftTokens = '5';
     const loader = { id: 'loader', type: 'modelLoader', selectedModel: 'mtp.gguf' };
     context.nodeEditorState.nodes = [node, loader];
-    context.nodeEditorState.connections = [{ fromNode: 'server', fromSocket: 'server', toNode: 'loader', toSocket: 'server' }];
-    await definition.execute({}, node);
+    context.nodeEditorState.connections = [{ fromNode: 'loader', fromSocket: 'model', toNode: 'server', toSocket: 'model' }];
+    await definition.execute({ model: { id: 'mtp.gguf', metadata: context.Darkstar.modelInventory[0], mtp: mtpModel().mtp } }, node, {});
     assert.equal(captured.modelId, 'mtp.gguf');
     assert.equal(captured.mtpMode, 'on');
     assert.equal(captured.mtpDraftTokens, '5');
@@ -11689,7 +13052,7 @@ test('server lifecycle binds active MTP to the selected model instance while ord
             loadedModelId: null,
             async normalizeServerConfig() { return structuredClone(normalizedBase); },
             async detectCapabilities() { return runtimeCapabilities; },
-            resolveModelSelection() { return { local: structuredClone(model) }; },
+            async resolveModelSelectionAsync() { return { local: structuredClone(model) }; },
             buildRouterArgs() { return ['--models-dir', 'models']; },
             async spawnAndWait(args, config, mode, readinessPath, timeoutMs, options) {
                 launches.push({ args, config: structuredClone(config), mode, readinessPath, timeoutMs, options });
@@ -11730,7 +13093,7 @@ test('server lifecycle binds active MTP to the selected model instance while ord
     assert.equal(plainRuntime.launches[0].config.mtp.enabled, false);
 });
 
-test('renderer model inventory preserves bounded MTP capability for Load Server model-dependent controls', () => {
+test('renderer model inventory preserves bounded MTP capability for GGUF Server model-dependent controls', () => {
     const source = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'server.js'), 'utf8');
     const context = { console, setInterval() {}, clearInterval() {} };
     context.window = context;
@@ -11774,7 +13137,7 @@ test('Auto MTP validates model/runtime compatibility at real model startup and f
                 pendingStreams: new Map(),
                 logLines: [],
                 transport: {},
-                resolveModelSelection() { return { local: { id: 'model', path: 'model.gguf', mtp: mtpModel().mtp } }; },
+                async resolveModelSelectionAsync() { return { local: { id: 'model', path: 'model.gguf', mtp: mtpModel().mtp } }; },
                 async stopProcessOnly() {},
                 async detectCapabilities() { return capabilities(); },
                 buildLegacyArgs(candidate) { return candidate.mtp?.enabled ? ['--spec-type', 'draft-mtp'] : ['--model', 'model.gguf']; },
@@ -11812,6 +13175,7 @@ TEST_FACTORIES.set("backend/Dev/tests/multi-gpu-loading-mode-regression.test.js"
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
@@ -11869,15 +13233,18 @@ function loadServerDefinition() {
     const controls = {
         escapeHtml(value) { return String(value ?? ''); },
         numberInput(label, value, _nodeId, param) { return `[number:${label}:${value}:${param}]`; },
+        slider(label, value, _min, _max, _step, _decimals, _nodeId, param) { return `[slider:${label}:${value}:${param}]`; },
+        textInput(label, value, _nodeId, param) { return `[text:${label}:${value}:${param}]`; },
         select(label, value, _nodeId, param, options) {
             return `[select:${label}:${value}:${param}:${options.map((option) => option.value).join(',')}]`;
         },
         booleanSelect(label, value, _nodeId, param) { return `[boolean:${label}:${value}:${param}]`; },
         status() { return '[status]'; },
+        group(title, _description, content) { return `[group:${title}]${String(content || '')}[/group]`; },
     };
     const nodes = {
         controls,
-        PORT_TYPES: { SERVER: 'server' },
+        PORT_TYPES: { SERVER: 'server', MODEL_CONFIG: 'MODEL_CONFIG', MODEL: 'MODEL', SAMPLER_PARAMETERS: 'SAMPLER_PARAMETERS' },
         builtinCommon: {
             baseNode(def, nodeId, x, y, extra) {
                 return { id: nodeId, type: def.id, x, y, ...extra };
@@ -11900,7 +13267,7 @@ function loadServerDefinition() {
     sandbox.globalThis = sandbox;
     const file = path.join(root, 'backend', 'renderer', 'nodes', 'builtin', 'load-server.js');
     vm.runInNewContext(fs.readFileSync(file, 'utf8'), vm.createContext(sandbox), { filename: file });
-    assert.ok(definition, 'Load Server definition must register');
+    assert.ok(definition, 'GGUF Server definition must register');
     return definition;
 }
 
@@ -11920,15 +13287,283 @@ test('LlamaRuntime constructor binds backend runtime helpers and can switch idle
     assert.equal(runtime.binDir, path.join(root, 'backend', 'bin', 'backends', 'cpu'));
 });
 
-test('Load Server puts the llama.cpp backend selector first and defaults existing workflows to CUDA', () => {
+test('GGUF Server resolves selected-model context metadata once per selection and never queries from slider input', async () => {
+    let definition = null;
+    const inspectCalls = [];
+    const modelRecords = {
+        'model-a': { id: 'model-a', displayName: 'Model A', contextLength: 32768, layerCount: 32 },
+        'model-b': { id: 'model-b', displayName: 'Model B', contextLength: 65536, layerCount: 40 },
+    };
+    const controls = {
+        escapeHtml(value) { return String(value ?? ''); },
+        numberInput() { return ''; }, slider() { return ''; }, textInput() { return ''; }, select() { return ''; }, booleanSelect() { return ''; }, status() { return ''; },
+        group(_title, _description, content) { return String(content || ''); },
+    };
+    let sandbox = null;
+    const bridge = {
+        async inspectModel(modelId) {
+            inspectCalls.push(modelId);
+            return { success: true, model: structuredClone(modelRecords[modelId] || null) };
+        },
+    };
+    const nodes = {
+        controls,
+        PORT_TYPES: { MODEL_CONFIG: 'MODEL_CONFIG', MODEL: 'MODEL' },
+        builtinCommon: {
+            baseNode(def, nodeId, x, y, extra) { return { id: nodeId, type: def.id, x, y, ...extra }; },
+            getLlamaBridge() { return bridge; },
+            cacheModelRecord(record) {
+                const inventory = sandbox.Darkstar.modelInventory;
+                const index = inventory.findIndex((candidate) => candidate.id === record.id);
+                if (index >= 0) inventory[index] = structuredClone(record);
+                else inventory.push(structuredClone(record));
+                return record;
+            },
+        },
+        registerNode(value) { definition = value; },
+    };
+    sandbox = {
+        Darkstar: { nodes, modelInventory: [] },
+        nodeEditorState: { nodes: [], connections: [] },
+        document: { getElementById() { return null; }, createElement() { return {}; } },
+        console, Set, Array, String, Number, Promise, Object,
+    };
+    sandbox.globalThis = sandbox;
+    sandbox.window = sandbox;
+    const file = path.join(root, 'backend', 'renderer', 'nodes', 'builtin', 'load-server.js');
+    vm.runInNewContext(fs.readFileSync(file, 'utf8'), vm.createContext(sandbox), { filename: file });
+    assert.ok(definition);
+
+    const loader = { id: 1, type: 'modelLoader', selectedModel: 'model-a' };
+    const server = definition.factory(2, 0, 0);
+    server.params.backend = 'cpu';
+    sandbox.nodeEditorState.nodes = [loader, server];
+    sandbox.nodeEditorState.connections = [{ fromNode: 1, fromSocket: 'model', toNode: 2, toSocket: 'model' }];
+
+    assert.equal(definition.getParameterDisplayValue(server, 'contextPercent'), 'Reading context limit…');
+    const loadingHtml = definition.buildContentHTML(server);
+    assert.match(loadingHtml, /value="100" disabled/u, 'metadata loading must preserve the saved 100% slider position instead of forcing the control to its minimum');
+
+    await definition.onMount(server);
+    assert.deepEqual(inspectCalls, [], 'mounting before startup metadata resolution must not issue its own selected-model query');
+    assert.equal(definition.getParameterDisplayValue(server, 'contextPercent'), 'Reading context limit…');
+    await nodes.refreshLoadServerGpuLayerLimits({ resetGpuLayers: false, queryModelMetadata: true });
+    assert.deepEqual(inspectCalls, ['model-a']);
+    assert.equal(definition.getParameterDisplayValue(server, 'contextPercent'), '100% · 32,768');
+
+    sandbox.Darkstar.modelInventory = [];
+    for (const percent of [10, 100, 20, 90, 30, 80]) {
+        server.params.contextPercent = percent;
+        definition.onParameterChange(server, 'contextPercent', percent);
+        assert.equal(definition.getParameterDisplayValue(server, 'contextPercent'), `${percent}% · ${Math.floor(32768 * percent / 100).toLocaleString('en-US')}`,
+            'slider input must consume the already-resolved selected-model metadata without performing inventory or IPC queries');
+    }
+    assert.deepEqual(inspectCalls, ['model-a'], 'rapid slider input must never re-query model metadata');
+    await definition.onMount(server);
+    assert.deepEqual(inspectCalls, ['model-a'], 'rerender/mount of the same resolved model must not re-query metadata');
+
+    loader.selectedModel = 'model-b';
+    await nodes.refreshLoadServerGpuLayerLimits({ changedLoaderId: 1, previousModelId: 'model-a', modelId: 'model-b', resetGpuLayers: true, queryModelMetadata: true });
+    assert.deepEqual(inspectCalls, ['model-a', 'model-b'], 'changing the selected model must perform exactly one targeted metadata query for the new model');
+    assert.equal(definition.getParameterDisplayValue(server, 'contextPercent'), '80% · 52,428');
+});
+
+test('renderer startup primes model-dependent metadata after workflow restoration and initial inventory completion', () => {
+    const initSource = fs.readFileSync(path.join(root, 'backend', 'renderer', 'init.js'), 'utf8');
+    const controlsSource = fs.readFileSync(path.join(root, 'backend', 'renderer', 'nodes', 'editor', 'controls.js'), 'utf8');
+    assert.match(initSource, /await initialModelInventoryPromise;[\s\S]*?await refreshModelDependentNodeControls\(\{ resetGpuLayers: false, queryModelMetadata: true \}\)/u,
+        'the pre-selected workflow model must be resolved after both workflow restore and startup inventory are available');
+    assert.match(controlsSource, /function refreshModelDependentNodeControls\(options\)[\s\S]*?return Promise\.resolve\(namespace\.refreshLoadServerGpuLayerLimits/u,
+        'startup must be able to await completion of the selected-model metadata refresh');
+});
+
+test('GGUF Server puts the backend selector first in the Runtime settings group and defaults existing workflows to CUDA', () => {
     const definition = loadServerDefinition();
     const node = definition.factory('server-backend', 10, 20);
     assert.equal(node.params.backend, 'cuda');
+    assert.equal(node.uiWidth, 760);
     const html = definition.buildContentHTML(node);
-    assert.ok(html.startsWith('[select:llama.cpp backend:cuda:backend:cuda,vulkan,cpu]'), 'backend selector must be the first Load Server control');
+    assert.match(html, /^<div class="load-server-settings">\[group:Runtime\]\[select:llama\.cpp backend:cuda:backend:cuda,vulkan,cpu\]/u,
+        'backend selector must remain the first Runtime preference');
 });
 
-test('Load Server backend-specific controls never expose CUDA selection for Vulkan or CPU', () => {
+test('GGUF Server presents Runtime, Memory, Acceleration, and Performance in deliberate order', () => {
+    const definition = loadServerDefinition();
+    const node = definition.factory('server-settings-groups', 10, 20);
+    const html = definition.buildContentHTML(node);
+    const runtimeAt = html.indexOf('[group:Runtime]');
+    const memoryAt = html.indexOf('[group:Memory]');
+    const accelerationAt = html.indexOf('[group:Acceleration]');
+    const performanceAt = html.indexOf('[group:Performance]');
+    const threadsAt = html.indexOf('[number:Threads (0 = auto):0:threads]');
+    const mtpSelectorAt = html.indexOf('[select:MTP:auto:mtpMode:auto,on,off]');
+    const capabilityAt = html.indexOf('MTP capability');
+    assert.ok(runtimeAt >= 0 && memoryAt > runtimeAt && accelerationAt > memoryAt && performanceAt > accelerationAt,
+        'semantic groups must follow the Settings information architecture');
+    assert.ok(threadsAt > performanceAt, 'Threads belongs to Performance');
+    assert.ok(mtpSelectorAt > threadsAt, 'MTP follows the primary performance controls');
+    assert.ok(capabilityAt > mtpSelectorAt, 'MTP capability follows the MTP selector');
+    assert.match(html.slice(runtimeAt, memoryAt), /Context size/u, 'Context size remains in Runtime because GGUF Server owns runtime context allocation');
+    assert.doesNotMatch(html, /Reasoning Effort|Seed \(-1 = random\)|Temperature|Sampler chain/u,
+        'request-time sampling remains exclusive to LM Sampler');
+    assert.doesNotMatch(html, /load-server-control-column|load-server-runtime-tower|load-server-continuation-tower/u,
+        'the old node-era two-column presentation must stay removed');
+});
+
+
+test('Set Diffusion Backend reuses browser presentation without sharing language-model history', () => {
+    const customRenderer = fs.readFileSync(path.join(root, 'custom_nodes', 'diffusion-backend-gguf', 'renderer.js'), 'utf8');
+    const customBackend = fs.readFileSync(path.join(root, 'custom_nodes', 'diffusion-backend-gguf', 'backend.js'), 'utf8');
+    const nodeEditorCss = fs.readFileSync(path.join(root, 'backend', 'renderer', 'node-editor.css'), 'utf8');
+    const editorControls = fs.readFileSync(path.join(root, 'backend', 'renderer', 'nodes', 'editor', 'controls.js'), 'utf8');
+    const builtinCommon = fs.readFileSync(path.join(root, 'backend', 'renderer', 'nodes', 'builtin', 'common.js'), 'utf8');
+    const loadModel = fs.readFileSync(path.join(root, 'backend', 'renderer', 'nodes', 'builtin', 'load-model.js'), 'utf8');
+
+    assert.match(builtinCommon, /function localBrowseField\(dropdownHtml, nodeId, action, label\)/u,
+        'the local GGUF browser field must have one shared implementation');
+    assert.match(loadModel, /common\.localBrowseField\(common\.modelDropdown\(node\), node\.id, 'browse-local-model', 'Model'\)/u,
+        'Invoke Language Model must use the shared browser field');
+    assert.match(customRenderer, /controls\.dropdown\('Diffusion GGUF', p\.diffusionModelPath[\s\S]*?common\.localBrowseField\(dropdown, node\.id, 'browse-local-diffusion', 'Diffusion GGUF'\)/u,
+        'Set Diffusion Backend must use the same dropdown + ellipsis field');
+    assert.match(customRenderer, /\.ds-diffusion-backend\{[^}]*min-width:0;[^}]*width:100%;[^}]*max-width:none/u,
+        'the diffusion body must shrink inside the node content column instead of overflowing beneath the output rail');
+    assert.doesNotMatch(customRenderer, /\.ds-diffusion-backend\{[^}]*min-width:455px/u,
+        'the obsolete fixed inner minimum width made the visible ellipsis sit underneath the output-rail hitbox');
+    assert.match(nodeEditorCss, /\.node-editor-view \.node-ports-right \{ pointer-events: none; \}/u,
+        'the transparent output rail must never intercept clicks intended for node controls');
+    assert.match(nodeEditorCss, /\.node-editor-view \.node-ports-right \.socket-point \{ pointer-events: auto; \}/u,
+        'output sockets must remain directly interactive after making the rail pointer-transparent');
+    assert.match(editorControls, /browserKind === 'model' \|\| browserKind === 'diffusion'[\s\S]*?browserKind === 'diffusion' \? window\.Darkstar\.diffusionModelFiles : window\.Darkstar\.modelFiles/u,
+        'model and diffusion GGUF browsing may share modal implementation but must use distinct browser modes');
+    assert.doesNotMatch(customRenderer, /common\.listModelOptions\(/u,
+        'diffusion model history must never be populated from the Invoke Language Model inventory');
+    assert.match(customRenderer, /root\.Darkstar\.diffusionModelInventory/u,
+        'Set Diffusion Backend must render only its dedicated diffusion-model history');
+    assert.doesNotMatch(customRenderer, /textInput\('Diffusion GGUF path'|node-file-drop-zone|Drop a \.gguf|openGgufBrowser|onFilesDropped/u,
+        'the diffusion node must not expose a manual path, custom browser, or GGUF drop target');
+    assert.doesNotMatch(customRenderer, /Tensor catalog|tensorsHtml\(/u,
+        'Set Diffusion Backend must keep tensor descriptors internal instead of rendering the Tensor Catalog section');
+    assert.doesNotMatch(customRenderer, /ds-companion-panel|ds-companion-heading|Pipeline companions/u,
+        'encoder/VAE companion controls must be seamless fields, not a separately styled or user-collapsible Pipeline companions section');
+    assert.match(customRenderer, /function companionFieldsHtml\(node, analysis\)[\s\S]*?if \(!external\.length\) return '';[\s\S]*?<div class="ds-companion-fields">/u,
+        'companion controls must appear only when the detected pipeline exposes external encoder/VAE roles');
+    assert.match(customRenderer, /controls\.group\('Diffusion model',[\s\S]*?diffusionModelPicker\(node\)\)/u,
+        'the primary diffusion selector must use the shared Settings grouping system');
+    assert.match(customRenderer, /if \(companions\) html \+= controls\.group\('Pipeline components'/u,
+        'conditional companion fields must appear as a semantic Settings group only when required');
+    assert.match(customRenderer, /if \(analysis\) html \+= controls\.group\('Inspection'/u,
+        'verbose model inspection belongs in its own semantic Settings group');
+    assert.doesNotMatch(customRenderer, /ds-companion-grid|ds-companion-browser-field|ds-diffusion-path-note/u,
+        'the diffusion package must not reintroduce private two-column or ad-hoc field layouts');
+    assert.match(customRenderer, /\.ds-diffusion-chip\{[^}]*border-right:[^}]*\}/u);
+    assert.doesNotMatch(customRenderer, /\.ds-diffusion-chip\{[^}]*border-radius|\.ds-diffusion-section\{[^}]*border-radius:(?!0)/u,
+        'inspection metrics and disclosure rows must be flat Settings content, not nested cards');
+    assert.doesNotMatch(customRenderer, /Analyze \/ Rescan|controls\.button\('Clear'/u,
+        'diffusion analysis must be automatic and the obsolete Analyze / Rescan and Clear buttons must not exist');
+    assert.match(customRenderer, /onParameterChange:[\s\S]*?if \(p\.diffusionModelPath\) automaticallyAnalyze\(node, p\.diffusionModelPath\)/u,
+        'changing the selected diffusion GGUF must immediately start automatic analysis');
+    assert.match(customRenderer, /<details class="ds-diffusion-section"><summary><span>Resolved pipeline paths<\/span>/u,
+        'Resolved pipeline paths must remain available but start collapsed');
+    assert.match(customRenderer, /<details class="ds-diffusion-section"><summary><span>Model analysis<\/span>/u,
+        'Model analysis must remain available but start collapsed');
+    assert.match(customRenderer, /<details class="ds-diffusion-section"><summary><span>GGUF metadata<\/span>/u,
+        'GGUF metadata must remain available but start collapsed');
+    assert.doesNotMatch(customRenderer, /<details class="ds-diffusion-section" open>/u,
+        'verbose autodetected diagnostic sections must not be expanded by default');
+    assert.match(customBackend, /tensors/u,
+        'removing Tensor Catalog visibility must not remove tensor analysis used by backend model detection');
+    assert.doesNotMatch(customBackend, /operations:\s*\{[^}]*browse/u,
+        'the diffusion plugin must not retain its obsolete parallel filesystem-browser backend');
+});
+
+test('Set Diffusion Backend auto-selects unique same-directory LLM encoder and VAE companions', (t) => {
+    const { sameDirectoryCompanionScan } = require(path.join(root, 'custom_nodes', 'diffusion-backend-gguf', 'backend.js'))._test;
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-diffusion-companions-'));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    const diffusionPath = path.join(directory, 'qwen-image-diffusion.gguf');
+    fs.writeFileSync(diffusionPath, 'fixture');
+
+    function writeSafetensors(filePath, metadata, tensors) {
+        const header = JSON.stringify(Object.assign({ __metadata__: metadata }, tensors));
+        const bytes = Buffer.from(header, 'utf8');
+        const prefix = Buffer.alloc(8);
+        prefix.writeBigUInt64LE(BigInt(bytes.length));
+        fs.writeFileSync(filePath, Buffer.concat([prefix, bytes]));
+    }
+
+    const llmPath = path.join(directory, 'qwen_text_encoder.safetensors');
+    writeSafetensors(llmPath, { 'general.architecture': 'qwen3' }, {
+        'model.embed_tokens.weight': { dtype: 'F16', shape: [151936, 4096] },
+        'model.layers.0.self_attn.q_proj.weight': { dtype: 'F16', shape: [4096, 4096] },
+    });
+    const vaePath = path.join(directory, 'image_vae.safetensors');
+    writeSafetensors(vaePath, {}, {
+        'encoder.conv_in.weight': { dtype: 'F16', shape: [128, 16, 3, 3] },
+        'decoder.conv_out.weight': { dtype: 'F16', shape: [3, 128, 3, 3] },
+        'post_quant_conv.weight': { dtype: 'F16', shape: [16, 16, 1, 1] },
+    });
+
+    const scan = sameDirectoryCompanionScan(diffusionPath, { family: 'Qwen Image', variant: '' });
+    assert.equal(scan.autoSelections.llmPath, llmPath);
+    assert.equal(scan.autoSelections.vaePath, vaePath);
+    assert.equal(scan.directory, directory);
+});
+
+test('Set Diffusion Backend automatically analyzes selections without manual action controls', async () => {
+    const source = fs.readFileSync(path.join(root, 'custom_nodes', 'diffusion-backend-gguf', 'renderer.js'), 'utf8');
+    let definition = null;
+    const operations = [];
+    const controls = {
+        escapeHtml(value) { return String(value == null ? '' : value); },
+        dropdown() { return '<div class="dropdown"></div>'; },
+        button(label) { return '<button>' + label + '</button>'; },
+        status(node) { return '<div class="status">' + String(node.statusMessage || '') + '</div>'; },
+        group(title, _description, content) { return '<section data-group="' + String(title) + '">' + String(content || '') + '</section>'; },
+    };
+    const sandbox = {
+        console, Map, Promise, setTimeout, clearTimeout,
+        Darkstar: { nodes: {
+            controls,
+            builtinCommon: {
+                listModelOptions(selected) { return [{ value: '', label: 'None' }, { value: selected, label: 'selected.gguf' }]; },
+                localBrowseField(html) { return '<div class="browser-field">' + html + '<button class="ellipsis">⋯</button></div>'; },
+            },
+            registerNode(value) { definition = value; },
+            async invokeBackend(_pluginId, operation, payload) {
+                operations.push([operation, payload]);
+                if (operation === 'analyze') return {
+                    schemaVersion: 1, path: payload.path, fileSizeDisplay: '1 GB',
+                    identity: { family: 'Flux', variant: '' }, gguf: { tensorCount: 1 },
+                    structure: {}, paths: {}, requirements: [], embeddedComponents: [], metadata: [],
+                };
+                if (operation === 'scanCompanions') return { candidates: [], autoSelections: {}, requirements: [] };
+                throw new Error('Unexpected backend operation: ' + operation);
+            },
+        } },
+        rerenderNode() {},
+        scheduleWorkflowSessionSave() {},
+    };
+    sandbox.window = sandbox;
+    sandbox.globalThis = sandbox;
+    vm.runInNewContext(source, vm.createContext(sandbox), { filename: 'custom_nodes/diffusion-backend-gguf/renderer.js' });
+    assert.ok(definition);
+
+    const node = definition.factory(7, 0, 0);
+    const initialHtml = definition.buildContentHTML(node);
+    assert.doesNotMatch(initialHtml, /Analyze \/ Rescan|>Clear</u);
+
+    node.params.diffusionModelPath = 'C:\\Models\\image.gguf';
+    definition.onParameterChange(node, 'diffusionModelPath');
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(operations.map(([operation]) => operation), ['analyze', 'scanCompanions']);
+    assert.equal(node.runtime.analysis.path, 'C:\\Models\\image.gguf');
+    assert.equal(node.status, 'active');
+    assert.match(node.statusMessage, /Flux/u);
+});
+
+test('GGUF Server backend-specific controls never expose CUDA selection for Vulkan or CPU', () => {
     const definition = loadServerDefinition();
     const vulkan = definition.factory('server-vulkan', 10, 20);
     vulkan.params.backend = 'vulkan';
@@ -12026,7 +13661,7 @@ test('server lifecycle selects the requested runtime before capability detection
     await exercise('vulkan');
 });
 
-test('Load Server defaults Multi-GPU loading to Sequential and renders both dropdown choices', () => {
+test('GGUF Server defaults Multi-GPU loading to Sequential and renders both dropdown choices', () => {
     const definition = loadServerDefinition();
     const node = definition.factory('server-1', 10, 20);
     assert.equal(node.params.multiGpuMode, 'sequential');
@@ -12034,7 +13669,7 @@ test('Load Server defaults Multi-GPU loading to Sequential and renders both drop
     assert.match(html, /\[select:Multi-GPU loading:sequential:multiGpuMode:sequential,parallel\]/u);
 });
 
-test('Load Server normalization preserves Parallel but migrates missing/invalid values to Sequential', () => {
+test('GGUF Server normalization preserves Parallel but migrates missing/invalid values to Sequential', () => {
     const definition = loadServerDefinition();
     const missing = { id: 'missing', params: {}, runtime: {} };
     definition.normalizeNode(missing);
@@ -12302,7 +13937,7 @@ test('legacy Parallel OOM retry refreshes VRAM and launches with a more conserva
         pendingStreams: new Map(),
         logLines: [],
         transport: {},
-        resolveModelSelection() { return { local: { id: 'model', path: 'model.gguf' } }; },
+        async resolveModelSelectionAsync() { return { local: { id: 'model', path: 'model.gguf' } }; },
         async stopProcessOnly() {},
         async detectCapabilities() { return modernCapabilities; },
         buildLegacyArgs(config) { return ['--tensor-split', config.tensorSplit]; },
@@ -12343,7 +13978,7 @@ test('legacy Parallel OOM retry refreshes VRAM and launches with a more conserva
     assert.ok(result.memoryFallback.changes.tensorSplit);
 });
 
-test('Load Server computes the heterogeneous tensor plan before any Parallel process can start', async () => {
+test('GGUF Server computes the heterogeneous tensor plan before any Parallel process can start', async () => {
     const { startServer } = require('../../runtime/server-process');
     const runtime = {
         process: null,
@@ -12451,6 +14086,7 @@ function runtimeContext() {
         syncProjectComposerGate() {},
         syncComposerControls() {},
         rerenderNode() {},
+        getNodeDef() { return null; },
         globalThis: null,
         window: null,
     };
@@ -12462,7 +14098,7 @@ function runtimeContext() {
     return { context, unloadCalls, invalidations: () => invalidations };
 }
 
-test('runtime-owning node edits defer model unload until Nodes -> Chat, with Sampler limited to context size', async () => {
+test('runtime-owning node edits defer model unload until Nodes -> Chat, with GGUF Server context sizing runtime-affecting and L_Sampler request-time only', async () => {
     const { context, unloadCalls, invalidations } = runtimeContext();
 
     const control = { type: 'control', params: { nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: false } };
@@ -12482,10 +14118,27 @@ test('runtime-owning node edits defer model unload until Nodes -> Chat, with Sam
     assert.equal(invalidations(), 1, 'successful model unload must invalidate and unblock the context contract');
 
     context.nodeRuntimeUnloadPending = false;
-    const server = { type: 'loadServer', params: { parallel: 1, futureServerSetting: false } };
+    const server = { type: 'loadServer', params: { parallel: 1, contextSize: '8192', contextPercent: 50, futureServerSetting: false } };
     before = context.nodeRuntimeUnloadRelevantSignature(server);
-    server.params.futureServerSetting = true;
-    assert.equal(context.noteNodeRuntimeConfigMutation(server, before), true, 'the whole Load Server params object is protected');
+    server.params.parallel = 2;
+    assert.equal(context.noteNodeRuntimeConfigMutation(server, before), true,
+        'GGUF Server runtime settings must still defer unload because they change llama.cpp process configuration');
+
+    context.nodeRuntimeUnloadPending = false;
+    before = context.nodeRuntimeUnloadRelevantSignature(server);
+    server.params.contextPercent = 100;
+    server.params.contextSize = '16384';
+    assert.equal(context.noteNodeRuntimeConfigMutation(server, before), true,
+        'GGUF Server Context size changes must defer an unload because they change llama.cpp runtime allocation');
+
+    context.nodeRuntimeUnloadPending = false;
+    const localSampler = { type: 'localSampler', params: { reasoning: 'auto', temperature: 0.6, topP: 0.95 } };
+    before = context.nodeRuntimeUnloadRelevantSignature(localSampler);
+    localSampler.params.reasoning = 'on';
+    localSampler.params.temperature = 0.9;
+    assert.equal(context.noteNodeRuntimeConfigMutation(localSampler, before), false,
+        'L_Sampler Reasoning Effort and request-time sampling changes must never unload or restart the loaded runtime');
+    assert.equal(context.nodeRuntimeUnloadPending, false);
 
     context.nodeRuntimeUnloadPending = false;
     const contextNode = { type: 'context', params: { systemPrompt: '', includeHistory: true } };
@@ -12494,15 +14147,11 @@ test('runtime-owning node edits defer model unload until Nodes -> Chat, with Sam
     assert.equal(context.noteNodeRuntimeConfigMutation(contextNode, before), true, 'the whole Context params object is protected');
 
     context.nodeRuntimeUnloadPending = false;
-    const sampler = { type: 'sampler', params: { contextSize: 20000, temperature: 0.6 } };
+    const sampler = { type: 'sampler', params: { stop: '' } };
     before = context.nodeRuntimeUnloadRelevantSignature(sampler);
-    sampler.params.temperature = 0.9;
-    assert.equal(context.noteNodeRuntimeConfigMutation(sampler, before), false, 'ordinary KSampler tuning must not unload the model');
+    sampler.params.stop = 'END';
+    assert.equal(context.noteNodeRuntimeConfigMutation(sampler, before), false, 'Orchestrator termination controls must not unload the model');
     assert.equal(context.nodeRuntimeUnloadPending, false);
-
-    before = context.nodeRuntimeUnloadRelevantSignature(sampler);
-    sampler.params.contextSize = 32000;
-    assert.equal(context.noteNodeRuntimeConfigMutation(sampler, before), true, 'KSampler context-size changes must defer an unload');
 
     const loader = context.nodeEditorState.nodes[0];
     loader.params = { projectorPath: 'C:\\Models\\vision-a.mmproj', projectorSource: 'manual' };
@@ -12516,9 +14165,9 @@ test('runtime-owning node edits defer model unload until Nodes -> Chat, with Sam
     assert.equal(context.setNodeParamValue(loader.id, 'projectorPath', 'string', ''), true);
     assert.equal(context.nodeRuntimeUnloadPending, true, 'selecting No Projector must dirty a runtime that had a projector');
 
-    const skills = { id: 7, type: 'skills', params: { skills: [{ path: 'C:\\Skills\\alpha\\SKILL.md' }] }, status: 'active', statusMessage: '' };
+    const skills = { id: 7, type: 'tools', params: { providers: [], skills: [{ path: 'C:\\Skills\\alpha\\SKILL.md' }] }, status: 'active', statusMessage: '' };
     context.nodeEditorState.nodes.push(skills);
-    context.getNodeDef = (type) => type === 'skills' ? {
+    context.getNodeDef = (type) => type === 'tools' ? {
         async onAction(node, action) {
             if (action === 'add-skill-file') node.params.skills.push({ path: 'C:\\Skills\\beta\\SKILL.md' });
             if (action === 'remove-skill-file:1') node.params.skills.splice(1, 1);
@@ -13045,6 +14694,28 @@ test('each chat tab owns a distinct live BrowserView and switching tabs restores
     await service.destroy();
 });
 
+test('Internet Access off tears down online hosts and Core rejects model online navigation until re-enabled', async () => {
+    const { service } = fixture();
+    service.activate('11');
+    const record = service.sessions.get('11');
+    await service.controlBrowser({ action: 'open', url: 'https://example.com' }, { browserId: '11', workspaceId: 'workspace-11' });
+    assert.equal(record.service.mode, 'online');
+
+    const disabled = await service.setInternetAccess(false);
+    assert.deepEqual(disabled, { enabled: false });
+    assert.equal(record.service.mode, 'offline', 'disabling internet must immediately return every live tab to the offline browser');
+    assert.equal(record.service.online.destroyed, true, 'disabling internet must terminate any isolated online-browser host');
+    await assert.rejects(
+        service.controlBrowser({ action: 'open', url: 'https://example.com' }, { browserId: '11', workspaceId: 'workspace-11' }),
+        (error) => error && error.code === 'INTERNET_ACCESS_DISABLED'
+    );
+
+    await service.setInternetAccess(true);
+    await service.controlBrowser({ action: 'open', url: 'https://example.org' }, { browserId: '11', workspaceId: 'workspace-11' });
+    assert.equal(record.service.mode, 'online');
+    await service.destroy();
+});
+
 test('browser work routed to an inactive tab stays in that tab and cannot replace the active tab browser', async () => {
     const { service, window } = fixture();
 
@@ -13361,13 +15032,14 @@ test('single-instance window handoff restores, shows, and focuses the existing D
         'destroyed windows must never be targeted by a second-instance handoff');
 });
 
-test('main app acquires Electron single-instance lock before runtime services and focuses the primary on relaunch', () => {
+test('main app acquires Electron single-instance lock before lazy runtime services and focuses the primary on relaunch', () => {
     const source = fs.readFileSync(path.join(ROOT, 'backend', 'app', 'run-main-app.js'), 'utf8');
     const identity = source.indexOf('configureWindowsAppIdentity(app);');
     const lock = source.indexOf('app.requestSingleInstanceLock()');
-    const services = source.indexOf('const services = createRuntimeServices');
-    assert.ok(identity >= 0 && lock > identity && services > lock,
-        'Windows app identity and single-instance ownership must be established before Darkstar initializes runtime services');
+    const serviceOwner = source.indexOf('const ensureRuntimeServices = () =>');
+    const serviceCreation = source.indexOf('services = createRuntimeServices', serviceOwner);
+    assert.ok(identity >= 0 && lock > identity && serviceOwner > lock && serviceCreation > serviceOwner,
+        'Windows app identity and single-instance ownership must be established before Darkstar can lazily initialize runtime services');
     assert.match(source, /if \(typeof app\.requestSingleInstanceLock === 'function' && !app\.requestSingleInstanceLock\(\)\) \{[\s\S]*?app\.quit\(\);[\s\S]*?return null;/u,
         'secondary launches must quit before constructing another Darkstar app instance');
     assert.match(source, /app\.on\('second-instance', \(\) => \{ focusPrimaryWindow\(\); \}\);/u,
@@ -13405,13 +15077,14 @@ test('application power guard requests prevent-app-suspension exactly once and r
     assert.equal(guard.id, null);
 });
 
-test('power protection is wired to app readiness/quit and does not use display-sleep prevention', () => {
+test('power protection starts with the main application handoff and stops on quit without preventing display sleep', () => {
     const source = fs.readFileSync(path.join(ROOT, 'backend', 'app', 'run-main-app.js'), 'utf8');
-    const ready = source.indexOf("app.whenReady().then(() => {");
-    const start = source.indexOf('powerProtection.start();', ready);
-    const windowOpen = source.indexOf('openMainWindow();', ready);
-    assert.ok(ready >= 0 && start > ready && start < windowOpen,
-        'power protection must be active before the main window begins work');
+    const startOwner = source.indexOf('const startMainApplication = () => {');
+    const start = source.indexOf('powerProtection.start();', startOwner);
+    const register = source.indexOf('registerIpc();', startOwner);
+    const windowOpen = source.indexOf('openMainWindow();', startOwner);
+    assert.ok(startOwner >= 0 && start > startOwner && register > start && windowOpen > register,
+        'power protection must activate before IPC/runtime startup and main-window work');
     assert.match(source, /app\.on\('will-quit', \(\) => powerProtection\.stop\(\)\)/u);
     assert.doesNotMatch(source, /prevent-display-sleep/u,
         'Darkstar should not keep the monitor awake; only application suspension should be blocked');
@@ -13635,6 +15308,24 @@ function evaluate(context, expression) {
     return vm.runInContext(expression, context);
 }
 
+
+test('filesystem reconciliation preserves restored external projects that are not children of the managed projects root', async () => {
+    const { context } = createContext();
+    evaluate(context, `
+        projects = [{ id: 7, title: 'External Workspace', activeTabId: 70 }];
+        tabs = [{ id: 70, projectId: 7, title: 'Existing chat', history: [{ role: 'user', content: 'keep me' }], tokens: 0, scheduled: [], userScrolledUp: false }];
+        activeProjectId = 7; activeTabId = 70; nextProjectId = 8; nextTabId = 71;
+        workspaceStateForProject(7).root = { path: 'D:/External Workspace', name: 'External Workspace' };
+        darkstar = { workspace: { listProjects: async function() { return { success: true, rootPath: 'C:/Darkstar/projects', projects: [{ name: 'Managed', path: 'C:/Darkstar/projects/Managed' }] }; } } };
+        renderProjects = function() {}; renderTabs = function() {}; renderChat = function() {};
+        updateTokenCounter = function() {}; renderQueue = function() {}; syncProjectComposerGate = function() {};
+        scheduleChatSessionSave = function() {}; generationSessionForTab = function() { return null; };
+    `);
+    await evaluate(context, 'synchronizeProjectsFromFilesystem({ attachMissingRoots: false })');
+    assert.equal(evaluate(context, 'Boolean(getProjectById(7))'), true, 'external project must survive managed-folder reconciliation');
+    assert.equal(evaluate(context, 'tabsForProject(7)[0].history[0].content'), 'keep me');
+});
+
 test('tabs remain globally stable while the tab bar ownership moves with the active project', () => {
     const { context } = createContext();
     evaluate(context, `
@@ -13774,6 +15465,165 @@ test('new tabs are created inside the active project and per-project tab limits 
     assert.equal(evaluate(context, 'getActiveProject().activeTabId'), evaluate(context, 'activeTabId'));
 });
 
+
+test('tabs can be reordered within a project and the persisted array order follows the visual order', () => {
+    const { context } = createContext();
+    vm.runInContext(source('backend/renderer/tabs.js'), context, { filename: 'tabs.js' });
+    evaluate(context, `
+        projects = [{ id: 0, title: 'Alpha', activeTabId: 1 }];
+        activeProjectId = 0; activeTabId = 1;
+        tabs = [
+            { id: 1, projectId: 0, title: 'One', history: [], tokens: 0, scheduled: [], userScrolledUp: false },
+            { id: 2, projectId: 0, title: 'Two', history: [], tokens: 0, scheduled: [], userScrolledUp: false },
+            { id: 3, projectId: 0, title: 'Three', history: [], tokens: 0, scheduled: [], userScrolledUp: false }
+        ];
+        renderTabs = function() {};
+        globalThis.__saveCount = 0;
+        scheduleChatSessionSave = function() { globalThis.__saveCount += 1; };
+    `);
+    assert.equal(evaluate(context, 'reorderTabWithinProject(3, 0)'), true);
+    assert.deepEqual(Array.from(evaluate(context, 'tabsForProject(0).map(function(tab) { return tab.id; })')), [3, 1, 2]);
+    assert.equal(evaluate(context, 'activeTabId'), 1, 'reordering must not change the active conversation');
+    assert.equal(evaluate(context, '__saveCount'), 1, 'reordering must persist immediately');
+});
+
+test('moving a tab between projects preserves conversation state without opening the destination', () => {
+    const { context } = createContext();
+    vm.runInContext(source('backend/renderer/tabs.js'), context, { filename: 'tabs.js' });
+    evaluate(context, `
+        projects = [
+            { id: 0, title: 'Alpha', activeTabId: 1 },
+            { id: 1, title: 'Beta', activeTabId: 3 }
+        ];
+        activeProjectId = 0; activeTabId = 1; nextTabId = 4;
+        tabs = [
+            { id: 1, projectId: 0, title: 'Alpha 1', history: [], tokens: 0, scheduled: [], userScrolledUp: false, composerDraft: { text: '', image: null } },
+            { id: 2, projectId: 0, title: 'Keep me', history: [{ role: 'user', content: 'history' }], tokens: 12, scheduled: [{ id: 'later', text: 'follow up', order: 1, tabId: 2 }], userScrolledUp: false, composerDraft: { text: 'draft', image: null } },
+            { id: 3, projectId: 1, title: 'Beta 1', history: [], tokens: 0, scheduled: [], userScrolledUp: false, composerDraft: { text: '', image: null } }
+        ];
+        workspaceStateForProject(0).root = { path: 'C:/Alpha', name: 'Alpha' };
+        workspaceStateForProject(1).root = { path: 'D:/Beta', name: 'Beta' };
+        renderTabs = function() {}; renderProjects = function() {}; renderChat = function() {};
+        renderQueue = function() {}; updateTokenCounter = function() {}; updateButtonStates = function() {};
+        updateScheduleButton = function() {}; playUiSound = function() {};
+        generationSessionForTab = function() { return null; };
+        scheduleChatSessionSave = function() {};
+    `);
+    assert.equal(evaluate(context, 'moveTabToProject(2, 1, 1)'), true);
+    assert.equal(evaluate(context, 'getActiveProject().id'), 0, 'dropping onto another project must not navigate there');
+    assert.equal(evaluate(context, 'activeTabId'), 1, 'moving a background tab must not change the visible conversation');
+    assert.deepEqual(Array.from(evaluate(context, 'tabsForProject(1).map(function(tab) { return tab.id; })')), [3, 2]);
+    assert.equal(evaluate(context, 'getProjectById(0).activeTabId'), 1, 'source selection must remain stable');
+    assert.equal(evaluate(context, 'getProjectById(1).activeTabId'), 3, 'destination selection must remain stable');
+    assert.equal(evaluate(context, 'tabsForProject(1)[1].history[0].content'), 'history');
+    assert.equal(evaluate(context, 'tabsForProject(1)[1].scheduled[0].text'), 'follow up');
+});
+
+test('moving the sole tab out of a project leaves a new blank tab behind', () => {
+    const { context } = createContext();
+    vm.runInContext(source('backend/renderer/tabs.js'), context, { filename: 'tabs.js' });
+    evaluate(context, `
+        projects = [
+            { id: 0, title: 'Alpha', activeTabId: 1 },
+            { id: 1, title: 'Beta', activeTabId: 2 }
+        ];
+        activeProjectId = 0; activeTabId = 1; nextTabId = 3;
+        tabs = [
+            { id: 1, projectId: 0, title: 'Only tab', history: [{ role: 'user', content: 'keep' }], tokens: 1, scheduled: [], userScrolledUp: false, composerDraft: { text: '', image: null } },
+            { id: 2, projectId: 1, title: 'Beta 1', history: [], tokens: 0, scheduled: [], userScrolledUp: false, composerDraft: { text: '', image: null } }
+        ];
+        workspaceStateForProject(0).root = { path: 'C:/Alpha', name: 'Alpha' };
+        workspaceStateForProject(1).root = { path: 'D:/Beta', name: 'Beta' };
+        renderTabs = function() {}; renderProjects = function() {}; renderChat = function() {};
+        renderQueue = function() {}; updateTokenCounter = function() {}; updateButtonStates = function() {};
+        updateScheduleButton = function() {}; playUiSound = function() {};
+        generationSessionForTab = function() { return null; };
+        scheduleChatSessionSave = function() {};
+    `);
+    assert.equal(evaluate(context, 'moveTabToProject(1, 1, 1)'), true);
+    assert.equal(evaluate(context, 'tabsForProject(0).length'), 1);
+    assert.notEqual(evaluate(context, 'tabsForProject(0)[0].id'), 1);
+    assert.equal(evaluate(context, 'tabsForProject(0)[0].history.length'), 0);
+    assert.equal(evaluate(context, 'getActiveProject().id'), 0, 'moving the active tab must keep the current project open');
+    assert.equal(evaluate(context, 'activeTabId'), evaluate(context, 'tabsForProject(0)[0].id'), 'the blank replacement must become the visible source tab');
+    assert.equal(evaluate(context, 'getProjectById(0).activeTabId'), evaluate(context, 'tabsForProject(0)[0].id'));
+    assert.equal(evaluate(context, 'getProjectById(1).activeTabId'), 2, 'destination selection must not be replaced by the moved tab');
+    assert.equal(evaluate(context, 'tabsForProject(1).some(function(tab) { return tab.id === 1; })'), true);
+});
+
+test('cross-project tab moves are blocked while generation ownership is live and pointer dragging stays frame-coalesced', () => {
+    const { context } = createContext();
+    vm.runInContext(source('backend/renderer/tabs.js'), context, { filename: 'tabs.js' });
+    evaluate(context, `
+        projects = [{ id: 0, title: 'Alpha', activeTabId: 1 }, { id: 1, title: 'Beta', activeTabId: 2 }];
+        activeProjectId = 0; activeTabId = 1;
+        tabs = [
+            { id: 1, projectId: 0, title: 'Busy', history: [], tokens: 0, scheduled: [], userScrolledUp: false },
+            { id: 2, projectId: 1, title: 'Beta', history: [], tokens: 0, scheduled: [], userScrolledUp: false }
+        ];
+        generationSessionForTab = function(tabId) { return Number(tabId) === 1 ? { id: 7, tabId: 1 } : null; };
+        playUiSound = function() {};
+    `);
+    assert.equal(evaluate(context, 'moveTabToProject(1, 1, 1)'), false);
+    assert.equal(evaluate(context, 'tabs[0].projectId'), 0);
+    assert.equal(evaluate(context, 'tabDragShiftForIndex(0, 2, 1, 101)'), -101);
+    assert.equal(evaluate(context, 'tabDragShiftForIndex(2, 0, 1, 101)'), 101);
+    assert.equal(evaluate(context, 'tabDragShiftForIndex(1, 1, 0, 101)'), 0);
+    assert.equal(evaluate(context, 'tabDragCommitIndex(0, 2)'), 3);
+    assert.equal(evaluate(context, 'tabDragCommitIndex(2, 0)'), 0);
+    const tabsSource = source('backend/renderer/tabs.js');
+    assert.doesNotMatch(tabsSource, /\.draggable\s*=\s*true|dragstart|dragover|dataTransfer/u);
+    assert.match(tabsSource, /addEventListener\('pointerdown'[\s\S]*?addEventListener\('pointermove'/u);
+    assert.match(tabsSource, /function scheduleTabPointerDragFrame[\s\S]*?requestAnimationFrame/u);
+    assert.match(tabsSource, /ghost\.style\.transform\s*=\s*'translate3d/u);
+    const styles = source('backend/shell/styles.css');
+    assert.match(styles, /\.tab-drag-ghost[\s\S]*?cubic-bezier\(\.18,\.86,\.24,1\)/u);
+    assert.match(styles, /body\.tab-pointer-drag-active \.tab-item[\s\S]*?transform 150ms/u);
+    assert.match(styles, /\.schema-project-item\.tab-drop-target[\s\S]*?transform: translateX\(3px\)/u);
+});
+
+test('tab drag hot path caches hit geometry and avoids redundant layout/style work', () => {
+    const { context } = createContext();
+    vm.runInContext(source('backend/renderer/tabs.js'), context, { filename: 'tabs.js' });
+    evaluate(context, `
+        globalThis.__tabTransformWrites = 0;
+        var candidateStyle = {};
+        Object.defineProperty(candidateStyle, 'transform', {
+            configurable: true,
+            get: function() { return ''; },
+            set: function() { globalThis.__tabTransformWrites += 1; }
+        });
+        tabDragState.active = true;
+        tabDragState.sourceIndex = 0;
+        tabDragState.previewIndex = 0;
+        tabDragState.previewMode = 'idle';
+        tabDragState.unit = 101;
+        tabDragState.sourceRect = { left: 10, top: 10, width: 100, height: 30 };
+        tabDragState.itemMetrics = [
+            { index: 0, element: { style: {} } },
+            { index: 1, element: { style: candidateStyle } }
+        ];
+        tabDragState.marker = { style: {}, classList: { add: function() {}, remove: function() {} } };
+        applyTabDragPreview(1);
+        globalThis.__writesAfterFirstPreview = globalThis.__tabTransformWrites;
+        applyTabDragPreview(1);
+        globalThis.__writesAfterRepeatedPreview = globalThis.__tabTransformWrites;
+        tabDragState.projectMetrics = [
+            { projectId: 9, element: { id: 'project-nine' }, rect: { left: 200, right: 320, top: 40, bottom: 88 } }
+        ];
+    `);
+    assert.equal(evaluate(context, '__writesAfterFirstPreview'), 1);
+    assert.equal(evaluate(context, '__writesAfterRepeatedPreview'), 1, 'unchanged insertion slots must not rewrite neighboring tab transforms');
+    assert.equal(evaluate(context, 'tabProjectDropTargetForPointer(250, 60).projectId'), 9);
+    assert.equal(evaluate(context, 'tabProjectDropTargetForPointer(100, 60)'), null);
+    const tabsSource = source('backend/renderer/tabs.js');
+    assert.doesNotMatch(tabsSource, /document\.elementFromPoint/u, 'drag frames must not force document-wide hit testing');
+    assert.match(tabsSource, /projectMetrics\s*=\s*measureTabProjectDropGeometry\(\)/u);
+    assert.match(tabsSource, /function onTabPointerMove[\s\S]*?positionTabDragGhost[\s\S]*?scheduleTabPointerDragFrame/u);
+    const styles = source('backend/shell/styles.css');
+    assert.match(styles, /@keyframes tab-drag-lift\s*\{\s*from \{ opacity: \.68; \}\s*to \{ opacity: \.97; \}\s*\}/u, 'drag lift animation must remain opacity-only');
+});
+
 test('a project without a directory hard-disables composer input until a root exists', () => {
     const { context, input, gate, gateName } = createContext();
     evaluate(context, 'syncProjectComposerGate()');
@@ -13851,6 +15701,7 @@ test('scheduled messages remain queued for projects without a directory instead 
 
 test('legacy v1 per-tab workspaces migrate losslessly into project-owned tab groups', () => {
     const { context } = createContext();
+    vm.runInContext(source('backend/renderer/chat-session-snapshot.js'), context, { filename: 'chat-session-snapshot.js' });
     vm.runInContext(source('backend/renderer/chat-session.js'), context, { filename: 'chat-session.js' });
     evaluate(context, `
         saveActiveTabScrollState = function() {};
@@ -13882,6 +15733,7 @@ test('legacy v1 per-tab workspaces migrate losslessly into project-owned tab gro
 
 test('project-aware snapshots persist project ownership and explorer defaults separately from tabs', () => {
     const { context } = createContext();
+    vm.runInContext(source('backend/renderer/chat-session-snapshot.js'), context, { filename: 'chat-session-snapshot.js' });
     vm.runInContext(source('backend/renderer/chat-session.js'), context, { filename: 'chat-session.js' });
     evaluate(context, `
         projects = [{ id: 0, title: 'Alpha', activeTabId: 0 }];
@@ -14593,6 +16445,13 @@ function loadContextNodeDefinition() {
     const sandbox = {
         console,
         Darkstar: {
+            imageData: {
+                safeDataUrl(image, fallbackMimeType) {
+                    const mimeType = String(image && image.mimeType || fallbackMimeType || 'image/png');
+                    const base64 = String(image && image.base64 || '');
+                    return base64 ? `data:${mimeType};base64,${base64}` : '';
+                },
+            },
             nodes: {
                 builtinCommon: { baseNode: () => ({}) },
                 controls: { textarea: () => '', booleanSelect: () => '', status: () => '' },
@@ -14606,6 +16465,22 @@ function loadContextNodeDefinition() {
     assert.ok(registered, 'Context node must register itself');
     return registered;
 }
+
+test('Context node emits text and images together through one Context output', () => {
+    const definition = loadContextNodeDefinition();
+    const node = { params: { includeHistory: true, systemPrompt: '' }, status: '', statusMessage: '' };
+    assert.equal(definition.inputs.length, 0);
+    const result = definition.execute({}, node, {
+        history: [{ role: 'user', content: 'Describe this image', images: [{ base64: 'QUJD', mimeType: 'image/png', name: 'sample.png' }] }],
+    });
+    assert.deepEqual(Object.keys(result), ['context']);
+    assert.equal(result.context.length, 1);
+    assert.equal(result.context[0].role, 'user');
+    assert.equal(result.context[0].content[0].type, 'text');
+    assert.equal(result.context[0].content[0].text, 'Describe this image');
+    assert.equal(result.context[0].content[1].type, 'image_url');
+    assert.equal(result.context[0].content[1].image_url.url, 'data:image/png;base64,QUJD');
+});
 
 test('Context node rehydrates every persisted reasoning round exactly once into future request history', () => {
     const definition = loadContextNodeDefinition();
@@ -14645,12 +16520,12 @@ test('Context node rehydrates every persisted reasoning round exactly once into 
         ],
     });
 
-    const assistantToolTurn = result.text.find((message) => message?.role === 'assistant' && Array.isArray(message.tool_calls));
+    const assistantToolTurn = result.context.find((message) => message?.role === 'assistant' && Array.isArray(message.tool_calls));
     assert.ok(assistantToolTurn);
     assert.equal(assistantToolTurn.reasoning_content, toolReasoning);
     assert.equal(assistantToolTurn.content, null);
 
-    const visibleAssistant = result.text.find((message) => message?.role === 'assistant' && !Array.isArray(message.tool_calls));
+    const visibleAssistant = result.context.find((message) => message?.role === 'assistant' && !Array.isArray(message.tool_calls));
     assert.ok(visibleAssistant);
     assert.equal(visibleAssistant.content, 'Original final answer');
     assert.equal(visibleAssistant.reasoning_content, finalReasoning,
@@ -14668,7 +16543,7 @@ test('Context node preserves ordinary historical reasoning as well as native con
             { id: 'a2', role: 'assistant', content: '', reasoning: 'unfinished reasoning tail' },
         ],
     });
-    const assistants = result.text.filter((message) => message.role === 'assistant');
+    const assistants = result.context.filter((message) => message.role === 'assistant');
     assert.equal(assistants.length, 2);
     assert.equal(assistants[0].reasoning_content, 'older private reasoning',
         'ordinary historical reasoning must remain model-facing instead of disappearing when Retry rebuilds context');
@@ -14862,20 +16737,21 @@ test('changing the selected model explicitly rerenders model-dependent reasoning
         previousModelId: 'first.gguf',
         modelId: 'second.gguf',
         resetGpuLayers: true,
+        queryModelMetadata: true,
     });
 });
 
 test('workflow reasoning persistence accepts exact safe model effort tokens', () => {
-    const source = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'workflow.js'), 'utf8');
-    const match = source.match(/function normalizedReasoningMode\(value\) \{[\s\S]*?\n    \}/u);
-    assert.ok(match, 'workflow reasoning normalizer must exist');
+    const source = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'workflow-local-pipeline-migration.js'), 'utf8');
+    const match = source.match(/function normalizeReasoningMode\(value\) \{[\s\S]*?\n    \}/u);
+    assert.ok(match, 'workflow migration reasoning normalizer must exist');
     const context = {};
     vm.createContext(context);
-    vm.runInContext(match[0] + '\nthis.normalizedReasoningMode = normalizedReasoningMode;', context);
-    assert.equal(context.normalizedReasoningMode('medium'), 'medium');
-    assert.equal(context.normalizedReasoningMode('model_specific-2'), 'model_specific-2');
-    assert.equal(context.normalizedReasoningMode('OFF'), 'off');
-    assert.equal(context.normalizedReasoningMode('<invalid>'), null);
+    vm.runInContext(match[0] + '\nthis.normalizeReasoningMode = normalizeReasoningMode;', context);
+    assert.equal(context.normalizeReasoningMode('medium'), 'medium');
+    assert.equal(context.normalizeReasoningMode('model_specific-2'), 'model_specific-2');
+    assert.equal(context.normalizeReasoningMode('OFF'), 'off');
+    assert.equal(context.normalizeReasoningMode('<invalid>'), null);
 });
 
 test('chat request normalization sends exact effort through Jinja kwargs without changing toggle behavior', () => {
@@ -14916,7 +16792,9 @@ function samplerHarness(reasoningCapability) {
         textInput: blank,
         textarea: blank,
         booleanSelect: blank,
+        toggle: blank,
         status: blank,
+        group(_title, _description, content) { return String(content || ''); },
         escapeHtml(value) { return String(value); },
     };
     const nodes = {
@@ -14926,7 +16804,7 @@ function samplerHarness(reasoningCapability) {
             },
         },
         controls,
-        PORT_TYPES: { MODEL: 'MODEL', TEXT: 'TEXT', IMAGE: 'IMAGE', SKILLS: 'SKILLS', TOOLS: 'TOOLS', CONTROL: 'CONTROL' },
+        PORT_TYPES: { MODEL: 'MODEL', SAMPLER_PARAMETERS: 'SAMPLER_PARAMETERS', TEXT: 'TEXT', IMAGE: 'IMAGE', SKILLS: 'SKILLS', TOOLS: 'TOOLS', CONTROL: 'CONTROL' },
         services: null,
         registerNode(value) { definition = value; },
     };
@@ -14935,6 +16813,8 @@ function samplerHarness(reasoningCapability) {
         structuredClone,
         Darkstar: {
             nodes,
+            imageData: { safeDataUrl(image) { return image && image.base64 ? `data:${image.mimeType || 'image/png'};base64,${image.base64}` : null; } },
+            async: { runBestEffort(operation) { return Promise.resolve().then(operation); } },
             modelInventory: [{ id: 'model.gguf', contextLength: 262144, reasoning: reasoningCapability }],
             chatRuntime: {
                 async streamChat(request) {
@@ -14953,7 +16833,11 @@ function samplerHarness(reasoningCapability) {
         },
     };
     context.globalThis = context;
-    vm.runInNewContext(source, context, { filename: 'sampler.js' });
+    context.window = context;
+    vm.createContext(context);
+    vm.runInContext(fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'nodes', 'builtin', 'context.js'), 'utf8'), context, { filename: 'context.js' });
+    vm.runInContext(fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'nodes', 'builtin', 'control.js'), 'utf8'), context, { filename: 'control.js' });
+    vm.runInContext(source, context, { filename: 'sampler.js' });
     return {
         definition,
         getReasoningSelect: () => reasoningSelect,
@@ -14961,10 +16845,62 @@ function samplerHarness(reasoningCapability) {
     };
 }
 
-test('Sampler renders exactly the effort values reported by the connected model', () => {
+function localSamplerReasoningHarness(reasoningCapability) {
+    const source = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'nodes', 'builtin', 'local-sampler.js'), 'utf8');
+    let definition = null;
+    let reasoningSelect = null;
+    const blank = () => '';
+    const controls = {
+        select(label, value, _nodeId, _key, options) {
+            if (label === 'Reasoning Effort') reasoningSelect = { value, options: structuredClone(options) };
+            return '';
+        },
+        numberInput: blank, slider: blank, textInput: blank, textarea: blank, booleanSelect: blank, status: blank,
+        group(_title, _description, content) { return String(content || ''); },
+        escapeHtml(value) { return String(value); },
+    };
+    const context = {
+        console, structuredClone,
+        document: { getElementById() { return null; } },
+        Darkstar: {
+            modelInventory: [{ id: 'model.gguf', contextLength: 262144, reasoning: reasoningCapability }],
+            nodes: {
+                builtinCommon: {
+                    baseNode(def, id, x, y, extra) { return Object.assign({ id, type: def.id, x, y }, structuredClone(extra)); },
+                    modelInventoryRecord(modelId) {
+                        return context.Darkstar.modelInventory.find((record) => record.id === modelId) || null;
+                    },
+                },
+                controls,
+                PORT_TYPES: { SAMPLER_PARAMETERS: 'SAMPLER_PARAMETERS' },
+                registerNode(value) { definition = value; },
+            },
+        },
+        nodeEditorState: {
+            initialized: true,
+            nodes: [
+                { id: 'loader', type: 'modelLoader', selectedModel: 'model.gguf' },
+                { id: 'server', type: 'loadServer' },
+                { id: 'local-sampler', type: 'localSampler' },
+                { id: 'orchestrator', type: 'sampler' },
+            ],
+            connections: [
+                { fromNode: 'loader', fromSocket: 'model', toNode: 'server', toSocket: 'model' },
+                { fromNode: 'server', fromSocket: 'gguf', toNode: 'orchestrator', toSocket: 'gguf' },
+                { fromNode: 'local-sampler', fromSocket: 'samplerParameters', toNode: 'orchestrator', toSocket: 'samplerParameters' },
+            ],
+        },
+    };
+    context.window = context;
+    context.globalThis = context;
+    vm.runInNewContext(source, context, { filename: 'local-sampler.js' });
+    return { definition, getReasoningSelect: () => reasoningSelect };
+}
+
+test('L_Sampler renders exactly the Reasoning Effort values reported by the connected model', () => {
     const capability = { type: 'effort', efforts: ['xhigh', 'medium', 'low'], defaultEffort: 'xhigh', supportsToggle: false };
-    const harness = samplerHarness(capability);
-    const node = harness.definition.factory('sampler', 0, 0);
+    const harness = localSamplerReasoningHarness(capability);
+    const node = harness.definition.factory('local-sampler', 0, 0);
     harness.definition.buildContentHTML(node);
     const select = harness.getReasoningSelect();
     assert.equal(select.value, 'auto');
@@ -14973,46 +16909,61 @@ test('Sampler renders exactly the effort values reported by the connected model'
     assert.equal(select.options.some((option) => option.value === 'on' || option.value === 'off' || option.value === 'high'), false);
 });
 
-test('Sampler retains Auto/On/Off for models without adjustable effort', () => {
-    const harness = samplerHarness({ type: 'toggle', efforts: [], defaultEffort: null, supportsToggle: true });
-    const node = harness.definition.factory('sampler', 0, 0);
+test('L_Sampler retains Auto/On/Off Reasoning Effort for models without adjustable effort', () => {
+    const harness = localSamplerReasoningHarness({ type: 'toggle', efforts: [], defaultEffort: null, supportsToggle: true });
+    const node = harness.definition.factory('local-sampler', 0, 0);
     harness.definition.buildContentHTML(node);
     assert.deepEqual(harness.getReasoningSelect().options.map((option) => option.value), ['auto', 'on', 'off']);
 });
 
-test('Sampler resumes reasoning with the selected supported effort but disables fresh reasoning for content continuation', async () => {
+test('L_Sampler preserves a saved named Reasoning Effort until model capability metadata is available', () => {
+    const harness = localSamplerReasoningHarness(null);
+    const node = harness.definition.factory('local-sampler', 0, 0);
+    node.params.reasoning = 'medium';
+    harness.definition.buildContentHTML(node);
+    const select = harness.getReasoningSelect();
+    assert.equal(select.value, 'medium');
+    assert.deepEqual(select.options.map((option) => option.value), ['auto', 'medium', 'on', 'off']);
+    assert.equal(select.options[1].label, 'Medium (saved)');
+    assert.equal(harness.definition.execute({}, node, {}).samplerParameters.reasoning, 'medium');
+});
+
+test('Orchestrator consumes L_Sampler Reasoning Effort and disables fresh reasoning for content continuation', async () => {
     const capability = { type: 'effort', efforts: ['xhigh', 'medium', 'low'], defaultEffort: 'xhigh', supportsToggle: false };
     const harness = samplerHarness(capability);
     const node = harness.definition.factory('sampler', 0, 0);
-    node.params.reasoning = 'medium';
+    const sampling = { reasoning: 'medium', contextSize: 262144, contextPercent: 100, seed: -1, temperature: 0.8, topK: 40, topP: 0.95, minP: 0.05, typicalP: 1, repeatPenalty: 1.1, repeatLastN: 64, presencePenalty: 0, frequencyPenalty: 0, dryMultiplier: 0, dryBase: 1.75, dryAllowedLength: 2, dryPenaltyLastN: 0, mirostat: 0, mirostatTau: 5, mirostatEta: 0.1, samplers: ['dry', 'top_k', 'typ_p', 'top_p', 'min_p', 'xtc', 'temperature'] };
     const model = { id: 'model.gguf', reasoning: capability, multimodal: false };
     const text = [{ role: 'assistant', content: '', reasoning: 'partial' }];
 
-    await harness.definition.execute({ model, text, while: {} }, node, {
-        parallelSlots: 1, continueFinalMessage: true, continueFinalMessageMode: 'reasoning'
+    await harness.definition.execute({ gguf: model, samplerParameters: sampling }, node, {
+        history: text, parallelSlots: 1, continueFinalMessage: true, continueFinalMessageMode: 'reasoning'
     });
     assert.equal(harness.getCapturedRequest().control.reasoning, 'medium');
     assert.equal(harness.getCapturedRequest().continueFinalMessage, 'reasoning');
 
-    await harness.definition.execute({ model, text, while: {} }, node, {
-        parallelSlots: 1, continueFinalMessage: true, continueFinalMessageMode: 'content'
+    await harness.definition.execute({ gguf: model, samplerParameters: sampling }, node, {
+        history: text, parallelSlots: 1, continueFinalMessage: true, continueFinalMessageMode: 'content'
     });
     assert.equal(harness.getCapturedRequest().control.reasoning, 'off');
     assert.equal(harness.getCapturedRequest().continueFinalMessage, 'content');
 
-    node.params.reasoning = 'made_up';
-    await harness.definition.execute({ model, text, while: {} }, node, { parallelSlots: 1, continueFinalMessage: false });
+    sampling.reasoning = 'made_up';
+    await harness.definition.execute({ gguf: model, samplerParameters: sampling }, node, { history: text, parallelSlots: 1, continueFinalMessage: false });
     assert.equal(harness.getCapturedRequest().control.reasoning, 'auto');
 });
 
-test('Sampler exposes context size rather than a local output-token cap', () => {
-    const source = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'nodes', 'builtin', 'sampler.js'), 'utf8');
-    assert.match(source, /function contextSliderHTML\(node\)/u);
-    assert.match(source, /data-param="contextPercent"/u);
-    assert.match(source, /CONTEXT_PERCENT_STEP = 10/u);
-    assert.match(source, /execution\.context\.localModelContextSize = samplerContextSize\(node\)/u);
-    assert.doesNotMatch(source, /Maximum output tokens/u);
-    assert.doesNotMatch(source, /maxTokens:\s*Number\(p\.(?:maxTokens|contextSize)\)/u);
+test('LlamaCPP Server owns Context size while L_Sampler and Orchestrator remain free of runtime context allocation state', () => {
+    const serverSource = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'nodes', 'builtin', 'load-server.js'), 'utf8');
+    const localSamplerSource = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'nodes', 'builtin', 'local-sampler.js'), 'utf8');
+    const orchestratorSource = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'nodes', 'builtin', 'sampler.js'), 'utf8');
+    assert.match(serverSource, /function contextSliderHTML\(node\)/u);
+    assert.match(serverSource, /data-param="contextPercent"/u);
+    assert.match(serverSource, /CONTEXT_PERCENT_STEP = 10/u);
+    assert.doesNotMatch(serverSource, /samplerParameters\.contextSize/u);
+    assert.doesNotMatch(localSamplerSource, /contextSliderHTML\(node\)|data-param="contextPercent"|contextSize/u);
+    assert.doesNotMatch(orchestratorSource, /contextSliderHTML\(node\)|Maximum output tokens/u);
+    assert.doesNotMatch(orchestratorSource, /maxTokens:\s*Number\(p\.(?:maxTokens|contextSize)\)/u);
 });
 });
 
@@ -15093,6 +17044,35 @@ test('chat detaches only for real user-driven upward scrolling and nested trace 
     assert.match(init, /document\.addEventListener\('keydown'[\s\S]*PageUp[\s\S]*Home/u);
     assert.match(init, /nestedScrollableElement\(this, e\.target\)[\s\S]*nestedCanScroll[\s\S]*e\.stopPropagation\(\); return;/u);
     assert.match(init, /nestedMax[\s\S]*scrollTop[\s\S]*deltaY/u, 'nested scrollers should yield wheel ownership to chat at their own edge');
+
+    const wheelStart = init.indexOf("container.addEventListener('wheel'");
+    const wheelEnd = init.indexOf('const queue = document.getElementById', wheelStart);
+    assert.ok(wheelStart >= 0 && wheelEnd > wheelStart, 'chat wheel handler not found');
+    const chatWheel = init.slice(wheelStart, wheelEnd);
+    assert.doesNotMatch(chatWheel, /preventDefault\(/u, 'chat wheel input must remain on Chromium native scrolling');
+    assert.doesNotMatch(chatWheel, /animate(?:Queue)?Scroll\(/u, 'chat wheel input must not be replayed through JavaScript easing');
+    assert.match(chatWheel, /passive:\s*true/u, 'chat wheel observation should remain passive');
+});
+
+test('follow-mode chat autoscroll never reads scrollHeight on the streamed hot path', () => {
+    let scrollHeightReads = 0;
+    const container = {
+        clientHeight: 500,
+        scrollTop: 0,
+        get scrollHeight() { scrollHeightReads += 1; return 1000; },
+    };
+    const context = vm.createContext({
+        console, URL, setTimeout, clearTimeout,
+        userScrolledUp: false,
+        getActiveTab() { return { userScrolledUp: false }; },
+        document: { getElementById(id) { return id === 'chatContainer' ? container : null; } },
+    });
+    vm.runInContext(chat + `\nthis.__smartScrollTest = { smartScrollToBottom };`, context, { filename: 'chat.js' });
+
+    context.__smartScrollTest.smartScrollToBottom();
+    assert.equal(scrollHeightReads, 0,
+        'normal streamed follow mode must not synchronously measure the growing chat document');
+    assert.ok(container.scrollTop >= 1000);
 });
 
 test('chat smart autoscroll clears stale restored detachment at the physical bottom but preserves real upward detachment', () => {
@@ -15109,7 +17089,7 @@ test('chat smart autoscroll clears stale restored detachment at the physical bot
     context.__smartScrollTest.smartScrollToBottom();
     assert.equal(context.userScrolledUp, false);
     assert.equal(tab.userScrolledUp, false);
-    assert.equal(container.scrollTop, 1000);
+    assert.ok(container.scrollTop >= container.scrollHeight, 'follow mode must request a position at or beyond the physical bottom without a synchronous height read');
 
     container.scrollTop = 300;
     context.__smartScrollTest.setSmartChatAutoscrollDetached(true);
@@ -15119,7 +17099,8 @@ test('chat smart autoscroll clears stale restored detachment at the physical bot
 
     const init = fs.readFileSync(path.join(projectRoot, 'backend', 'renderer', 'init.js'), 'utf8');
     assert.match(init, /container\.scrollTop = container\.scrollHeight;\s*if \(typeof resumeSmartChatAutoscroll === 'function'\) resumeSmartChatAutoscroll\(\);/u);
-    assert.match(init, /step > 0 && isAtBottom\(q\.el\)[\s\S]*resumeSmartChatAutoscroll\(\)/u);
+    assert.match(init, /container\.addEventListener\('scroll'[\s\S]*isAtBottom\(this\)[\s\S]*resumeSmartChatAutoscroll\(\)/u,
+        'native chat scrolling must still resume smart autoscroll when the viewport reaches the physical bottom');
 });
 });
 
@@ -15188,6 +17169,7 @@ function loadControlDefinition() {
         toggle(label, value, _id, param) { return `[toggle:${label}:${value}:${param}]`; },
         numberInput(label, value, _id, param) { return `[number:${label}:${value}:${param}]`; },
         status() { return '[status]'; },
+        group(_title, _description, content) { return String(content || ''); },
     };
     const nodes = {
         controls,
@@ -15249,26 +17231,34 @@ test('reasoning-pruning runtime module and model-facing Control settings are phy
 test('Control node exposes a default-OFF model idle unload toggle with a fixed 10-minute timeout', async () => {
     const definition = loadControlDefinition();
     const node = definition.factory('control-1', 0, 0);
-    assert.deepEqual(Object.keys(node.params).sort(), ['autoCompact', 'modelIdleUnloadEnabled', 'nameConversations']);
+    assert.deepEqual(Object.keys(node.params).sort(), ['autoCompact', 'dynamicVramEnabled', 'modelIdleUnloadEnabled', 'nameConversations', 'negativePromptEnabled']);
     const html = definition.buildContentHTML(node);
     assert.match(html, /Name Conversations/u);
     assert.match(html, /Auto-compact/u);
     assert.match(html, /Model idle unload/u);
     assert.equal(/Context Pruning|Image Pruning|headroom/u.test(html), false);
+    assert.match(html, /Dynamic VRAM/u);
+    assert.match(html, /Negative Prompt/u);
 
     const output = await definition.execute({}, node);
-    assert.deepEqual(Object.keys(output.while).sort(), ['autoCompact', 'modelIdleUnloadSeconds', 'nameConversations']);
+    assert.deepEqual(Object.keys(output.while).sort(), ['autoCompact', 'dynamicVramEnabled', 'modelIdleUnloadSeconds', 'nameConversations', 'negativePromptEnabled']);
     assert.equal(output.while.autoCompact, false);
     assert.equal(node.params.modelIdleUnloadEnabled, false, 'model idle unload must default OFF');
     assert.equal(output.while.modelIdleUnloadSeconds, 0);
+    assert.equal(output.while.dynamicVramEnabled, false);
+    assert.equal(output.while.negativePromptEnabled, false);
 
     node.params.modelIdleUnloadEnabled = true;
     const enabledOutput = await definition.execute({}, node);
     assert.equal(enabledOutput.while.modelIdleUnloadSeconds, 600, 'ON must use the fixed 10-minute timeout');
+    assert.equal(enabledOutput.while.dynamicVramEnabled, false);
+    assert.equal(enabledOutput.while.negativePromptEnabled, false);
 
     const legacyEnabled = { id: 'legacy-idle', params: { nameConversations: true, autoCompact: false, modelIdleUnloadSeconds: 45 } };
     definition.normalizeNode(legacyEnabled);
     assert.equal(legacyEnabled.params.modelIdleUnloadEnabled, true, 'legacy positive idle timeouts must migrate to ON');
+    assert.equal(legacyEnabled.params.dynamicVramEnabled, false);
+    assert.equal(legacyEnabled.params.negativePromptEnabled, false);
 });
 
 test('old workflow pruning fields are discarded instead of influencing the normalized Control node', () => {
@@ -15287,6 +17277,8 @@ test('old workflow pruning fields are discarded instead of influencing the norma
         nameConversations: false,
         autoCompact: false,
         modelIdleUnloadEnabled: false,
+        dynamicVramEnabled: false,
+        negativePromptEnabled: false,
     });
 });
 });
@@ -15343,7 +17335,7 @@ function actionableRendererFiles() {
 
 test('completeness: every renderer JavaScript module has an explicit feature regression contract', () => {
     const files = jsFiles('backend/renderer');
-    assert.equal(files.length, 63, 'renderer source inventory changed; add regression coverage for the new/removed module');
+    assert.equal(files.length, 70, 'renderer source inventory changed; add regression coverage for the new/removed module');
     for (const file of files) {
         assert.ok(featureInventory.includes(`'${file}'`), `${file} has no explicit feature regression contract`);
     }
@@ -15351,7 +17343,7 @@ test('completeness: every renderer JavaScript module has an explicit feature reg
 
 test('completeness: every first-party backend JavaScript module has an explicit feature regression contract', () => {
     const files = jsFiles('backend', (file) => !file.includes('/python_vendor/') && !file.startsWith('backend/renderer/') && !file.startsWith('backend/scripts/') && !file.startsWith('backend/vendor/') && !file.startsWith('backend/Dev/'));
-    assert.equal(files.length, 121, 'backend source inventory changed; add regression coverage for the new/removed module');
+    assert.equal(files.length, 128, 'backend source inventory changed; add regression coverage for the new/removed module');
     for (const file of files) {
         assert.ok(featureInventory.includes(`'${file}'`), `${file} has no explicit feature regression contract`);
     }
@@ -15367,7 +17359,7 @@ test('completeness: every built-in node module is explicitly represented in the 
 
 test('completeness: every renderer module that creates or listens to actionable UI is covered', () => {
     const files = actionableRendererFiles();
-    assert.equal(files.length, 31, 'actionable renderer file inventory changed; add direct control tests for the changed surface');
+    assert.equal(files.length, 35, 'actionable renderer file inventory changed; add direct control tests for the changed surface');
     const allControlTests = staticInventory + '\n' + dynamicInventory + '\n' + staticExecutionInventory + '\n' + delegatedExecutionInventory + '\n' + featureInventory;
     for (const file of files) {
         assert.ok(allControlTests.includes(`'${file}'`), `${file} exposes UI actions but is absent from the exhaustive regression layer`);
@@ -15377,9 +17369,9 @@ test('completeness: every renderer module that creates or listens to actionable 
 test('completeness: static button count and external wiring are mechanically locked', () => {
     const buttons = html.match(/<button\b[^>]*>[\s\S]*?<\/button>/gu) || [];
     const inline = buttons.filter((button) => /\bonclick=/u.test((button.match(/^<button\b[^>]*>/u) || [''])[0]));
-    assert.equal(buttons.length, 59);
+    assert.equal(buttons.length, 64);
     assert.equal(inline.length, 0);
-    assert.ok(staticInventory.includes('all 59 current static buttons'));
+    assert.ok(staticInventory.includes('all 64 current static buttons'));
     assert.ok(staticExecutionInventory.includes('static HTML contains no executable inline event attributes'));
     assert.ok(delegatedExecutionInventory.includes('workspace Choose Directory invokes chooser'));
     assert.ok(delegatedExecutionInventory.includes('UIP Connect application opens the picker'));
@@ -15530,6 +17522,258 @@ test('package and renderer reference only the backend PNG source, never a reposi
 });
 
 // ============================================================================
+// TEST MODULE: backend/Dev/tests/orchestrator-sampling-workflow-migration-regression.test.js
+// ============================================================================
+TEST_FACTORIES.set("backend/Dev/tests/orchestrator-sampling-workflow-migration-regression.test.js", function(module, exports, require, __filename, __dirname) {
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+const vm = require('node:vm');
+
+const ROOT = path.resolve(__dirname, '..', '..', '..');
+const source = (relativePath) => fs.readFileSync(path.join(ROOT, relativePath), 'utf8');
+
+function migrationHarness() {
+    const definitions = new Map();
+    const blank = () => '';
+    const controls = new Proxy({ escapeHtml(value) { return String(value); } }, {
+        get(target, key) { return target[key] || blank; },
+    });
+    const nodes = {
+        controls,
+        PORT_TYPES: {
+            MODEL_CONFIG: 'MODEL_CONFIG', MODEL: 'MODEL', SAMPLER_PARAMETERS: 'SAMPLER_PARAMETERS', DM_SAMPLER: 'DM_SAMPLER',
+            TEXT: 'TEXT', IMAGE: 'IMAGE', SKILLS: 'SKILLS', TOOLS: 'TOOLS', CONTROL: 'CONTROL',
+        },
+        builtinCommon: {
+            baseNode(definition, id, x, y, extra) {
+                return Object.assign({
+                    id, type: definition.id, title: definition.title, badge: definition.badge || 'NODE', x, y,
+                    inputs: structuredClone(definition.inputs || []), outputs: structuredClone(definition.outputs || []),
+                    status: 'idle', statusMessage: '',
+                }, structuredClone(extra || {}));
+            },
+            getLlamaBridge() { return {}; },
+        },
+        registerNode(definition) { definitions.set(definition.id, definition); return definition; },
+    };
+    const sandbox = {
+        console, structuredClone, WeakMap, Map, Set, Date, RegExp, ArrayBuffer, Number, String, Boolean, Object, Math,
+        setTimeout, clearTimeout,
+        document: { getElementById() { return null; }, addEventListener() {} },
+        nodeEditorState: { nodes: [], connections: [], nextNodeId: 1, panX: 0, panY: 0, zoom: 1 },
+        Darkstar: { nodes, modelInventory: [], imageData: { safeDataUrl(image) { return image && image.base64 ? `data:${image.mimeType || 'image/png'};base64,${image.base64}` : null; } }, async: { runBestEffort() {} } },
+        getNodeDef(type) { return definitions.get(type) || null; },
+        getDarkstarWorkflowSecurity() { return { modelActionPermissionLevel: 'boundary-guard', filesystemAccessLevel: '3' }; },
+        async restoreDarkstarWorkflowSecurity() { return true; },
+    };
+    sandbox.globalThis = sandbox;
+    sandbox.window = sandbox;
+    vm.createContext(sandbox);
+    for (const rel of [
+        'backend/renderer/nodes/builtin/load-server.js',
+        'backend/renderer/nodes/builtin/local-sampler.js',
+        'backend/renderer/nodes/builtin/context.js',
+        'backend/renderer/nodes/builtin/control.js',
+        'backend/renderer/nodes/builtin/sampler.js',
+    ]) vm.runInContext(source(rel), sandbox, { filename: rel });
+    definitions.set('tools', {
+        id: 'tools', title: 'Loader', badge: 'AGENT', outputNode: false, inputs: [],
+        outputs: [{ name: 'tools', label: 'Tools', type: 'TOOLS' }, { name: 'skills', label: 'Skills', type: 'SKILLS' }],
+        factory(id, x, y) {
+            return { id, type: 'tools', title: 'Loader', badge: 'AGENT', x, y, inputs: [], outputs: structuredClone(this.outputs),
+                params: { providers: [], skills: [], browserControlToolMigrationVersion: 1, timeoutToolMigrationVersion: 1, askUserYesNoToolMigrationVersion: 1, generateImageToolMigrationVersion: 1, maxRoundsMigrationVersion: 2, maxRounds: 'auto', toolChoice: 'auto' } };
+        },
+        normalizeNode(node) {
+            if (!node.params || typeof node.params !== 'object') node.params = {};
+            if (!Array.isArray(node.params.providers)) node.params.providers = [];
+            if (!Array.isArray(node.params.skills)) node.params.skills = [];
+            node.title = 'Loader'; node.inputs = []; node.outputs = structuredClone(this.outputs);
+        },
+    });
+    definitions.set('modelLoader', {
+        id: 'modelLoader', title: 'Invoke Language Model (GGUF)', badge: 'GGUF', outputNode: false,
+        inputs: [], outputs: [{ name: 'model', label: 'Language Model', type: 'MODEL_CONFIG' }],
+        factory(id, x, y) {
+            return { id, type: 'modelLoader', title: this.title, badge: this.badge, x, y,
+                inputs: [], outputs: structuredClone(this.outputs), params: {}, selectedModel: 'model.gguf' };
+        },
+        normalizeNode(node) { node.title = this.title; node.inputs = []; node.outputs = structuredClone(this.outputs); },
+    });
+    vm.runInContext(source('backend/renderer/workflow-local-pipeline-migration.js'), sandbox, { filename: 'workflow-local-pipeline-migration.js' });
+    vm.runInContext(source('backend/renderer/workflow.js'), sandbox, { filename: 'workflow.js' });
+    return { sandbox };
+}
+
+test('legacy separate Tools and Skills nodes collapse into one Loader without losing capabilities', async () => {
+    const { sandbox } = migrationHarness();
+    const tools = {
+        id: 10, type: 'tools', title: 'Tools', badge: 'AGENT', x: 0, y: 0, inputs: [], outputs: [{ name: 'tools', label: 'Tools', type: 'TOOLS' }],
+        params: { providers: [{ kind: 'python', path: 'C:/tools/custom.py', name: 'Custom', toolCount: 1 }], maxRounds: 'auto', toolChoice: 'auto', browserControlToolMigrationVersion: 1, timeoutToolMigrationVersion: 1, askUserYesNoToolMigrationVersion: 1, generateImageToolMigrationVersion: 1, maxRoundsMigrationVersion: 2 },
+    };
+    const skills = {
+        id: 11, type: 'skills', title: 'Skills', badge: 'AGENT', x: 0, y: 300, inputs: [], outputs: [{ name: 'skills', label: 'Skills', type: 'SKILLS' }],
+        params: { skills: [{ path: 'C:/skills/art/SKILL.md', name: 'Art', description: 'Art guidance', compatible: true }] },
+    };
+    const orchestrator = {
+        id: 12, type: 'sampler', title: 'Orchestrator', badge: 'OUTPUT', x: 600, y: 100, params: {}, outputs: [],
+        inputs: [{ name: 'samplerParameters', label: 'LM Sampler', type: 'SAMPLER_PARAMETERS', required: true }, { name: 'dmSampler', label: 'DM Sampler', type: 'DM_SAMPLER', required: false }, { name: 'skills', label: 'Skills', type: 'SKILLS', required: false }, { name: 'tools', label: 'Tools', type: 'TOOLS', required: false }],
+    };
+    await sandbox.restoreWorkflowSnapshot({
+        format: 'darkstar-workflow-snapshot', version: 2,
+        security: { modelActionPermissionLevel: 'boundary-guard', filesystemAccessLevel: '3' },
+        editor: { nodes: [tools, skills, orchestrator], connections: [
+            { fromNode: 10, fromSocket: 'tools', toNode: 12, toSocket: 'tools' },
+            { fromNode: 11, fromSocket: 'skills', toNode: 12, toSocket: 'skills' },
+        ], nextNodeId: 13, panX: 0, panY: 0, zoom: 1 },
+    });
+    const loaders = sandbox.nodeEditorState.nodes.filter((node) => node.type === 'tools');
+    assert.equal(loaders.length, 1);
+    assert.equal(loaders[0].title, 'Loader');
+    assert.equal(sandbox.nodeEditorState.nodes.some((node) => node.type === 'skills'), false);
+    assert.deepEqual(Array.from(loaders[0].params.skills, (skill) => skill.path), ['C:/skills/art/SKILL.md']);
+    assert.deepEqual(Array.from(loaders[0].params.providers, (provider) => provider.path), ['C:/tools/custom.py']);
+    const edges = sandbox.nodeEditorState.connections;
+    assert.equal(edges.some((edge) => edge.fromNode === loaders[0].id && edge.fromSocket === 'tools' && edge.toNode === 12 && edge.toSocket === 'tools'), true);
+    assert.equal(edges.some((edge) => edge.fromNode === loaders[0].id && edge.fromSocket === 'skills' && edge.toNode === 12 && edge.toSocket === 'skills'), true);
+});
+
+test('legacy local workflow migrates atomically to the canonical local ownership contract', async () => {
+    const { sandbox } = migrationHarness();
+    const oldSampling = {
+        seed: 77, temperature: 0.41, topK: 13, topP: 0.88, minP: 0.09, typicalP: 0.91,
+        repeatPenalty: 1.07, repeatLastN: 72, presencePenalty: 0.2, frequencyPenalty: -0.1,
+        dryMultiplier: 0.33, dryBase: 1.8, dryAllowedLength: 3, dryPenaltyLastN: 2048,
+        mirostat: '1', mirostatTau: 4.4, mirostatEta: 0.17, samplers: 'top_k;top_p;temperature',
+    };
+    const server = {
+        id: 1, type: 'loadServer', title: 'Load GGUF Server', badge: 'LLAMA.CPP', x: 0, y: 0,
+        inputs: [], outputs: [{ name: 'server', label: 'Server', type: 'SERVER' }],
+        params: Object.assign({ port: 0, contextSize: 'auto' }, oldSampling),
+    };
+    const loader = {
+        id: 2, type: 'modelLoader', title: 'Invoke Language Model (GGUF)', badge: 'GGUF', x: 400, y: 0,
+        selectedModel: 'model.gguf', params: {},
+        inputs: [{ name: 'server', label: 'Server', type: 'SERVER', required: true }],
+        outputs: [{ name: 'model', label: 'Language Model', type: 'MODEL' }],
+    };
+    const contextNode = {
+        id: 3, type: 'context', title: 'Context', badge: 'CHAT', x: 800, y: 200,
+        params: { systemPrompt: 'legacy system', includeHistory: false },
+        inputs: [{ name: 'model', label: 'Language Model', type: 'MODEL', required: true }],
+        outputs: [{ name: 'text', label: 'Text', type: 'TEXT' }, { name: 'image', label: 'Image', type: 'IMAGE' }],
+    };
+    const orchestrator = {
+        id: 4, type: 'sampler', title: 'Autoregressive Sampler', badge: 'OUTPUT', x: 1200, y: 300,
+        params: { reasoning: 'medium', contextSize: 160000, stop: 'END\nDONE', cachePrompt: false, ignoreEos: true },
+        inputs: [
+            { name: 'model', label: 'Language Model', type: 'MODEL', required: true },
+            { name: 'text', label: 'Text', type: 'TEXT', required: true },
+            { name: 'while', label: 'Control', type: 'CONTROL', required: false },
+        ], outputs: [],
+    };
+    const controlNode = {
+        id: 5, type: 'control', title: 'Control', badge: 'FLOW', x: 800, y: 600,
+        params: { nameConversations: false, autoCompact: true, modelIdleUnloadEnabled: true },
+        inputs: [], outputs: [{ name: 'while', label: 'Control', type: 'CONTROL' }],
+    };
+    const connections = [
+        { fromNode: 1, fromSocket: 'server', toNode: 2, toSocket: 'server' },
+        { fromNode: 2, fromSocket: 'model', toNode: 3, toSocket: 'model' },
+        { fromNode: 2, fromSocket: 'model', toNode: 4, toSocket: 'model' },
+        { fromNode: 3, fromSocket: 'text', toNode: 4, toSocket: 'text' },
+        { fromNode: 3, fromSocket: 'image', toNode: 4, toSocket: 'image' },
+        { fromNode: 5, fromSocket: 'while', toNode: 4, toSocket: 'while' },
+    ];
+
+    await sandbox.restoreWorkflowSnapshot({
+        format: 'darkstar-workflow-snapshot', version: 2,
+        security: { modelActionPermissionLevel: 'boundary-guard', filesystemAccessLevel: '3' },
+        editor: { nodes: [server, loader, contextNode, orchestrator, controlNode], connections, nextNodeId: 6, panX: 0, panY: 0, zoom: 1 },
+    });
+
+    const restored = sandbox.nodeEditorState.nodes;
+    const restoredServer = restored.find((node) => node.type === 'loadServer');
+    const restoredLoader = restored.find((node) => node.type === 'modelLoader');
+    const restoredSampler = restored.find((node) => node.type === 'localSampler');
+    const restoredOrchestrator = restored.find((node) => node.type === 'sampler');
+    assert.equal(restored.find((node) => node.type === 'context'), undefined, 'local Context must be absorbed into Orchestrator');
+    assert.equal(restored.find((node) => node.type === 'control'), undefined, 'local Control must be absorbed into Orchestrator');
+    assert.equal(restoredServer.title, 'LlamaCPP Server');
+    assert.equal(restoredServer.inputs[0].label, 'Language Model');
+    assert.equal(restoredServer.outputs[0].label, 'Language Model');
+    assert.deepEqual(Array.from(restoredOrchestrator.inputs, (input) => input.name), ['samplerParameters', 'dmSampler', 'skills', 'tools']);
+    assert.equal(restoredSampler.title, 'LM Sampler');
+    assert.deepEqual(Array.from(restoredSampler.inputs, (input) => input.name), ['gguf']);
+    assert.equal(restoredSampler.params.temperature, oldSampling.temperature);
+    assert.equal(restoredSampler.params.dryPenaltyLastN, oldSampling.dryPenaltyLastN);
+    assert.equal(restoredSampler.params.reasoning, 'medium');
+    assert.equal(restoredSampler.params.stop, 'END\nDONE');
+    assert.equal(restoredSampler.params.cachePrompt, false);
+    assert.equal(restoredSampler.params.ignoreEos, true);
+    assert.equal(Object.hasOwn(restoredSampler.params, 'contextSize'), false, 'Context size must leave L_Sampler');
+    assert.equal(Object.hasOwn(restoredSampler.params, 'contextPercent'), false, 'Context percent must leave L_Sampler');
+    assert.equal(Object.hasOwn(restoredServer.params, 'reasoning'), false, 'Reasoning Effort must leave GGUF Server');
+    assert.equal(String(restoredServer.params.contextSize), '160000', 'Context size must migrate to GGUF Server');
+    for (const key of Object.keys(oldSampling)) assert.equal(Object.hasOwn(restoredServer.params, key), false, `${key} must leave GGUF Server`);
+    assert.equal(restoredOrchestrator.params.systemPrompt, 'legacy system');
+    assert.equal(restoredOrchestrator.params.includeHistory, false);
+    assert.equal(restoredOrchestrator.params.nameConversations, false);
+    assert.equal(restoredOrchestrator.params.autoCompact, true);
+    assert.equal(restoredOrchestrator.params.modelIdleUnloadEnabled, true);
+    for (const key of ['reasoning', 'contextSize', 'stop', 'cachePrompt', 'ignoreEos']) {
+        assert.equal(Object.hasOwn(restoredOrchestrator.params, key), false, `${key} must not remain on Orchestrator`);
+    }
+
+    const edges = sandbox.nodeEditorState.connections;
+    const has = (fromNode, fromSocket, toNode, toSocket) => edges.some((edge) => edge.fromNode === fromNode && edge.fromSocket === fromSocket && edge.toNode === toNode && edge.toSocket === toSocket);
+    assert.equal(has(restoredLoader.id, 'model', restoredServer.id, 'model'), true);
+    assert.equal(has(restoredServer.id, 'gguf', restoredSampler.id, 'gguf'), true);
+    assert.equal(has(restoredServer.id, 'gguf', restoredOrchestrator.id, 'gguf'), false, 'Language Model must flow through LM Sampler, not directly into Orchestrator');
+    assert.equal(has(restoredSampler.id, 'samplerParameters', restoredOrchestrator.id, 'samplerParameters'), true);
+    assert.equal(has(restoredSampler.id, 'samplerParameters', restoredServer.id, 'samplerParameters'), false,
+        'L_Sampler must never feed GGUF Server');
+    assert.equal(edges.some((edge) => ['context', 'text', 'image', 'while', 'server'].includes(edge.fromSocket) || ['context', 'text', 'image', 'while', 'server'].includes(edge.toSocket)), false,
+        'legacy Context, Control, Image, Text, and Server sockets must be gone from the migrated local graph');
+});
+
+test('legacy API sampler collapses separate Text/Image wiring into one Context connection', () => {
+    const { sandbox } = migrationHarness();
+    const contextNode = {
+        id: 10, type: 'context', title: 'Context', params: { systemPrompt: '', includeHistory: true },
+        inputs: [{ name: 'model', label: 'Language Model', type: 'MODEL', required: true }],
+        outputs: [{ name: 'text', label: 'Text', type: 'TEXT' }, { name: 'image', label: 'Image', type: 'IMAGE' }],
+    };
+    const apiSampler = {
+        id: 11, type: 'apiSampler', title: '[ Custom ] Autoregressive Sampler (API)', params: {},
+        inputs: [
+            { name: 'model', label: 'Language Model', type: 'MODEL', required: true },
+            { name: 'text', label: 'Text', type: 'TEXT', required: true },
+            { name: 'image', label: 'Image', type: 'IMAGE', required: false },
+        ],
+        outputs: [],
+    };
+    const connections = [
+        { fromNode: 10, fromSocket: 'text', toNode: 11, toSocket: 'text' },
+        { fromNode: 10, fromSocket: 'image', toNode: 11, toSocket: 'image' },
+    ];
+    sandbox.Darkstar.workflowLocalPipelineMigration.migrate({
+        nodes: [contextNode, apiSampler],
+        connections,
+        legacyControlReasoning: new Map(),
+        clone: structuredClone,
+        getNodeDef: sandbox.getNodeDef,
+    });
+    assert.equal(contextNode.inputs.length, 0);
+    assert.equal(contextNode.outputs[0].name, 'context');
+    assert.deepEqual(connections, [{ fromNode: 10, fromSocket: 'context', toNode: 11, toSocket: 'context' }]);
+});
+});
+
+// ============================================================================
 // TEST MODULE: backend/Dev/tests/sampler-context-authority-regression.test.js
 // ============================================================================
 TEST_FACTORIES.set("backend/Dev/tests/sampler-context-authority-regression.test.js", function(module, exports, require, __filename, __dirname) {
@@ -15542,340 +17786,328 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 const ROOT = path.resolve(__dirname, '..', '..', '..');
-function source(relativePath) { return fs.readFileSync(path.join(ROOT, relativePath), 'utf8'); }
+const source = (relativePath) => fs.readFileSync(path.join(ROOT, relativePath), 'utf8');
 
-function harness() {
+function pipelineHarness() {
     const definitions = new Map();
     let startedConfig = null;
+    let loadedModel = null;
     let chatRequest = null;
+    let runtimeStatus = null;
     const blank = () => '';
-    const controls = {
-        dropdown: blank,
-        button: blank,
-        status: blank,
-        numberInput: blank,
-        select: blank,
-        slider: blank,
-        textInput: blank,
-        textarea: blank,
-        booleanSelect: blank,
-        escapeHtml(value) { return String(value); },
+    const controls = new Proxy({ escapeHtml(value) { return String(value); } }, { get(target, key) { return target[key] || blank; } });
+    const bridge = {
+        async startServer(config) {
+            startedConfig = structuredClone(config);
+            return { success: true, host: '127.0.0.1', port: 18080, backend: 'cuda', parallelSlots: 1, totalContextSize: Number(config.contextSize) || 262144, contextSizePerSlot: Number(config.contextSize) || 262144 };
+        },
+        async loadModel(modelId, projectorPath) {
+            loadedModel = { modelId, projectorPath };
+            return { success: true, modelId, contextSizePerSlot: Number(startedConfig.contextSize) || 262144, totalContextSize: Number(startedConfig.contextSize) || 262144, parallelSlots: 1,
+                metadata: { id: modelId, contextLength: 262144, reasoning: { type: 'effort', efforts: ['medium', 'low'], defaultEffort: 'medium', supportsToggle: false } } };
+        },
+        async getStatus() { return runtimeStatus ? structuredClone(runtimeStatus) : null; },
+    };
+    const common = {
+        baseNode(definition, id, x, y, extra) {
+            return Object.assign({ id, type: definition.id, title: definition.title, badge: definition.badge, x, y, status: 'idle', statusMessage: '',
+                inputs: structuredClone(definition.inputs || []), outputs: structuredClone(definition.outputs || []) }, structuredClone(extra || {}));
+        },
+        getLlamaBridge() { return bridge; },
+        cacheModelRecord(record) { return record; },
     };
     const nodes = {
-        PORT_TYPES: {
-            SERVER: 'SERVER', MODEL: 'MODEL', TEXT: 'TEXT', IMAGE: 'IMAGE', SKILLS: 'SKILLS',
-            TOOLS: 'TOOLS', CONTROL: 'CONTROL',
-        },
-        controls,
+        PORT_TYPES: { MODEL_CONFIG: 'MODEL_CONFIG', MODEL: 'MODEL', SAMPLER_PARAMETERS: 'SAMPLER_PARAMETERS', DM_SAMPLER: 'DM_SAMPLER', TEXT: 'TEXT', IMAGE: 'IMAGE', SKILLS: 'SKILLS', TOOLS: 'TOOLS', CONTROL: 'CONTROL' },
+        controls, builtinCommon: common,
         registerNode(definition) { definitions.set(definition.id, definition); return definition; },
     };
     const context = {
-        console,
-        structuredClone,
+        console, structuredClone,
         document: { getElementById() { return null; } },
         Darkstar: {
             nodes,
-            modelInventory: [{ id: 'model.gguf', contextLength: 262144, reasoning: null }],
+            imageData: { safeDataUrl(image) { return image && image.base64 ? `data:${image.mimeType || 'image/png'};base64,${image.base64}` : null; } },
+            async: { runBestEffort(operation) { return Promise.resolve().then(operation); } },
+            modelInventory: [{ id: 'model.gguf', contextLength: 262144, reasoning: { type: 'effort', efforts: ['medium', 'low'], defaultEffort: 'medium', supportsToggle: false } }],
             chatRuntime: {
                 async streamChat(request) {
                     chatRequest = structuredClone(request);
-                    return {
-                        text: 'ok', reasoning: '', usage: {}, finishReason: 'length',
-                        stopDetails: {
-                            source: 'llama.cpp-verbose', stopType: 'limit', tokensEvaluated: 1000, tokensPredicted: 45000,
-                            generationSettings: { contextSize: 262144, maxTokens: 45000, nPredict: 45000, ignoreEos: false },
-                        },
-                    };
+                    return { text: 'ok', reasoning: '', usage: {}, finishReason: 'length', stopDetails: { stopType: 'limit', tokensPredicted: 45000, generationSettings: { contextSize: 262144, nPredict: 45000 } } };
                 },
             },
         },
-        darkstar: {
-            nodes: {
-                async startServer(config) {
-                    startedConfig = structuredClone(config);
-                    // Deliberately emulate the historical bad readback: the bridge
-                    // reports model capability rather than the requested allocation.
-                    return {
-                        success: true,
-                        port: 18080,
-                        host: '127.0.0.1',
-                        parallelSlots: 1,
-                        totalContextSize: 262144,
-                        contextSizePerSlot: 262144,
-                        requestedContextMode: 'manual',
-                    };
-                },
-                async detectProjector() { return { success: true, projectors: [], projectorPath: '' }; },
-                async loadModel(modelId) {
-                    return {
-                        success: true, modelId, parallelSlots: 1,
-                        totalContextSize: 262144, contextSizePerSlot: 262144,
-                        contextMeasurementSource: 'props-model',
-                    };
-                },
-            },
-        },
-        nodeEditorState: { nodes: [], connections: [] },
+        nodeEditorState: { initialized: true, nodes: [], connections: [] },
         updateTokenCounter() {},
+        setContextContractRuntimeContextReady() {},
     };
     context.window = context;
     context.globalThis = context;
     vm.createContext(context);
-    vm.runInContext(source('backend/renderer/nodes/builtin/common.js'), context, { filename: 'common.js' });
-    vm.runInContext(source('backend/renderer/nodes/builtin/load-server.js'), context, { filename: 'load-server.js' });
-    vm.runInContext(source('backend/renderer/nodes/builtin/load-model.js'), context, { filename: 'load-model.js' });
-    vm.runInContext(source('backend/renderer/nodes/builtin/sampler.js'), context, { filename: 'sampler.js' });
-    vm.runInContext(source('backend/renderer/nodes/graph-core.js'), context, { filename: 'graph-core.js' });
-    vm.runInContext(source('backend/renderer/nodes/graph-runtime.js'), context, { filename: 'graph-runtime.js' });
+    for (const rel of [
+        'backend/renderer/nodes/builtin/load-server.js',
+        'backend/renderer/nodes/builtin/local-sampler.js',
+        'backend/renderer/nodes/builtin/context.js',
+        'backend/renderer/nodes/builtin/control.js',
+        'backend/renderer/nodes/builtin/sampler.js',
+    ]) vm.runInContext(source(rel), context, { filename: rel });
     return {
-        context,
-        definitions,
+        context, definitions,
         getStartedConfig: () => startedConfig,
+        getLoadedModel: () => loadedModel,
         getChatRequest: () => chatRequest,
+        setRuntimeStatus(value) { runtimeStatus = value ? structuredClone(value) : null; },
     };
 }
 
-test('local Sampler context field is the sole local context-length contract from UI through TOKEN_LIMIT', async () => {
-    const { context, definitions, getStartedConfig } = harness();
+test('LlamaCPP Server owns context sizing while L_Sampler owns Reasoning Effort and request sampling', async () => {
+    const { context, definitions, getStartedConfig, getLoadedModel } = pipelineHarness();
     const serverDefinition = definitions.get('loadServer');
-    const modelDefinition = definitions.get('modelLoader');
-    const samplerDefinition = definitions.get('sampler');
-    assert.ok(serverDefinition);
-    assert.ok(samplerDefinition);
-
+    const samplerDefinition = definitions.get('localSampler');
     const serverNode = serverDefinition.factory('server', 0, 0);
-    serverNode.params.contextSize = 'auto'; // Must not win over the Sampler field.
-    const loaderNode = modelDefinition.factory('loader', 0, 0);
-    loaderNode.selectedModel = 'model.gguf';
-    const samplerNode = samplerDefinition.factory('sampler', 0, 0);
-
-    // Existing 1.2.1 workflows persisted this exact UI field as maxTokens.
-    // Migration must preserve its intent by snapping the legacy absolute value to the nearest model-relative ten-percent step.
-    delete samplerNode.params.contextSize;
-    samplerNode.params.maxTokens = 160000;
-    context.nodeEditorState.nodes = [serverNode, loaderNode, samplerNode];
+    const samplerNode = samplerDefinition.factory('local-sampler', 0, 0);
+    assert.equal(serverNode.title, 'LlamaCPP Server');
+    assert.equal(serverNode.outputs[0].label, 'Language Model');
+    serverNode.params.contextPercent = 50;
+    samplerNode.params.reasoning = 'medium';
+    const loader = { id: 'loader', type: 'modelLoader', selectedModel: 'model.gguf' };
+    context.nodeEditorState.nodes = [loader, serverNode, samplerNode];
     context.nodeEditorState.connections = [
-        { fromNode: 'server', fromSocket: 'server', toNode: 'loader', toSocket: 'server' },
-        { fromNode: 'loader', fromSocket: 'model', toNode: 'sampler', toSocket: 'model' },
+        { fromNode: 'loader', fromSocket: 'model', toNode: 'server', toSocket: 'model' },
     ];
 
-    const executionContext = {};
-    samplerDefinition.prepareExecution(samplerNode, { context: executionContext });
-    assert.equal(samplerNode.params.contextPercent, 60);
-    assert.equal(samplerNode.params.contextSize, 157286);
-    assert.equal(Object.hasOwn(samplerNode.params, 'maxTokens'), false);
-    assert.equal(executionContext.localModelContextSize, 157286);
-    assert.equal(executionContext.localModelContextSource, 'sampler');
-
-    const output = await serverDefinition.execute({}, serverNode, executionContext);
-    assert.equal(getStartedConfig().contextSize, 157286, 'Sampler context must serialize the snapped 60% model-relative allocation into Load Server');
-    assert.equal(context.TOKEN_LIMIT, 157286, 'status-bar denominator must obey the Sampler context ceiling');
-    assert.equal(context.CONTEXT_LIMIT_READY, false, 'server allocation alone must remain provisional until the model load reports effective context');
-    assert.equal(output.server.totalContextSize, 157286);
-    assert.equal(output.server.contextSizePerSlot, 157286);
-
-    await modelDefinition.execute(output, loaderNode);
-    assert.equal(context.TOKEN_LIMIT, 157286,
-        'Load Model must not re-expand TOKEN_LIMIT from a later 262,144 capability readback');
-    assert.equal(context.CONTEXT_LIMIT_READY, true, 'successful Load Model measurement makes TOKEN_LIMIT authoritative for the context contract');
-    assert.equal(output.server.contextSizePerSlot, 157286);
-    assert.equal(output.server.totalContextSize, 157286);
+    const samplerParameters = samplerDefinition.execute({ gguf: { id: 'model.gguf', reasoning: { type: 'effort', efforts: ['low', 'medium'], defaultEffort: 'medium' } } }, samplerNode, {}).samplerParameters;
+    const output = await serverDefinition.execute({
+        model: { id: 'model.gguf', metadata: context.Darkstar.modelInventory[0] },
+    }, serverNode, {});
+    assert.equal(Object.hasOwn(samplerParameters, 'contextSize'), false);
+    assert.equal(Object.hasOwn(samplerParameters, 'contextPercent'), false);
+    assert.equal(samplerParameters.reasoning, 'medium');
+    assert.equal(String(getStartedConfig().contextSize), '131072');
+    assert.equal(getStartedConfig().modelId, 'model.gguf');
+    assert.equal(getLoadedModel().modelId, 'model.gguf');
+    assert.equal(output.gguf.id, 'model.gguf');
+    assert.equal(Object.hasOwn(output.gguf, 'reasoningSelection'), false);
+    assert.equal(output.gguf.server.contextSizePerSlot, 131072);
+    assert.equal(String(serverNode.params.contextSize), '131072');
+    assert.equal(serverNode.params.contextPercent, 50);
+    assert.equal(Object.hasOwn(serverNode.params, 'reasoning'), false);
 });
 
 
-
-test('cold-start context contract is re-checked after model load and aborts before Sampler emits anything', async () => {
-    const { definitions, getChatRequest } = harness();
-    const samplerDefinition = definitions.get('sampler');
-    const samplerNode = samplerDefinition.factory('sampler-stop', 0, 0);
-    let checks = 0;
-    await assert.rejects(
-        samplerDefinition.execute({
-            model: { id: 'model.gguf' },
-            text: [{ role: 'user', content: 'continue' }],
-            while: { nameConversations: true },
-        }, samplerNode, {
-            stopForContextContractAfterModelLoad() { checks += 1; return true; },
-        }),
-        error => error && error.name === 'AbortError' && /Context contract exceeded/u.test(error.message)
-    );
-    assert.equal(checks, 1);
-    assert.equal(getChatRequest(), null, 'no title request or model generation may start after the authoritative post-load check blocks');
-});
-
-test('GraphRuntime publishes Sampler context before targeted upstream model preparation', async () => {
-    const { context, definitions, getStartedConfig } = harness();
-    const serverDefinition = definitions.get('loadServer');
-    const samplerDefinition = definitions.get('sampler');
-    const serverNode = serverDefinition.factory(1, 0, 0);
-    serverNode.params.contextSize = 'auto';
-    const loaderNode = {
-        id: 2, type: 'modelLoader', title: 'Load Model', selectedModel: 'model.gguf',
-        inputs: [{ name: 'server', label: 'server', type: 'SERVER', required: true }],
-        outputs: [{ name: 'model', label: 'model', type: 'MODEL' }],
-    };
-    const contextNode = {
-        id: 3, type: 'context', title: 'Context', inputs: [],
-        outputs: [{ name: 'text', label: 'text', type: 'TEXT' }],
-    };
-    const controlNode = {
-        id: 4, type: 'control', title: 'Control', inputs: [],
-        outputs: [{ name: 'while', label: 'while', type: 'CONTROL' }],
-    };
-    const samplerNode = samplerDefinition.factory(5, 0, 0);
-    samplerNode.params.contextSize = 160000;
-    const nodes = [serverNode, loaderNode, contextNode, controlNode, samplerNode];
-    const connections = [
-        { fromNode: 1, fromSocket: 'server', toNode: 2, toSocket: 'server' },
-        { fromNode: 2, fromSocket: 'model', toNode: 5, toSocket: 'model' },
-        { fromNode: 3, fromSocket: 'text', toNode: 5, toSocket: 'text' },
-        { fromNode: 4, fromSocket: 'while', toNode: 5, toSocket: 'while' },
-    ];
-    context.nodeEditorState.nodes = nodes;
-    context.nodeEditorState.connections = connections;
-
-    definitions.set('modelLoader', {
-        id: 'modelLoader', outputNode: false,
-        async execute(inputs, node) { return { model: { id: node.selectedModel, server: inputs.server } }; },
+test('LlamaCPP Server refreshes runtime identity after model loading can replace llama.cpp', async () => {
+    const { context, definitions, setRuntimeStatus } = pipelineHarness();
+    const definition = definitions.get('loadServer');
+    const node = definition.factory('server', 0, 0);
+    node.params.contextPercent = 50;
+    setRuntimeStatus({
+        success: true, running: true, loadedModelId: 'model.gguf', host: '127.0.0.2', port: 19090, mode: 'legacy', backend: 'cuda',
+        parallelSlots: 1, totalContextSize: 131072, contextSizePerSlot: 131072, contextMeasurementSource: 'runtime-props',
+        gpuSelection: { mode: 'manual', deviceIds: [1], label: 'GPU 1' }, multiGpuMode: 'sequential', kvCacheLocation: 'gpu',
     });
-    definitions.set('context', { id: 'context', outputNode: false, async execute() { return { text: [{ role: 'user', content: 'x' }] }; } });
-    definitions.set('control', { id: 'control', outputNode: false, async execute() { return { while: {} }; } });
-    const registry = { get(type) { return definitions.get(type) || null; } };
-    const runtime = new context.Darkstar.nodes.GraphRuntime({ registry, graphCore: context.Darkstar.nodes.graphCore });
-    const executionContext = {};
-    await runtime.execute({ nodes, connections, context: executionContext, targetNodeIds: [2] });
 
-    assert.equal(executionContext.localModelContextSize, 157286,
-        'Sampler preflight must run even when /compact targets only the model loader');
-    assert.equal(getStartedConfig().contextSize, 157286);
-    assert.equal(context.TOKEN_LIMIT, 157286);
+    const output = await definition.execute({
+        model: { id: 'model.gguf', metadata: context.Darkstar.modelInventory[0] },
+    }, node, {});
+    assert.equal(output.gguf.server.host, '127.0.0.2');
+    assert.equal(output.gguf.server.port, 19090);
+    assert.equal(output.gguf.server.mode, 'legacy');
+    assert.equal(output.gguf.server.contextMeasurementSource, 'runtime-props');
+    assert.equal(output.gguf.server.gpuSelection.label, 'GPU 1');
+    assert.match(node.statusMessage, /127\.0\.0\.2:19090/u);
+    assert.doesNotMatch(node.statusMessage, /127\.0\.0\.1:18080/u);
 });
 
-test('local Sampler context field is not serialized as a max_tokens completion cap', async () => {
-    const { context, definitions, getChatRequest } = harness();
-    const samplerDefinition = definitions.get('sampler');
-    const node = samplerDefinition.factory('sampler', 0, 0);
-    node.params.contextSize = 160000;
-    context.nodeEditorState.nodes = [
-        { id: 'loader', type: 'modelLoader', selectedModel: 'model.gguf' },
-        node,
-    ];
-    context.nodeEditorState.connections = [
-        { fromNode: 'loader', fromSocket: 'model', toNode: 'sampler', toSocket: 'model' },
-    ];
-
-    await samplerDefinition.execute({
-        model: { id: 'model.gguf', multimodal: false },
-        text: [{ role: 'user', content: 'hello' }],
-        while: {},
-    }, node, { parallelSlots: 1 });
-
-    assert.equal(Object.hasOwn(getChatRequest(), 'maxTokens'), false,
-        'the context field must never be repurposed as a completion/output-token budget');
+test('L_Sampler owns Reasoning Effort, request-time sampling, stop, prompt-cache reuse, and Ignore EOS', () => {
+    const { definitions } = pipelineHarness();
+    const definition = definitions.get('localSampler');
+    const node = definition.factory('local-sampler', 0, 0);
+    node.params.reasoning = 'on';
+    node.params.temperature = 1.23;
+    node.params.topK = 17;
+    node.params.dryPenaltyLastN = 8192;
+    node.params.samplers = 'top_k;top_p;temperature';
+    node.params.stop = 'END\nDONE';
+    node.params.cachePrompt = false;
+    node.params.ignoreEos = true;
+    const output = definition.execute({ gguf: { id: 'model.gguf' } }, node, {});
+    assert.equal(definition.inputs.length, 1);
+    assert.equal(definition.inputs[0].name, 'gguf');
+    assert.equal(definition.outputs[0].label, 'LM Sampler');
+    assert.equal(output.samplerParameters.reasoning, 'on');
+    assert.equal(Object.hasOwn(output.samplerParameters, 'contextSize'), false);
+    assert.equal(Object.hasOwn(output.samplerParameters, 'contextPercent'), false);
+    assert.equal(output.samplerParameters.temperature, 1.23);
+    assert.equal(output.samplerParameters.topK, 17);
+    assert.equal(output.samplerParameters.dryPenaltyLastN, 8192);
+    assert.equal(output.samplerParameters.stop, 'END\nDONE');
+    assert.equal(output.samplerParameters.cachePrompt, false);
+    assert.equal(output.samplerParameters.ignoreEos, true);
+    assert.deepEqual(Array.from(output.samplerParameters.samplers), ['top_k', 'top_p', 'temperature']);
 });
 
 
-test('local Sampler preserves llama.cpp stop diagnostics through the graph result', async () => {
-    const { definitions } = harness();
-    const samplerDefinition = definitions.get('sampler');
-    const node = samplerDefinition.factory('sampler-stop-details', 0, 0);
-    const result = await samplerDefinition.execute({
-        model: { id: 'model.gguf', multimodal: false },
-        text: [{ role: 'user', content: 'hello' }],
-        while: {},
-    }, node, { parallelSlots: 1 });
+test('Orchestrator owns local Context and strategic controls while consuming Language Model and LM Sampler', async () => {
+    const { definitions, getChatRequest } = pipelineHarness();
+    const samplerDefinition = definitions.get('localSampler');
+    const orchestratorDefinition = definitions.get('sampler');
+    const samplerNode = samplerDefinition.factory('local-sampler', 0, 0);
+    samplerNode.params.temperature = 1.11;
+    samplerNode.params.topP = 0.81;
+    samplerNode.params.stop = 'END\nDONE';
+    samplerNode.params.cachePrompt = false;
+    samplerNode.params.ignoreEos = true;
+    const samplerParameters = samplerDefinition.execute({ gguf: { id: 'model.gguf', multimodal: true, projectorPath: 'projector.gguf', reasoning: null } }, samplerNode, {}).samplerParameters;
+    const orchestrator = orchestratorDefinition.factory('orchestrator', 0, 0);
+    assert.equal(orchestrator.uiWidth, 720);
+    assert.deepEqual(Array.from(orchestrator.inputs, (input) => [input.name, input.label, input.type, input.required]), [
+        ['samplerParameters', 'LM Sampler', 'SAMPLER_PARAMETERS', true],
+        ['dmSampler', 'DM Sampler', 'DM_SAMPLER', false],
+        ['skills', 'Skills', 'SKILLS', false],
+        ['tools', 'Tools', 'TOOLS', false],
+    ]);
+    assert.deepEqual(Object.keys(orchestrator.params).sort(), ['autoCompact', 'dynamicVramEnabled', 'imageCountOverride', 'includeHistory', 'modelIdleUnloadEnabled', 'nameConversations', 'negativePromptEnabled', 'systemPrompt']);
+    assert.equal(orchestrator.params.imageCountOverride, 0);
+    orchestrator.params.systemPrompt = 'System policy';
+    orchestrator.params.nameConversations = false;
+    assert.equal(orchestrator.params.dynamicVramEnabled, false);
 
-    assert.equal(result.finishReason, 'length');
+    const result = await orchestratorDefinition.execute({
+        samplerParameters,
+    }, orchestrator, {
+        parallelSlots: 1,
+        history: [{ role: 'user', content: 'hello', images: [{ base64: 'QUJD', mimeType: 'image/png' }] }],
+    });
+    const request = getChatRequest();
+    assert.deepEqual(request.messages, [
+        { role: 'system', content: 'System policy' },
+        { role: 'user', content: [
+            { type: 'text', text: 'hello' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,QUJD' } },
+        ] },
+    ]);
+    assert.equal(request.vision.enabled, true);
+    assert.equal(request.vision.projectorPath, 'projector.gguf');
+    assert.equal(request.temperature, 1.11);
+    assert.equal(request.topP, 0.81);
+    assert.deepEqual(request.stop, ['END', 'DONE']);
+    assert.equal(request.cachePrompt, false);
+    assert.equal(request.ignoreEos, true);
+    assert.equal(Object.hasOwn(request, 'maxTokens'), false);
+    assert.equal(Object.hasOwn(orchestrator.params, 'stop'), false);
+    assert.equal(Object.hasOwn(orchestrator.params, 'cachePrompt'), false);
+    assert.equal(Object.hasOwn(orchestrator.params, 'ignoreEos'), false);
     assert.equal(result.stopDetails.stopType, 'limit');
     assert.equal(result.stopDetails.tokensPredicted, 45000);
-    assert.equal(result.stopDetails.generationSettings.contextSize, 262144);
-    assert.equal(result.stopDetails.generationSettings.nPredict, 45000);
 });
 
+test('cold-start context contract is re-checked by Orchestrator after GGUF is authoritative', async () => {
+    const { definitions, getChatRequest } = pipelineHarness();
+    const localSampler = definitions.get('localSampler').factory('local-sampler', 0, 0);
+    const samplerParameters = definitions.get('localSampler').execute({ gguf: { id: 'model.gguf', multimodal: false, reasoning: null } }, localSampler, {}).samplerParameters;
+    const orchestratorDefinition = definitions.get('sampler');
+    await assert.rejects(orchestratorDefinition.execute({ samplerParameters,
+    }, orchestratorDefinition.factory('orchestrator', 0, 0), {
+        history: [{ role: 'user', content: 'continue' }],
+        stopForContextContractAfterModelLoad() { return true; },
+    }), (error) => error && error.name === 'AbortError' && /Context contract exceeded/u.test(error.message));
+    assert.equal(getChatRequest(), null);
+});
 
-test('bundled local workflow stores context on the Sampler and never ships the legacy maxTokens key', () => {
+test('bundled local workflow persists the six-node ownership and merged Loader socket contract', () => {
     const { decodeWorkflowSnapshot } = require('../../workflow/workflow-snapshot-codec');
     const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(ROOT, 'workflows', 'darkstar-workflow.dswf')));
     const editor = snapshot.editor && typeof snapshot.editor === 'object' ? snapshot.editor : snapshot;
-    const sampler = editor.nodes.find((node) => node && node.type === 'sampler');
-    assert.ok(sampler);
-    assert.equal(sampler.params.contextSize, 200000);
-    assert.equal(Object.hasOwn(sampler.params, 'maxTokens'), false);
+    const server = editor.nodes.find((node) => node.type === 'loadServer');
+    const modelLoader = editor.nodes.find((node) => node.type === 'modelLoader');
+    const loader = editor.nodes.find((node) => node.type === 'tools');
+    const localSampler = editor.nodes.find((node) => node.type === 'localSampler');
+    const dmSampler = editor.nodes.find((node) => node.type === 'com.darkstar.dm-sampler.sampler');
+    const orchestrator = editor.nodes.find((node) => node.type === 'sampler');
+    assert.equal(editor.nodes.length, 6);
+    assert.equal(editor.nodes.some((node) => node.type === 'context'), false);
+    assert.equal(editor.nodes.some((node) => node.type === 'control'), false);
+    assert.equal(server.title, 'LlamaCPP Server');
+    assert.equal(loader.title, 'Loader');
+    assert.deepEqual(loader.params.skills, []);
+    assert.equal(editor.nodes.some((node) => node.type === 'skills'), false);
+    assert.equal(localSampler.title, 'LM Sampler');
+    assert.equal(dmSampler.title, '[ Custom ] DM Sampler');
+    assert.deepEqual(dmSampler.params, { seed: -1, steps: 0, cfgScale: 7, sampler: 'auto', scheduler: 'auto', denoise: 1, generationPrefix: 'masterpiece, best quality' });
+    assert.equal(Object.hasOwn(localSampler.params, 'contextSize'), false);
+    assert.equal(Object.hasOwn(localSampler.params, 'contextPercent'), false);
+    assert.equal(localSampler.params.reasoning, 'auto');
+    assert.equal(localSampler.params.stop, '');
+    assert.equal(localSampler.params.cachePrompt, true);
+    assert.equal(localSampler.params.ignoreEos, false);
+    assert.equal(server.params.contextSize, 'auto');
+    assert.equal(server.params.contextPercent, 100);
+    assert.equal(Object.hasOwn(server.params, 'reasoning'), false);
+    assert.deepEqual(orchestrator.params, {
+        systemPrompt: '', includeHistory: true, nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: false, dynamicVramEnabled: false, negativePromptEnabled: false, imageCountOverride: 0,
+    });
+    for (const key of ['contextSize', 'reasoning', 'stop', 'cachePrompt', 'ignoreEos']) assert.equal(Object.hasOwn(orchestrator.params, key), false);
+    for (const key of ['seed', 'temperature', 'topK', 'topP', 'minP', 'typicalP', 'repeatPenalty', 'repeatLastN', 'presencePenalty', 'frequencyPenalty', 'dryMultiplier', 'dryBase', 'dryAllowedLength', 'dryPenaltyLastN', 'mirostat', 'mirostatTau', 'mirostatEta', 'samplers', 'stop', 'cachePrompt', 'ignoreEos']) {
+        assert.equal(Object.hasOwn(localSampler.params, key), true, `LM Sampler must persist ${key}`);
+        assert.equal(Object.hasOwn(server.params, key), false, `LlamaCPP Server must not persist ${key}`);
+        assert.equal(Object.hasOwn(orchestrator.params, key), false, `Orchestrator must not persist ${key}`);
+    }
+    const has = (fromNode, fromSocket, toNode, toSocket) => editor.connections.some((edge) => edge.fromNode === fromNode && edge.fromSocket === fromSocket && edge.toNode === toNode && edge.toSocket === toSocket);
+    assert.equal(has(modelLoader.id, 'model', server.id, 'model'), true);
+    assert.equal(has(localSampler.id, 'samplerParameters', server.id, 'samplerParameters'), false);
+    assert.equal(has(server.id, 'gguf', localSampler.id, 'gguf'), true);
+    assert.equal(has(server.id, 'gguf', orchestrator.id, 'gguf'), false);
+    assert.equal(has(localSampler.id, 'samplerParameters', orchestrator.id, 'samplerParameters'), true);
+    assert.equal(has(dmSampler.id, 'dmSampler', orchestrator.id, 'dmSampler'), true);
+    assert.equal(has(loader.id, 'tools', orchestrator.id, 'tools'), true);
+    assert.equal(has(loader.id, 'skills', orchestrator.id, 'skills'), true);
+    assert.equal(editor.connections.filter((edge) => edge.fromNode === dmSampler.id || edge.toSocket === 'dmSampler').length, 1,
+        'DM Sampler must connect directly and only to Orchestrator');
+    assert.equal(editor.connections.length, 6);
+    assert.equal(editor.connections.some((edge) => ['context', 'while', 'image'].includes(edge.fromSocket) || ['context', 'while', 'image'].includes(edge.toSocket)), false);
+
+    const fallback = source('backend/renderer/nodes/editor/core.js');
+    const fallbackBody = fallback.match(/function createDefaultNodePipeline\(startX, startY\) \{[\s\S]*?\n\}/u);
+    assert.ok(fallbackBody, 'emergency fallback graph constructor must exist');
+    for (const type of ['modelLoader', 'loadServer', 'localSampler', 'tools', 'sampler']) {
+        assert.ok(fallbackBody[0].includes("createNode('" + type + "'"), `fallback graph must create ${type}`);
+    }
+    assert.doesNotMatch(fallbackBody[0], /createNode\('(?:context|control)'/u);
+    assert.equal((fallbackBody[0].match(/addConnection\(/gu) || []).length, 5,
+        'emergency fallback remains the production-only five-node graph when custom nodes are unavailable');
 });
 
-test('Sampler context slider is model-relative, discrete by ten percent, and preserves the selected percentile across model changes', () => {
-    const { context, definitions } = harness();
-    context.Darkstar.modelInventory = [
-        { id: 'model.gguf', contextLength: 186000, reasoning: null },
-        { id: 'smaller.gguf', contextLength: 32000, reasoning: null },
-    ];
-    const samplerDefinition = definitions.get('sampler');
-    const loaderNode = { id: 'loader', type: 'modelLoader', selectedModel: 'model.gguf' };
-    const samplerNode = samplerDefinition.factory('sampler', 0, 0);
-    samplerNode.params.contextPercent = 50;
-    context.nodeEditorState.nodes = [loaderNode, samplerNode];
-    context.nodeEditorState.connections = [
-        { fromNode: 'loader', fromSocket: 'model', toNode: 'sampler', toSocket: 'model' },
-    ];
-
-    samplerDefinition.normalizeNode(samplerNode);
-    assert.equal(samplerNode.params.contextPercent, 50);
-    assert.equal(samplerNode.params.contextSize, 93000);
-    assert.equal(samplerDefinition.getParameterDisplayValue(samplerNode, 'contextPercent'), '50% · 93,000');
-
-    samplerNode.params.contextPercent = 57;
-    samplerDefinition.onParameterChange(samplerNode, 'contextPercent');
-    assert.equal(samplerNode.params.contextPercent, 60, 'even programmatic in-between values must snap to a ten-percent step');
-    assert.equal(samplerNode.params.contextSize, 111600);
-    assert.equal(samplerDefinition.getParameterDisplayValue(samplerNode, 'contextPercent'), '60% · 111,600');
-
-    loaderNode.selectedModel = 'smaller.gguf';
-    samplerDefinition.normalizeNode(samplerNode);
-    assert.equal(samplerNode.params.contextPercent, 60, 'model switches preserve user intent as a percentile');
-    assert.equal(samplerNode.params.contextSize, 19200, 'the absolute context allocation must be recomputed from the newly selected model');
-
-    samplerNode.params.contextPercent = 100;
-    samplerDefinition.onParameterChange(samplerNode, 'contextPercent');
-    assert.equal(samplerNode.params.contextSize, 32000, '100% must equal, never exceed, the selected model context capability');
-
-    loaderNode.selectedModel = 'model.gguf';
-    const staleLegacyNode = samplerDefinition.factory('legacy-sampler', 0, 0);
-    delete staleLegacyNode.params.contextPercent;
-    staleLegacyNode.params.contextSize = 999999;
-    context.nodeEditorState.nodes = [loaderNode, staleLegacyNode];
-    context.nodeEditorState.connections = [
-        { fromNode: 'loader', fromSocket: 'model', toNode: 'legacy-sampler', toSocket: 'model' },
-    ];
-    samplerDefinition.normalizeNode(staleLegacyNode);
-    assert.equal(staleLegacyNode.params.contextPercent, 100);
-    assert.equal(staleLegacyNode.params.contextSize, 186000, 'stale or restored absolute values above model capability must clamp to the model maximum');
+test('Orchestrator performs multimodal projector validation after its internal Context assembly reaches the model boundary', async () => {
+    const { definitions, getChatRequest } = pipelineHarness();
+    const localSampler = definitions.get('localSampler').factory('local-sampler', 0, 0);
+    const samplerParameters = definitions.get('localSampler').execute({ gguf: { id: 'model.gguf', multimodal: false, projectorPath: null, reasoning: null } }, localSampler, {}).samplerParameters;
+    const orchestratorDefinition = definitions.get('sampler');
+    await assert.rejects(orchestratorDefinition.execute({ samplerParameters,
+    }, orchestratorDefinition.factory('orchestrator', 0, 0), {
+        parallelSlots: 1,
+        history: [{ role: 'user', content: 'Describe this image', images: [{ base64: 'QUJD', mimeType: 'image/png' }] }],
+    }), /no multimodal projector/u);
+    assert.equal(getChatRequest(), null, 'invalid multimodal Context must be rejected before generation starts');
 });
 
-test('local Sampler UI exposes only the model-bounded ten-percent context slider and no arbitrary context number input', () => {
-    const { context, definitions } = harness();
-    const samplerDefinition = definitions.get('sampler');
-    const loaderNode = { id: 'loader', type: 'modelLoader', selectedModel: 'model.gguf' };
-    const samplerNode = samplerDefinition.factory('sampler', 0, 0);
-    samplerNode.params.contextPercent = 70;
-    context.nodeEditorState.nodes = [loaderNode, samplerNode];
-    context.nodeEditorState.connections = [
-        { fromNode: 'loader', fromSocket: 'model', toNode: 'sampler', toSocket: 'model' },
-    ];
-    const html = samplerDefinition.buildContentHTML(samplerNode);
-    const samplerSource = source('backend/renderer/nodes/builtin/sampler.js');
+test('runtime and request ownership stays separated across LlamaCPP Server, L_Sampler, and Orchestrator', () => {
     const serverSource = source('backend/renderer/nodes/builtin/load-server.js');
-
-    assert.match(html, /class="node-slider node-context-size-slider"/u);
-    assert.match(html, /min="10" max="100" step="10" value="70"/u);
-    assert.match(html, /data-param="contextPercent"/u);
-    assert.match(html, /70% · 183,500/u);
-    assert.match(html, /data-model-context-maximum="262144"/u);
-    assert.doesNotMatch(samplerSource, /controls\.numberInput\('Context size'/u);
-    assert.doesNotMatch(samplerSource, /Maximum output tokens/u);
-    assert.doesNotMatch(samplerSource, /controls\.numberInput\([^\n]*p\.maxTokens/u);
-    assert.doesNotMatch(serverSource, /buildContentHTML:[\s\S]*?contextSliderHTML\(node\)/u,
-        'Load Server must not expose a second editable context owner');
+    const localSamplerSource = source('backend/renderer/nodes/builtin/local-sampler.js');
+    const orchestratorSource = source('backend/renderer/nodes/builtin/sampler.js');
+    assert.match(serverSource, /contextSliderHTML\(node\)/u);
+    assert.doesNotMatch(serverSource, /samplerParameters\.contextSize|controls\.select\('Reasoning Effort'|controls\.slider\('Temperature'/u);
+    assert.doesNotMatch(localSamplerSource, /contextSliderHTML\(node\)|contextPercent|contextSize/u);
+    assert.match(localSamplerSource, /controls\.select\('Reasoning Effort'/u);
+    assert.match(localSamplerSource, /controls\.slider\('Temperature'/u);
+    assert.match(localSamplerSource, /controls\.textInput\('Sampler chain'/u);
+    assert.match(localSamplerSource, /controls\.textarea\('Stop strings'/u);
+    assert.match(localSamplerSource, /controls\.booleanSelect\('Reuse prompt cache'/u);
+    assert.match(localSamplerSource, /controls\.booleanSelect\('Ignore EOS'/u);
+    assert.match(orchestratorSource, /contextBuilder\.buildControls\(node\)/u);
+    assert.match(orchestratorSource, /controlPolicy\.buildControls\(node\)/u);
+    assert.doesNotMatch(orchestratorSource, /contextSliderHTML\(node\)|controls\.select\('Reasoning Effort'|controls\.slider\('Temperature'/u);
+    assert.doesNotMatch(orchestratorSource, /inputs\.context|inputs\.while/u);
 });
+
 });
 
 // ============================================================================
@@ -16527,21 +18759,24 @@ test('Auto-compact still defers on a cold runtime, while manual /compact loads t
     assert.match(String(compactMessages(manual.tab)[0].content || ''), /HANDOFF SUMMARY/u);
 });
 
-test('cold manual compaction graph preparation executes only Load Server and Load Model dependencies', async () => {
+test('cold manual compaction graph preparation executes only GGUF Server and Load Model dependencies', async () => {
     let runtimeModelId = '';
     const executed = [];
     const definitions = {
-        loadServer: {
-            outputNode: false,
-            async execute() { executed.push('server'); return { server: { running: true } }; },
-        },
         modelLoader: {
             outputNode: false,
-            async execute(inputs) {
-                assert.equal(inputs.server.running, true);
+            async execute() {
                 executed.push('model');
-                runtimeModelId = 'model.gguf';
-                return { model: { id: runtimeModelId } };
+                return { model: { id: 'model.gguf' } };
+            },
+        },
+        loadServer: {
+            outputNode: false,
+            async execute(inputs) {
+                assert.equal(inputs.model.id, 'model.gguf');
+                executed.push('server');
+                runtimeModelId = inputs.model.id;
+                return { gguf: { id: runtimeModelId, server: { running: true } } };
             },
         },
         sampler: {
@@ -16554,13 +18789,13 @@ test('cold manual compaction graph preparation executes only Load Server and Loa
         activeTabId: 1,
         nodeEditorState: {
             nodes: [
-                { id: 1, type: 'loadServer', title: 'Load Server', inputs: [], outputs: [{ name: 'server', label: 'server', type: 'server' }] },
-                { id: 2, type: 'modelLoader', title: 'Load Model', inputs: [{ name: 'server', label: 'server', type: 'server', required: true }], outputs: [{ name: 'model', label: 'model', type: 'model' }] },
-                { id: 3, type: 'sampler', title: 'Sampler', inputs: [{ name: 'model', label: 'model', type: 'model', required: true }], outputs: [{ name: 'text', label: 'text', type: 'text' }] },
+                { id: 1, type: 'modelLoader', title: 'Invoke Language Model (GGUF)', inputs: [], outputs: [{ name: 'model', label: 'Language Model', type: 'MODEL_CONFIG' }] },
+                { id: 2, type: 'loadServer', title: 'GGUF Server', inputs: [{ name: 'model', label: 'Language Model', type: 'MODEL_CONFIG', required: true }], outputs: [{ name: 'gguf', label: 'GGUF', type: 'MODEL' }] },
+                { id: 3, type: 'sampler', title: 'Orchestrator', inputs: [{ name: 'gguf', label: 'GGUF', type: 'MODEL', required: true }], outputs: [] },
             ],
             connections: [
-                { fromNode: 1, fromSocket: 'server', toNode: 2, toSocket: 'server' },
-                { fromNode: 2, fromSocket: 'model', toNode: 3, toSocket: 'model' },
+                { fromNode: 1, fromSocket: 'model', toNode: 2, toSocket: 'model' },
+                { fromNode: 2, fromSocket: 'gguf', toNode: 3, toSocket: 'gguf' },
             ],
             executingNodeId: null,
         },
@@ -16576,13 +18811,13 @@ test('cold manual compaction graph preparation executes only Load Server and Loa
     vm.runInContext(read('backend/renderer/graph-execution.js'), context, { filename: 'graph-execution.js' });
 
     assert.equal(await sandbox.ensureCompactionModelLoaded({ auto: false, tabId: 1 }), 'model.gguf');
-    assert.deepEqual(executed, ['server', 'model']);
+    assert.deepEqual(executed, ['model', 'server']);
     assert.equal(await sandbox.ensureCompactionModelLoaded({ auto: false, tabId: 1 }), 'model.gguf');
-    assert.deepEqual(executed, ['server', 'model'], 'an already loaded model must not rerun graph preparation');
+    assert.deepEqual(executed, ['model', 'server'], 'an already loaded model must not rerun graph preparation');
 
     runtimeModelId = '';
     await assert.rejects(() => sandbox.ensureCompactionModelLoaded({ auto: true, tabId: 1 }), /No model is loaded/u);
-    assert.deepEqual(executed, ['server', 'model'], 'automatic compaction must keep its cold-runtime defer behavior');
+    assert.deepEqual(executed, ['model', 'server'], 'automatic compaction must keep its cold-runtime defer behavior');
 });
 
 test('custom graph compaction remains available without a locally loaded model', async () => {
@@ -16700,12 +18935,15 @@ test('Auto-compact does not trigger below 90% context occupancy', async () => {
     assert.equal(streamed.length, 0);
 });
 
-test('Control node defaults Auto-compact OFF and emits the flag', () => {
-    const source = read('backend/renderer/nodes/builtin/control.js');
-    assert.match(source, /autoCompact:\s*false/u);
-    assert.match(source, /controls\.toggle\('Auto-compact'/u);
-    assert.match(source, /90% of the context window[\s\S]*earliest 50%/u);
-    assert.match(source, /autoCompact:\s*node\.params\.autoCompact === true/u);
+test('Orchestrator owns local Auto-compact while legacy Control retains the same API-compatible policy', () => {
+    const control = read('backend/renderer/nodes/builtin/control.js');
+    const orchestrator = read('backend/renderer/nodes/builtin/sampler.js');
+    assert.match(control, /autoCompact:\s*typeof params\.autoCompact === 'boolean' \? params\.autoCompact : false/u);
+    assert.match(control, /controls\.toggle\('Auto-compact'/u);
+    assert.match(control, /90% of the context window[\s\S]*earliest 50%/u);
+    assert.match(control, /autoCompact:\s*params\.autoCompact === true/u);
+    assert.match(orchestrator, /controlPolicy\.buildControls\(node\)/u);
+    assert.match(orchestrator, /controlPolicy\.runtimeControl\(p\)/u);
 });
 
 test('Auto-compact trigger threshold is scoped in send.js and matches the commands policy', () => {
@@ -16768,13 +19006,13 @@ test('slash-command menu closes on outside pointer interaction without stealing 
 
 test('Application Interface replaces the old Universal Interface Protocol display name without renaming the stable model tool id', () => {
     const production = [
-        read('backend/shell/index.html'), read('backend/renderer/uip.js'), read('backend/renderer/nodes/builtin/tools.js'),
+        read('backend/shell/index.html'), read('backend/renderer/uip.js'), read('backend/renderer/nodes/builtin/loader.js'),
         read('backend/agent/builtin/uip-tools.js'), read('backend/uip/uip-service.js'), read('backend/uip/windows-bridge.js'),
     ].join('\n');
     assert.equal(production.includes('Universal Interface Protocol'), false);
     assert.match(read('backend/shell/index.html'), />APPLICATION INTERFACE</u);
     assert.match(read('backend/agent/builtin/uip-tools.js'), /name: 'UIP_Chromium_Interface_Element'/u);
-    assert.doesNotMatch(read('backend/renderer/nodes/builtin/tools.js'), /Application Interface|uipProvider\(/u);
+    assert.doesNotMatch(read('backend/renderer/nodes/builtin/loader.js'), /Application Interface|uipProvider\(/u);
 });
 
 test('compact instructions are packaged in agent_assets/agent_prompts and compacted system history renders as a dedicated orange double-line COMPACT agent surface', () => {
@@ -17237,7 +19475,24 @@ test('live tool streaming has one canonical full-call representation instead of 
     assert.doesNotMatch(streamState, /summarizeToolCalls/u);
     assert.doesNotMatch(tracker, /payload\?\.partialCalls/u);
     assert.doesNotMatch(apiBackend, /toolCallSummary/u);
-    assert.match(streaming, /onToolCallDelta\(\{ calls: snapshotToolCalls\(toolCalls\) \}\)/u);
+    assert.match(streaming, /onToolCallDelta\(\{ calls: toolCalls \}\)/u,
+        'the synchronous preparation tracker should receive the canonical live Map');
+    assert.doesNotMatch(streaming, /onToolCallDelta\(\{ calls: snapshotToolCalls\(toolCalls\) \}\)/u,
+        'streaming tool arguments must not allocate a full snapshot wrapper on every delta');
+    assert.match(tracker, /source instanceof Map/u, 'the preparation tracker must accept the canonical live Map');
+});
+
+test('tool preparation tracker consumes the live Map without changing emitted preparation semantics', () => {
+    const { createPreparationTracker } = require('../../runtime/tool-preparation-tracker');
+    const events = [];
+    const tracker = createPreparationTracker(3, { onToolEvent(event) { events.push(event); } });
+    tracker.update({ calls: new Map([[0, { index: 0, id: 'call-1', function: { name: 'replace_file', arguments: '{\"path\":\"game.js\"}' } }]]) });
+    tracker.finish();
+    const preparation = events.find((event) => event && event.type === 'preparing' && event.preparation);
+    assert.ok(preparation, 'live Map update should emit normal preparation state');
+    assert.equal(preparation.preparation.toolCallId, 'call-1');
+    assert.equal(preparation.preparation.name, 'replace_file');
+    assert.equal(preparation.preparation.argumentChars, '{\"path\":\"game.js\"}'.length);
 });
 
 function toolRuntime(overrides = {}) {
@@ -19211,78 +21466,59 @@ function read(relativePath) {
     return fs.readFileSync(path.join(root, relativePath), 'utf8');
 }
 
-test('Launch_Darkstar.bat is the root-level, location-independent entrypoint that bootstraps pinned Python, Electron and llama.cpp dependencies', () => {
-    const source = read('Launch_Darkstar.bat');
-    assert.match(source, /set "DARKSTAR_ROOT=%~dp0"/u);
-    assert.match(source, /backend\\vendor\\electron\\win32-x64\\electron\.exe/u);
-    assert.match(source, /backend\\scripts\\bootstrap-python\.ps1/u);
-    assert.match(source, /backend\\vendor\\python\\python-3\.11\.9-amd64\.exe/u);
-    assert.match(source, /backend\\scripts\\bootstrap-electron\.ps1/u);
-    assert.match(source, /backend\\scripts\\bootstrap-llamacpp\.ps1/u);
-    assert.match(source, /backend\\bin\\backends\\cpu\\llama-server\.exe/u);
-    assert.match(source, /backend\\bin\\backends\\vulkan\\llama-server\.exe/u);
-    assert.match(source, /backend\\bin\\backends\\cuda\\llama-server\.exe/u);
-    assert.match(source, /powershell\.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%DARKSTAR_PYTHON_BOOTSTRAP%"/u);
-    assert.match(source, /powershell\.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%DARKSTAR_BOOTSTRAP%"/u);
-    assert.match(source, /powershell\.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%DARKSTAR_LLAMA_BOOTSTRAP%"/u);
-    assert.match(source, /43\.2\.0/u);
-    assert.match(source, /set "ELECTRON_RUN_AS_NODE=1"/u);
-    assert.match(source, /Diagnostics enabled\. Runtime trace will be recorded for this session\./u);
-    assert.match(source, /"%DARKSTAR_ELECTRON%" "%DARKSTAR_LAUNCHER%" --darkstar-debug %\*/u);
+test('Launch_Darkstar.bat uses Windows CRLF line endings so cmd CALL labels remain reliable', () => {
+    const launcherPath = path.join(root, 'Launch_Darkstar.bat');
+    const descriptor = fs.openSync(launcherPath, 'r');
+    const bytes = Buffer.alloc(fs.fstatSync(descriptor).size);
+    try { fs.readSync(descriptor, bytes, 0, bytes.length, 0); } finally { fs.closeSync(descriptor); }
+    const source = bytes.toString('latin1');
+    assert.ok(source.includes('\r\n'), 'Windows launcher must contain CRLF line endings');
+    assert.equal(source.replace(/\r\n/gu, '').includes('\n'), false, 'Windows launcher must not contain bare LF line endings');
+    assert.equal(source.replace(/\r\n/gu, '').includes('\r'), false, 'Windows launcher must not contain bare CR line endings');
+    assert.match(read('.gitattributes'), /^\*\.bat text eol=crlf$/mu);
+    assert.match(read('.gitattributes'), /^\*\.cmd text eol=crlf$/mu);
 });
 
-test('root native launcher and all shortcut creation are removed while bootstrap remains visible only when required', () => {
-    assert.equal(fs.existsSync(path.join(root, 'Darkstar.exe')), false, 'obsolete root native launcher must remain absent');
-    assert.equal(fs.existsSync(path.join(root, 'Darkstar.bat')), false, 'obsolete BAT filename must remain absent');
-    assert.equal(fs.existsSync(path.join(root, 'launcher')), false, 'obsolete native launcher source tree must remain absent');
-    assert.equal(fs.existsSync(path.join(root, 'backend', 'scripts', 'build-windows-launcher.ps1')), false, 'obsolete launcher build helper must remain absent');
-    assert.equal(fs.existsSync(path.join(root, 'backend', 'scripts', 'create-first-launch-shortcut.ps1')), false, 'legacy one-time shortcut helper must remain absent');
-    assert.equal(fs.existsSync(path.join(root, 'backend', 'scripts', 'ensure-darkstar-shortcut.ps1')), false, 'shortcut creation helper must remain removed');
-    assert.equal(fs.existsSync(path.join(root, 'Darkstar.lnk')), false, 'repository must not ship a Darkstar shortcut');
-
+test('Launch_Darkstar.bat is the standalone Windows entrypoint and owns presence-only provisioning plus Electron startup', () => {
     const batch = read('Launch_Darkstar.bat');
-    const hiddenLauncher = read('backend/scripts/launch-darkstar-hidden.vbs');
-    const setupLauncher = read('backend/scripts/launch-darkstar-setup.vbs');
-    const pythonBootstrap = read('backend/scripts/bootstrap-python.ps1');
-    const electronBootstrap = read('backend/scripts/bootstrap-electron.ps1');
-    const llamaBootstrap = read('backend/scripts/bootstrap-llamacpp.ps1');
-
-    assert.doesNotMatch(batch, /DARKSTAR_SHORTCUT|ensure-darkstar-shortcut|Darkstar\.lnk|Start Menu|start-menu-shortcut/u);
-    assert.match(batch, /set "DARKSTAR_HIDDEN_HELPER=%DARKSTAR_ROOT%\\backend\\scripts\\launch-darkstar-hidden\.vbs"/u);
-    assert.match(batch, /set "DARKSTAR_SETUP_HELPER=%DARKSTAR_ROOT%\\backend\\scripts\\launch-darkstar-setup\.vbs"/u);
-    assert.match(batch, /set "DARKSTAR_BOOTSTRAP_REQUIRED=0"/u);
-    assert.match(batch, /if \/I "%DARKSTAR_HIDDEN_LAUNCH%"=="1" if "%DARKSTAR_BOOTSTRAP_REQUIRED%"=="1"/u);
-    assert.match(batch, /start "" \/b "%DARKSTAR_WSCRIPT%" \/\/Nologo "%DARKSTAR_SETUP_HELPER%" %\*/u);
-    assert.match(batch, /Runtime setup complete\. Starting Darkstar/u);
-    assert.match(batch, /call :launch_hidden_async %\*/u);
-    assert.match(batch, /start "" \/b "%DARKSTAR_WSCRIPT%" \/\/Nologo "%DARKSTAR_HIDDEN_HELPER%" %\*/u);
-
-    assert.match(hiddenLauncher, /shell\.Run\(commandLine, 0, True\)/u);
-    assert.match(hiddenLauncher, /DARKSTAR_HIDDEN_LAUNCH/u);
-    assert.ok(hiddenLauncher.includes('& " /d /c call " &'), 'hidden launcher must invoke the BAT through cmd /c call');
-    assert.match(setupLauncher, /shell\.Run\(commandLine, 1, True\)/u);
-    assert.ok(setupLauncher.includes('& " /d /c call " &'), 'visible setup launcher must use cmd /c so its terminal closes with the BAT');
-    assert.match(setupLauncher, /DARKSTAR_HIDDEN_LAUNCH/u);
-
-    assert.match(pythonBootstrap, /\$ProgressPreference = 'SilentlyContinue'/u);
-    assert.match(pythonBootstrap, /python-3\.11\.9-amd64\.exe/u);
-    assert.match(pythonBootstrap, /Get-FileHash/u);
-    assert.match(pythonBootstrap, /Get-AuthenticodeSignature/u);
-    assert.match(pythonBootstrap, /Start-Process -FilePath \$InstallerPath -Wait -PassThru/u);
-    assert.doesNotMatch(pythonBootstrap, /\/quiet|\/passive|InstallAllUsers=|PrependPath=|Include_pip=|Shortcuts=/u);
-    assert.match(electronBootstrap, /\$ProgressPreference = 'SilentlyContinue'/u);
-    assert.match(llamaBootstrap, /\$ProgressPreference = 'SilentlyContinue'/u);
-    assert.match(electronBootstrap, /curl\.exe/u);
-    assert.match(electronBootstrap, /--progress-bar/u);
-    assert.match(llamaBootstrap, /curl\.exe/u);
-    assert.match(llamaBootstrap, /--progress-bar/u);
-    assert.ok(batch.includes('if /I "%DARKSTAR_HIDDEN_LAUNCH%"=="1" exit /b %DARKSTAR_EXIT_CODE%'), 'hidden BAT failures must return instead of pausing invisibly');
+    assert.equal(fs.existsSync(path.join(root, 'Darkstar_Launcher.exe')), false, 'the native launcher executable must not ship');
+    assert.equal(fs.existsSync(path.join(root, 'launcher', 'Darkstar_Launcher.c')), false, 'the removed native launcher source must not ship');
+    assert.equal(fs.existsSync(path.join(root, 'backend', 'scripts', 'build-windows-launcher.ps1')), false, 'the removed native launcher build helper must not ship');
+    for (const marker of [
+        'backend\\scripts\\bootstrap-python.ps1',
+        'backend\\scripts\\bootstrap-electron.ps1',
+        'backend\\scripts\\bootstrap-llamacpp.ps1',
+        'backend\\vendor\\electron\\win32-x64\\electron.exe',
+        'backend\\shell',
+        '.darkstar-runtime\\python-install.json',
+        'backend\\bin\\backends\\cpu\\llama-server.exe',
+        'backend\\bin\\backends\\vulkan\\llama-server.exe',
+        'backend\\bin\\backends\\cuda\\llama-server.exe',
+        'backend\\bin\\diffusion\\cpu\\sd-cli.exe',
+        'backend\\bin\\diffusion\\vulkan\\sd-cli.exe',
+    ]) assert.ok(batch.includes(marker), `standalone BAT must include ${marker}`);
+    assert.match(batch, /call :ensure_python \|\| goto :bootstrap_failed/u);
+    assert.match(batch, /call :ensure_electron \|\| goto :bootstrap_failed/u);
+    assert.match(batch, /call :ensure_native \|\| goto :bootstrap_failed/u);
+    assert.match(batch, /start "" \/D "%DARKSTAR_ROOT%" "%DARKSTAR_ELECTRON%" "%DARKSTAR_APP%" %\*/u);
+    assert.doesNotMatch(batch, /ELECTRON_RUN_AS_NODE|wscript\.exe/iu,
+        'standalone BAT must launch one Electron application without a hidden-script or Node-mode handoff');
+    assert.equal(fs.existsSync(path.join(root, 'backend', 'scripts', 'launch-darkstar-hidden.vbs')), false, 'obsolete VBS handoff must remain removed');
 });
 
-test('Launch_Darkstar.bat always enables runtime diagnostics for supported Windows launches', () => {
-    const source = read('Launch_Darkstar.bat');
-    assert.match(source, /"%DARKSTAR_ELECTRON%" "%DARKSTAR_LAUNCHER%" --darkstar-debug %\*/u);
-    assert.doesNotMatch(source, /"%DARKSTAR_ELECTRON%" "%DARKSTAR_LAUNCHER%" %\*/u);
+test('main workspace starts directly after Electron readiness with no pre-workspace gate assets or state', () => {
+    const source = read('backend/Darkstar_Core.js');
+    assert.equal(fs.existsSync(path.join(root, 'backend', 'shell', 'trial.html')), false);
+    assert.equal(fs.existsSync(path.join(root, 'backend', 'shell', 'trial.css')), false);
+    assert.doesNotMatch(source, /createTrialWindow|trial-state\.json|TRIAL_DURATION_DAYS|darkstar:trial-action|darkstar-preload-role=trial/u);
+    const readyBlock = source.slice(source.indexOf('app.whenReady().then(() => {'), source.indexOf("app.on('window-all-closed'"));
+    assert.match(readyBlock, /startMainApplication\(\);/u,
+        'app.whenReady must start the main application directly');
+    assert.match(source, /mainWindow\.webContents\.once\('dom-ready', \(\) => \{[\s\S]*?mainWindow\.show\(\);/u,
+        'main workspace must still remain hidden until its DOM is ready');
+    assert.match(source, /let services = null/u);
+    assert.match(source, /const ensureRuntimeServices = \(\) =>/u,
+        'runtime services should still initialize lazily inside main application startup');
 });
 
 test('Python bootstrap launches the pinned official 3.11.9 x64 installer interactively only when Python 3.11 x64 is absent', () => {
@@ -19372,15 +21608,43 @@ test('llama.cpp bootstrap is pinned to one b10645 CPU/Vulkan/CUDA 12.4 bundle an
     assert.doesNotMatch(source, /releases\/latest|http:\/\//u);
 });
 
-test('Launch_Darkstar.bat pauses only on startup or application failure and preserves the failing exit code', () => {
+
+test('stable-diffusion.cpp bootstrap is pinned to the audited 50d6405 CPU/Vulkan release and verifies archives before installation', () => {
+    const source = read('backend/scripts/bootstrap-llamacpp.ps1');
+    const policy = JSON.parse(read('backend/runtime-component-policy.json'));
+    const bootstrap = policy.backendBin.diffusionBootstrap;
+    assert.equal(bootstrap.bundleVersion, 1);
+    assert.equal(bootstrap.releaseTag, 'master-830-50d6405');
+    assert.equal(bootstrap.commit, '50d6405');
+    assert.deepEqual(bootstrap.backends.cpu.archives.map((entry) => [entry.asset, entry.sha256]), [[
+        'sd-master-50d6405-bin-win-cpu-x64.zip',
+        'a51eaf6b5e779142ef58a0a983fd629589d6a8e76ce2779ed12721c9686b26ce',
+    ]]);
+    assert.deepEqual(bootstrap.backends.vulkan.archives.map((entry) => [entry.asset, entry.sha256]), [[
+        'sd-master-50d6405-bin-win-vulkan-x64.zip',
+        '633771a830ad3e7e6ca5b602acc4d57fe44fc13a09a5f79bfeb38e7f58af98f9',
+    ]]);
+    for (const backend of ['cpu', 'vulkan']) {
+        for (const archive of bootstrap.backends[backend].archives) {
+            assert.match(archive.url, /^https:\/\/github\.com\/leejet\/stable-diffusion\.cpp\/releases\/download\/master-830-50d6405\//u);
+        }
+    }
+    assert.match(source, /Ensure-DiffusionRuntime/u);
+    assert.match(source, /Get-DiffusionBackendValidationIssues/u);
+    assert.match(source, /Test-DiffusionRuntime/u);
+    assert.match(source, /Get-FileHash/u);
+    assert.match(source, /stable-diffusion\.cpp-LICENSE/u);
+    assert.match(source, /stable-diffusion\.cpp-ggml-LICENSE/u);
+    assert.match(source, /Test-MITNotice/u);
+    assert.doesNotMatch(source, /stable-diffusion\.cpp[\s\S]*releases\/latest/u);
+});
+
+test('Launch_Darkstar.bat pauses only on provisioning or launch failure paths', () => {
     const source = read('Launch_Darkstar.bat');
-    const successExit = source.indexOf('if not "%DARKSTAR_EXIT_CODE%"=="0" goto :launch_failed');
-    const pause = source.indexOf('pause >nul');
-    assert.ok(successExit >= 0);
-    assert.ok(pause > successExit, 'pause must live only in the failure path');
-    assert.match(source, /:startup_failed[\s\S]*set "DARKSTAR_EXIT_CODE=1"/u);
-    assert.match(source, /:hold_error[\s\S]*pause >nul[\s\S]*exit \/b %DARKSTAR_EXIT_CODE%/u);
-    assert.ok(source.includes('if /I \"%DARKSTAR_HIDDEN_LAUNCH%\"==\"1\" exit /b %DARKSTAR_EXIT_CODE%'), 'hidden shortcut launches must return failure without waiting for an invisible keypress');
+    assert.match(source, /:bootstrap_failed[\s\S]*?pause >nul[\s\S]*?exit \/b 1/u);
+    assert.match(source, /:launch_failed[\s\S]*?pause >nul[\s\S]*?exit \/b 1/u);
+    const happyPath = source.slice(0, source.indexOf(':ensure_python'));
+    assert.doesNotMatch(happyPath, /pause >nul/u, 'successful direct startup must not stop for user input');
 });
 
 test('normal launcher strips Electron Node-mode and leaves diagnostics completely off without --darkstar-debug', async (t) => {
@@ -20103,7 +22367,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { ModelDirectoryMonitor } = require('../../runtime/models');
+const { LlamaRuntime } = require('../../llama-runtime');
+const { AsyncModelInventory, ModelDirectoryMonitor } = require('../../runtime/models');
 const { countChatInputTokens, resetInputTokenEndpointSupport } = require('../../runtime/tokens');
 const { createProjectSourceView } = require('../../scripts/source-analysis');
 const { detectReasoningCapabilities } = require('../../runtime/gguf-metadata');
@@ -20178,6 +22443,199 @@ test('model directory monitoring preserves polling fallback when native watching
     assert.equal(interval.delay, 250);
     monitor.stop();
     assert.equal(interval, null);
+});
+
+
+test('startup model inventory runs off the main thread and coalesces overlapping scans', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-model-worker-'));
+    const modelPath = path.join(directory, 'fixture.gguf');
+    const projectorPath = path.join(directory, 'fixture.mmproj');
+    const header = Buffer.alloc(24);
+    header.write('GGUF', 0, 'ascii');
+    header.writeUInt32LE(3, 4);
+    header.writeBigUInt64LE(0n, 8);
+    header.writeBigUInt64LE(0n, 16);
+    fs.writeFileSync(modelPath, header);
+    fs.writeFileSync(projectorPath, 'projector');
+    const inventory = new AsyncModelInventory({
+        modelsDir: directory,
+        corePath: path.join(ROOT, 'backend', 'Darkstar_Core.js'),
+    });
+    try {
+        const first = inventory.list();
+        const second = inventory.list();
+        assert.equal(first, second, 'monitor startup and renderer startup must share one inventory scan');
+        let eventLoopTurnObserved = false;
+        await new Promise((resolve) => setImmediate(() => { eventLoopTurnObserved = true; resolve(); }));
+        assert.equal(eventLoopTurnObserved, true, 'requesting inventory must yield instead of synchronously parsing GGUF metadata');
+        const records = await first;
+        assert.deepEqual(records.map((record) => record.id), ['fixture']);
+        const projectorRequest = inventory.listProjectors(modelPath);
+        let projectorTurnObserved = false;
+        await new Promise((resolve) => setImmediate(() => { projectorTurnObserved = true; resolve(); }));
+        assert.equal(projectorTurnObserved, true, 'projector discovery used by first model load must also yield off Electron Main');
+        const projectors = await projectorRequest;
+        assert.equal(projectors.some((candidate) => candidate.path === fs.realpathSync(projectorPath)), true);
+    } finally {
+        await inventory.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('model inventory worker is referenced only while a request is pending and returns to an idle unref state', async () => {
+    const lifecycle = [];
+    class FakeWorker extends EventEmitter {
+        constructor() { super(); lifecycle.push('construct'); }
+        on(name, listener) { lifecycle.push(`on:${name}`); return super.on(name, listener); }
+        ref() { lifecycle.push('ref'); }
+        unref() { lifecycle.push('unref'); }
+        postMessage(message) {
+            lifecycle.push('post');
+            queueMicrotask(() => this.emit('message', { id: message.id, success: true, records: [] }));
+        }
+        async terminate() { lifecycle.push('terminate'); this.emit('exit', 0); return 0; }
+    }
+    const inventory = new AsyncModelInventory({
+        modelsDir: path.join(os.tmpdir(), 'darkstar-model-worker-lifecycle'),
+        corePath: path.join(ROOT, 'backend', 'Darkstar_Core.js'),
+        Worker: FakeWorker,
+    });
+    try {
+        await inventory.list();
+        const listenerEnd = lifecycle.indexOf('on:exit');
+        const firstUnref = lifecycle.indexOf('unref');
+        const refIndex = lifecycle.indexOf('ref');
+        const postIndex = lifecycle.indexOf('post');
+        const lastUnref = lifecycle.lastIndexOf('unref');
+        assert.ok(listenerEnd >= 0 && firstUnref > listenerEnd, 'idle unref must happen after MessagePort-owning listeners are attached');
+        assert.ok(refIndex > firstUnref && postIndex > refIndex, 'an active request must ref the worker before posting work');
+        assert.ok(lastUnref > postIndex, 'the worker must return to unref state after the final response settles');
+    } finally {
+        await inventory.close();
+    }
+    assert.equal(lifecycle.at(-1), 'terminate');
+});
+
+test('startup inventory and first-send lifecycle keep GGUF and projector inspection off Electron Main', () => {
+    const ipcSource = read('backend/ipc/register-llama-ipc.js');
+    const runtimeSource = read('backend/llama-runtime.js');
+    const selectionSource = read('backend/runtime/model-selection-service.js');
+    const serverSource = read('backend/runtime/server-process.js');
+    const lifecycleSource = read('backend/runtime/model-lifecycle.js');
+    assert.match(runtimeSource, /listLocalModelsAsync\(\) \{ return this\.modelInventory\.list\(\); \}/u);
+    assert.match(runtimeSource, /inspectModelFilesAsync\(paths\) \{ return this\.modelInventory\.inspect\(paths\); \}/u);
+    assert.match(runtimeSource, /inspectModelAsync\(modelId\) \{ return modelSelection\.inspectModel\(this, modelId\); \}/u);
+    assert.match(selectionSource, /runtime\.modelInventory\?\.inspectModel[\s\S]*?runtime\.modelInventory\.inspectModel\(requested\)/u,
+        'selected-model metadata inspection must stay on the inventory worker instead of rescanning GGUF metadata on the Electron thread');
+    assert.match(selectionSource, /runtime\.modelInventory\?\.listProjectors[\s\S]*?runtime\.modelInventory\.listProjectors\(modelPath\)/u,
+        'projector discovery used by model load must stay on the inventory worker');
+    assert.match(serverSource, /await runtime\.resolveModelSelectionAsync\(normalized\.modelId\)/u,
+        'first Send must not synchronously walk or parse GGUF files while starting llama.cpp');
+    assert.doesNotMatch(serverSource, /runtime\.resolveModelSelection\(normalized\.modelId\)/u);
+    assert.match(lifecycleSource, /const selection = await runtime\.resolveModelSelectionAsync\(normalized\.modelId\)/u);
+    assert.match(lifecycleSource, /request\.selection \|\| await runtime\.resolveModelSelectionAsync\(modelId\)/u,
+        'the worker-resolved model record must be carried through direct/legacy loading instead of being parsed again');
+    assert.match(lifecycleSource, /const models = await runtime\.listRouterModels\(true\);[\s\S]*?runtime\.resolveModelSelection\(normalized\.modelId, models/u,
+        'the only synchronous resolver use may occur after worker inspection and router listing, where it matches in-memory records only');
+    assert.match(ipcSource, /const allModels = async \(\) => \[\.\.\.await runtime\.listLocalModelsAsync\(\), \.\.\.await rememberedModels\(\)\]/u);
+    assert.match(ipcSource, /runtime\.inspectModelFilesAsync\(rememberedModelPaths\(\)\)/u,
+        'remembered GGUF metadata must stay on the inventory worker during startup');
+    assert.match(ipcSource, /localHistory\?\.prune\(LOCAL_MODEL_HISTORY_KEYS\.MODELS, validateModelFilePath\)/u,
+        'history pruning must not call runtime.inspectModel and recursively walk the model directory');
+    assert.doesNotMatch(ipcSource, /const allModels = \(\) => \[\.\.\.runtime\.listLocalModels\(\)/u);
+});
+
+test('absolute remembered model inspection never rescans the models directory on the Electron thread', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-absolute-model-'));
+    const modelPath = path.join(directory, 'remembered.gguf');
+    const header = Buffer.alloc(24);
+    header.write('GGUF', 0, 'ascii'); header.writeUInt32LE(3, 4);
+    header.writeBigUInt64LE(0n, 8); header.writeBigUInt64LE(0n, 16);
+    fs.writeFileSync(modelPath, header);
+    const runtime = new LlamaRuntime({
+        baseDir: directory,
+        modelsDir: path.join(directory, 'models'),
+        modelInventory: { list: async () => [], inspect: async () => [], close: async () => {} },
+        log: () => {},
+    });
+    runtime.listLocalModels = () => { throw new Error('absolute inspection must not walk models/'); };
+    try {
+        const inspected = runtime.inspectModel(modelPath);
+        assert.equal(inspected.path, fs.realpathSync(modelPath));
+    } finally {
+        runtime.modelIdleUnload.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('worker inventory can inspect remembered model files without blocking or rescanning the local directory', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-remembered-worker-'));
+    const modelPath = path.join(directory, 'remembered.gguf');
+    const header = Buffer.alloc(24);
+    header.write('GGUF', 0, 'ascii'); header.writeUInt32LE(3, 4);
+    header.writeBigUInt64LE(0n, 8); header.writeBigUInt64LE(0n, 16);
+    fs.writeFileSync(modelPath, header);
+    const inventory = new AsyncModelInventory({
+        modelsDir: path.join(directory, 'models'),
+        corePath: path.join(ROOT, 'backend', 'Darkstar_Core.js'),
+    });
+    try {
+        const inspection = inventory.inspect([modelPath, path.join(directory, 'missing.gguf')]);
+        let yielded = false;
+        await new Promise((resolve) => setImmediate(() => { yielded = true; resolve(); }));
+        assert.equal(yielded, true);
+        const records = await inspection;
+        assert.deepEqual(records.map((record) => record.path), [fs.realpathSync(modelPath)]);
+    } finally {
+        await inventory.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+
+test('selected-model metadata inspection targets one GGUF through the inventory worker', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-selected-model-worker-'));
+    const modelsDir = path.join(directory, 'models');
+    fs.mkdirSync(modelsDir, { recursive: true });
+    const writeContextGguf = (filePath) => {
+        const u32 = (value) => { const buffer = Buffer.alloc(4); buffer.writeUInt32LE(value); return buffer; };
+        const u64 = (value) => { const buffer = Buffer.alloc(8); buffer.writeBigUInt64LE(BigInt(value)); return buffer; };
+        const str = (value) => { const buffer = Buffer.from(value, 'utf8'); return Buffer.concat([u64(buffer.length), buffer]); };
+        fs.writeFileSync(filePath, Buffer.concat([
+            Buffer.from('GGUF'), u32(3), u64(0), u64(3),
+            str('general.architecture'), u32(8), str('test'),
+            str('test.block_count'), u32(4), u32(48),
+            str('test.context_length'), u32(4), u32(262144),
+        ]));
+    };
+    const selectedPath = path.join(modelsDir, 'selected.gguf');
+    writeContextGguf(selectedPath);
+    const otherDir = path.join(modelsDir, 'other');
+    fs.mkdirSync(otherDir, { recursive: true });
+    writeContextGguf(path.join(otherDir, 'other-model.gguf'));
+    const inventory = new AsyncModelInventory({ modelsDir, corePath: path.join(ROOT, 'backend', 'Darkstar_Core.js') });
+    try {
+        const selected = await inventory.inspectModel('selected');
+        assert.equal(selected.id, 'selected');
+        assert.equal(selected.path, fs.realpathSync(selectedPath));
+        assert.equal(selected.contextLength, 262144);
+        const nested = await inventory.inspectModel('other');
+        assert.equal(nested.id, 'other');
+        assert.equal(nested.contextLength, 262144);
+    } finally {
+        await inventory.close();
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('renderer shell restoration is not gated behind the initial model-directory inventory', () => {
+    const source = read('backend/renderer/init.js');
+    const inventoryStart = source.indexOf("var initialModelInventoryPromise = typeof loadModelList === 'function' ? loadModelList() : Promise.resolve(false);");
+    const firstRender = source.indexOf('renderTabs();');
+    const inventoryAwait = source.indexOf('await initialModelInventoryPromise;');
+    assert.ok(inventoryStart >= 0 && firstRender > inventoryStart && inventoryAwait > firstRender,
+        'the first shell render must happen while model inventory continues asynchronously');
+    assert.doesNotMatch(source, /startAutomaticModelRefresh\(\);\s*await loadModelList\(\);/u);
 });
 
 test('exact input-token preflight reuses the same sanitized request across slot assignment but invalidates on prompt-affecting changes', async () => {
@@ -20543,7 +23001,7 @@ test('filesystem browser sidebar is static Darkstar UI with icons and is wired o
     assert.match(modal, /navigateFilesystemDirectory\(String\(button\.dataset\.localPath \|\| ''\), button\.dataset\.rootView === 'true'/u);
     assert.doesNotMatch(modal, /showOpenDialog|dialog\.showOpenDialog/u);
     assert.match(appMain, /\['desktop', 'downloads', 'documents', 'pictures', 'music', 'videos'\][\s\S]*?app\.getPath\(name\)/u);
-    assert.match(llamaIpc, /model: DIALOG_LOCATION_KEYS\.MODELS, projector: DIALOG_LOCATION_KEYS\.PROJECTORS,[\s\S]*?tool: DIALOG_LOCATION_KEYS\.TOOLS, skill: DIALOG_LOCATION_KEYS\.SKILLS, image: DIALOG_LOCATION_KEYS\.IMAGES/u);
+    assert.match(llamaIpc, /model: DIALOG_LOCATION_KEYS\.MODELS, diffusion: DIALOG_LOCATION_KEYS\.DIFFUSION_MODELS, projector: DIALOG_LOCATION_KEYS\.PROJECTORS,[\s\S]*?tool: DIALOG_LOCATION_KEYS\.TOOLS, skill: DIALOG_LOCATION_KEYS\.SKILLS, image: DIALOG_LOCATION_KEYS\.IMAGES/u);
     assert.match(llamaIpc, /getDirectory\(locationKey, fallback\)[\s\S]*?runtime\.browseModelFiles\(\{ \.\.\.request, kind \}, \{ specialPaths: options\.modelFileBrowserPaths \|\| \{\}, defaultPath \}\)[\s\S]*?rememberDirectory\(locationKey, result\.currentPath\)/u);
 });
 
@@ -20678,9 +23136,10 @@ test('absolute filesystem models always use direct legacy loading instead of the
         activeStreams: new Map(),
         pendingStreams: new Map(),
         normalizeModelLoadRequest(request) { return { modelId: String(request), projectorPath: '' }; },
-        resolveModelSelection(modelId) { return resolveModelSelection(modelId, [], []); },
-        async loadLegacyModel(modelId, projectorPath) {
-            legacyRequest = { modelId, projectorPath };
+        resolveModelSelection() { throw new Error('direct first load must not resolve GGUF metadata synchronously on Electron Main'); },
+        async resolveModelSelectionAsync(modelId) { return resolveModelSelection(modelId, [], []); },
+        async loadLegacyModel(modelId, projectorPath, options) {
+            legacyRequest = { modelId, projectorPath, selection: options && options.selection };
             return { modelId, status: 'loaded' };
         },
         async listRouterModels() { routerListed = true; return []; },
@@ -20694,14 +23153,17 @@ test('absolute filesystem models always use direct legacy loading instead of the
             validateProjectorPath: (value) => value,
         });
         assert.equal(result.status, 'loaded');
-        assert.deepEqual(legacyRequest, { modelId: model, projectorPath: null });
+        assert.equal(legacyRequest.modelId, model);
+        assert.equal(legacyRequest.projectorPath, null);
+        assert.equal(legacyRequest.selection.directFile, true, 'the worker-resolved selection must be carried into legacy loading without a second GGUF inspection');
+        assert.equal(legacyRequest.selection.local.path, fs.realpathSync(model));
         assert.equal(routerListed, false, 'direct filesystem models must never fall through to /models router discovery');
     } finally {
         fs.rmSync(directory, { recursive: true, force: true });
     }
 });
 
-test('Load Model dropdown contains only model choices because local browsing has a dedicated adjacent button', () => {
+test('Load Model dropdown exposes None while keeping the path example out of selectable choices', () => {
     const source = read('backend/renderer/nodes/builtin/common.js');
     const modelSelect = {
         options: [
@@ -20720,10 +23182,46 @@ test('Load Model dropdown contains only model choices because local browsing has
     const common = sandbox.Darkstar.nodes.builtinCommon;
     const options = common.listModelOptions('alpha');
     assert.deepEqual(Array.from(options, (option) => option.value), ['', 'alpha', 'beta']);
+    assert.equal(options[0].label, 'None');
+    assert.equal(options.some((option) => /Your\/Model\/Path/u.test(option.label)), false);
     assert.equal(options.some((option) => /Browse Local Filesystem/u.test(option.label)), false);
     assert.equal(common.isAbsoluteModelPath('/models/external.gguf'), true);
     assert.equal(common.isAbsoluteModelPath('C:\\Models\\external.gguf'), true);
     assert.equal(common.isAbsoluteModelPath('managed/subdir.gguf'), false);
+});
+
+test('model and projector dropdowns display None for an explicit empty selection instead of path placeholders', () => {
+    const source = read('backend/renderer/nodes/control-renderers.js');
+    const sandbox = {
+        Darkstar: {
+            dom: { escapeHtml(value) {
+                return String(value).replace(/&/gu, '&amp;').replace(/</gu, '&lt;').replace(/>/gu, '&gt;').replace(/"/gu, '&quot;');
+            } },
+            nodes: {},
+        },
+    };
+    sandbox.window = sandbox;
+    sandbox.globalThis = sandbox;
+    vm.runInNewContext(source, vm.createContext(sandbox), { filename: 'backend/renderer/nodes/control-renderers.js' });
+    const controls = sandbox.Darkstar.nodes.controls;
+    const options = [{ value: '', label: 'None' }, { value: 'alpha', label: 'Alpha' }];
+
+    const emptyModelHtml = controls.dropdown('Model', '', 1, '', options, 'model', 'C:/Your/Model/Path');
+    assert.match(emptyModelHtml, /node-dropdown-value">None</u);
+    assert.doesNotMatch(emptyModelHtml, /node-dropdown-value">C:\/Your\/Model\/Path</u);
+    assert.match(emptyModelHtml, /data-value="" data-label="None"/u);
+
+    const emptyProjectorHtml = controls.dropdown('Projector', '', 1, 'projectorPath', options, 'string', 'C:/Your/MMProj/Path');
+    assert.match(emptyProjectorHtml, /node-dropdown-value">None</u);
+    assert.doesNotMatch(emptyProjectorHtml, /node-dropdown-value">C:\/Your\/MMProj\/Path</u);
+    assert.match(emptyProjectorHtml, /data-value="" data-label="None"/u);
+
+    const selectedHtml = controls.dropdown('Model', 'alpha', 1, '', options, 'model', 'C:/Your/Model/Path');
+    assert.match(selectedHtml, /node-dropdown-value">Alpha</u);
+    assert.doesNotMatch(selectedHtml, /node-dropdown-value">C:\/Your\/Model\/Path</u);
+
+    const placeholderOnlyHtml = controls.dropdown('Model', '', 1, '', [{ value: 'alpha', label: 'Alpha' }], 'model', 'C:/Your/Model/Path');
+    assert.match(placeholderOnlyHtml, /node-dropdown-value">C:\/Your\/Model\/Path</u, 'placeholder copy remains available when no real empty-value option exists');
 });
 
 test('model browser IPC stays behind preload and the Darkstar modal rather than invoking a native file dialog', () => {
@@ -20736,7 +23234,8 @@ test('model browser IPC stays behind preload and the Darkstar modal rather than 
     assert.match(preload, /browseModelFiles:[\s\S]*?CHANNELS\.MODEL_FILES_BROWSE/u);
     assert.match(preload, /inspectModel:[\s\S]*?CHANNELS\.MODEL_INSPECT/u);
     assert.match(llamaIpc, /CHANNELS\.MODEL_FILES_BROWSE[\s\S]*?runtime\.browseModelFiles/u);
-    assert.match(llamaIpc, /CHANNELS\.MODEL_INSPECT[\s\S]*?runtime\.inspectModel/u);
+    assert.match(llamaIpc, /CHANNELS\.MODEL_INSPECT[\s\S]*?runtime\.inspectModelAsync/u);
+    assert.match(llamaIpc, /const directFile = path\.isAbsolute\(requested\)[\s\S]*?id: directFile \? model\.path : requested/u, 'selected-model inspection must preserve portable relative model IDs');
     assert.match(modal, /Browse Local Filesystem/u);
     assert.match(modal, /Darkstar’s filesystem browser/u);
     assert.match(modal, /browseModelFiles/u);
@@ -20834,6 +23333,90 @@ test('adjacent Model and Projector browse buttons use the canonical local-browse
     assert.match(buttonHtml, /aria-label="Browse Local Filesystem for Model"/u);
 });
 
+test('diffusion filesystem mode lists GGUF files under a distinct kind without invoking LM inspection', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-diffusion-browser-kind-'));
+    const diffusion = path.join(directory, 'diffusion.gguf');
+    const nested = path.join(directory, 'nested');
+    fs.mkdirSync(nested);
+    writeEmptyGguf(diffusion);
+    try {
+        const listing = browseModelFiles({ path: directory, kind: 'diffusion' }, { defaultPath: directory });
+        assert.deepEqual(listing.entries.map((entry) => [entry.name, entry.type]), [
+            ['nested', 'directory'], ['diffusion.gguf', 'diffusion'],
+        ]);
+        const selected = browseModelFiles({ path: diffusion, kind: 'diffusion' }, { defaultPath: directory });
+        assert.equal(selected.selectedPath, fs.realpathSync(diffusion));
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('local model browser recovers to the nearest existing parent when a remembered file path is stale', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-stale-model-browser-'));
+    const existingParent = path.join(directory, 'models');
+    fs.mkdirSync(existingParent);
+    const missingModel = path.join(existingParent, 'moved', 'image.gguf');
+    try {
+        const listing = browseModelFiles({ path: missingModel, kind: 'model', parentOfFile: true }, { defaultPath: directory });
+        assert.equal(listing.currentPath, fs.realpathSync(existingParent),
+            'ellipsis browsing must still open when the remembered GGUF path no longer exists');
+        assert.equal(listing.selectedPath, '');
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+});
+
+test('Diffusion GGUF ellipsis uses the shared browser and commits the selected file path', async () => {
+    const controlsSource = read('backend/renderer/nodes/editor/controls.js');
+    const selectedPath = 'C:\\Models\\diffusion.gguf';
+    const stalePath = 'C:\\Models\\missing\\old.gguf';
+    const node = { id: 91, type: 'com.darkstar.diffusion-backend-gguf.setter', params: { diffusionModelPath: stalePath }, status: 'idle', statusMessage: '' };
+    let initialPath = null;
+    let browseCallbackPath = null;
+    const definition = {
+        localGgufBrowseParam: 'diffusionModelPath',
+        onParameterChange() {},
+        async onLocalGgufBrowse(_node, result) { browseCallbackPath = result.path; },
+    };
+    const sandbox = {
+        document: { getElementById() { return null; } },
+        nodeEditorState: { nodes: [node], controlEventsBound: false },
+        getNodeDef() { return definition; },
+        scheduleWorkflowSessionSave() {},
+        noteNodeRuntimeConfigMutation() {},
+        rerenderNode() {},
+        renderConnections() {},
+        showNodeEditorToast(message) { throw new Error(message); },
+        console,
+    };
+    sandbox.window = {
+        Darkstar: {
+            nodes: {
+                builtinCommon: {
+                    isAbsoluteModelPath(value) { return /^[A-Za-z]:[\\/]/u.test(String(value || '')); },
+                    cacheModelRecord() {},
+                },
+            },
+            diffusionModelFiles: {
+                async open(options) {
+                    initialPath = options.initialPath;
+                    return { path: selectedPath, fileName: 'diffusion.gguf' };
+                },
+            },
+        },
+    };
+    sandbox.globalThis = sandbox;
+    vm.runInContext(controlsSource, vm.createContext(sandbox), { filename: 'backend/renderer/nodes/editor/controls.js' });
+
+    const button = { disabled: false, isConnected: true, dataset: { nodeId: '91', action: 'browse-local-diffusion' } };
+    await sandbox.browseNodeLocalFilesystem({ preventDefault() {}, stopPropagation() {} }, button);
+
+    assert.equal(initialPath, stalePath, 'the diffusion picker must anchor browsing to the currently displayed path');
+    assert.equal(node.params.diffusionModelPath, selectedPath);
+    assert.equal(browseCallbackPath, selectedPath);
+    assert.equal(button.disabled, false);
+});
+
 test('projector discovery recognizes .mmproj and the filesystem browser exposes only valid projector candidates', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-projector-browser-'));
     const child = path.join(directory, 'nested');
@@ -20894,7 +23477,7 @@ test('explicit No Projector suppresses Core auto-detection while the default req
         activeStreams: new Map(),
         pendingStreams: new Map(),
         normalizeModelLoadRequest,
-        resolveModelSelection(modelId) { return resolveModelSelection(modelId, [], []); },
+        async resolveModelSelectionAsync(modelId) { return resolveModelSelection(modelId, [], []); },
         async loadLegacyModel(modelId, projectorPath) {
             legacyRequest = { modelId, projectorPath };
             return { modelId, status: 'loaded' };
@@ -20924,11 +23507,12 @@ test('explicit No Projector suppresses Core auto-detection while the default req
     }
 });
 
-test('Load Model projector dropdown auto-selects detected projectors, exposes No Projector, and keeps local browse on adjacent buttons', async () => {
+test('Load Model projector dropdown auto-selects detected projectors, exposes None, and keeps local browse on adjacent buttons', async () => {
     const commonSource = read('backend/renderer/nodes/builtin/common.js');
     const loadModelSource = read('backend/renderer/nodes/builtin/load-model.js');
     let definition = null;
     let projectorOptions = [];
+    let projectorPlaceholder = null;
     let loadArguments = null;
     const detectedPath = '/models/vision.mmproj';
     const bridge = {
@@ -20941,14 +23525,18 @@ test('Load Model projector dropdown auto-selects detected projectors, exposes No
         },
     };
     const controls = {
-        dropdown(label, _value, _nodeId, _param, options) {
-            if (label === 'Projector') projectorOptions = options.slice();
+        dropdown(label, _value, _nodeId, _param, options, _kind, placeholderLabel) {
+            if (label === 'Projector') {
+                projectorOptions = options.slice();
+                projectorPlaceholder = placeholderLabel;
+            }
             return '';
         },
         button(label, _nodeId, action, options) {
             return `<button class="${options && options.className || ''}" data-action="${action}" aria-label="${options && options.ariaLabel || ''}">${label}</button>`;
         },
         status() { return ''; },
+        group(_title, _description, content) { return String(content || ''); },
         escapeHtml(value) { return String(value); },
     };
     const sandbox = {
@@ -20979,7 +23567,9 @@ test('Load Model projector dropdown auto-selects detected projectors, exposes No
     assert.equal(node.params.projectorSource, 'detected');
     const initialHtml = definition.buildContentHTML(node);
     assert.equal(projectorOptions[0].value, '');
-    assert.equal(projectorOptions[0].label, 'No Projector');
+    assert.equal(projectorOptions[0].label, 'None');
+    assert.equal(projectorPlaceholder, 'C:/Your/MMProj/Path');
+    assert.equal(projectorOptions.some((option) => /Your\/MMProj\/Path/u.test(option.label)), false);
     assert.equal(projectorOptions.some((option) => /Browse Local Filesystem/u.test(option.label)), false);
     assert.match(initialHtml, /data-action="browse-local-model"[\s\S]*?aria-label="Browse Local Filesystem for Model"/u);
     assert.match(initialHtml, /data-action="browse-local-projector"[\s\S]*?aria-label="Browse Local Filesystem for Projector"/u);
@@ -20987,10 +23577,11 @@ test('Load Model projector dropdown auto-selects detected projectors, exposes No
     node.params.projectorPath = '';
     definition.onParameterChange(node, 'projectorPath');
     assert.equal(node.params.projectorSource, 'none');
-    await definition.execute({ server: { running: true } }, node, {});
+    const noProjector = await definition.execute({}, node, {});
     assert.equal(node.params.projectorSource, 'none');
-    assert.equal(loadArguments.projectorPath, '');
-    assert.equal(loadArguments.options.autoDetectProjector, false);
+    assert.equal(noProjector.model.projectorPath, null);
+    assert.equal(noProjector.model.projectorSource, 'none');
+    assert.equal(loadArguments, null, 'Invoke Language Model must not load the model; LlamaCPP Server owns model loading');
 
     const manualPath = '/external/custom.mmproj';
     assert.equal(definition.onProjectorBrowse(node, { path: manualPath, fileName: 'custom.mmproj' }), manualPath);
@@ -21001,9 +23592,10 @@ test('Load Model projector dropdown auto-selects detected projectors, exposes No
     assert.equal(node.params.projectorSource, 'manual');
     assert.ok(projectorOptions.some((option) => option.value === manualPath && /Local file/u.test(option.label)));
     assert.equal(projectorOptions.some((option) => /Browse Local Filesystem/u.test(option.label)), false);
-    await definition.execute({ server: { running: true } }, node, {});
-    assert.equal(loadArguments.projectorPath, manualPath);
-    assert.equal(loadArguments.options.autoDetectProjector, true);
+    const manualProjector = await definition.execute({}, node, {});
+    assert.equal(manualProjector.model.projectorPath, manualPath);
+    assert.equal(manualProjector.model.projectorSource, 'manual');
+    assert.equal(loadArguments, null);
 
     const rememberedPath = '/external/remembered.mmproj';
     sandbox.Darkstar.projectorInventory = [{ path: rememberedPath, fileName: 'remembered.mmproj' }];
@@ -21015,8 +23607,9 @@ test('Load Model projector dropdown auto-selects detected projectors, exposes No
     definition.buildContentHTML(node);
     assert.equal(node.params.projectorSource, 'manual', 'an explicit remembered-projector dropdown choice must remain authoritative');
     assert.ok(projectorOptions.some((option) => option.value === rememberedPath && /Local file/u.test(option.label)));
-    await definition.execute({ server: { running: true } }, node, {});
-    assert.equal(loadArguments.projectorPath, rememberedPath, 'execution must not replace a remembered custom projector during auto-detection');
+    const rememberedProjector = await definition.execute({}, node, {});
+    assert.equal(rememberedProjector.model.projectorPath, rememberedPath, 'execution must not replace a remembered custom projector during auto-detection');
+    assert.equal(loadArguments, null);
 
     const restoredPath = '/external/restored.mmproj';
     const restoredNode = definition.factory(2, 0, 0);
@@ -21028,8 +23621,9 @@ test('Load Model projector dropdown auto-selects detected projectors, exposes No
     assert.equal(restoredNode.params.projectorSource, 'manual', 'a projector persisted by an older build must migrate to an authoritative restored selection');
     assert.equal(restoredNode.params.projectorModel, restoredNode.selectedModel);
     bridge.detectProjector = async () => ({ success: true, projectors: [], projectorPath: '' });
-    await definition.execute({ server: { running: true } }, restoredNode, {});
-    assert.equal(loadArguments.projectorPath, restoredPath, 'restart migration must not clear a visibly selected custom projector before model load');
+    const restoredProjector = await definition.execute({}, restoredNode, {});
+    assert.equal(restoredProjector.model.projectorPath, restoredPath, 'restart migration must not clear a visibly selected custom projector before GGUF Server loads the model');
+    assert.equal(loadArguments, null);
 
     let resolveOldDetection;
     let resolveNewDetection;
@@ -21062,7 +23656,7 @@ test('projector Browse Local Filesystem is routed through Darkstar modal and exi
     assert.match(modal, /No native file dialog is opened/u);
     assert.doesNotMatch(modal, /showOpenDialog|dialog\.showOpenDialog/u);
     assert.match(controls, /browserKind !== 'projector'[\s\S]*?projectorFiles[\s\S]*?onProjectorBrowse[\s\S]*?setNodeParamValue\(nodeId, 'projectorPath'/u);
-    assert.match(loadModelNode, /label: 'No Projector'/u);
+    assert.match(loadModelNode, /label: 'None'/u);
     assert.match(loadModelNode, /localBrowseField\(common\.modelDropdown\(node\), node\.id, 'browse-local-model', 'Model'\)[\s\S]*?localBrowseField\(controls\.dropdown\('Projector'[\s\S]*?node\.id, 'browse-local-projector', 'Projector'\)/u);
     assert.doesNotMatch(loadModelNode, /options\.push\(\{ value: .*Browse Local Filesystem/u);
 });
@@ -21135,27 +23729,35 @@ test('skill and image filesystem modes expose only valid files and image selecti
     }
 });
 
-test('custom model and projector history persists outside workflows and prunes deleted assets on validation', () => {
+test('language-model, diffusion-model, and projector histories persist independently and prune deleted assets', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-model-history-'));
     const storePath = path.join(directory, 'local-model-history.json');
-    const model = path.join(directory, 'remembered.gguf');
+    const model = path.join(directory, 'remembered-language.gguf');
+    const diffusion = path.join(directory, 'remembered-diffusion.gguf');
     const projector = path.join(directory, 'remembered.mmproj');
     writeEmptyGguf(model);
+    writeEmptyGguf(diffusion);
     fs.writeFileSync(projector, 'projector');
     try {
         const store = new LocalModelHistoryStore({ filePath: storePath });
         store.remember(LOCAL_MODEL_HISTORY_KEYS.MODELS, model);
+        store.remember(LOCAL_MODEL_HISTORY_KEYS.DIFFUSION_MODELS, diffusion);
         store.remember(LOCAL_MODEL_HISTORY_KEYS.PROJECTORS, projector);
         const restored = new LocalModelHistoryStore({ filePath: storePath });
         assert.deepEqual(restored.list(LOCAL_MODEL_HISTORY_KEYS.MODELS), [path.normalize(model)]);
+        assert.deepEqual(restored.list(LOCAL_MODEL_HISTORY_KEYS.DIFFUSION_MODELS), [path.normalize(diffusion)]);
         assert.deepEqual(restored.list(LOCAL_MODEL_HISTORY_KEYS.PROJECTORS), [path.normalize(projector)]);
+        assert.equal(restored.list(LOCAL_MODEL_HISTORY_KEYS.MODELS).includes(path.normalize(diffusion)), false, 'diffusion selections must never contaminate LM history');
+        assert.equal(restored.list(LOCAL_MODEL_HISTORY_KEYS.DIFFUSION_MODELS).includes(path.normalize(model)), false, 'LM selections must never contaminate diffusion history');
         assert.deepEqual(restored.prune(LOCAL_MODEL_HISTORY_KEYS.MODELS, validateModelFilePath), [fs.realpathSync(model)]);
+        assert.deepEqual(restored.prune(LOCAL_MODEL_HISTORY_KEYS.DIFFUSION_MODELS, validateModelFilePath), [fs.realpathSync(diffusion)]);
         assert.deepEqual(restored.prune(LOCAL_MODEL_HISTORY_KEYS.PROJECTORS, validateProjectorPath), [fs.realpathSync(projector)]);
 
         fs.unlinkSync(model);
-        assert.deepEqual(restored.prune(LOCAL_MODEL_HISTORY_KEYS.MODELS, validateModelFilePath), [], 'deleted custom models must be forgotten rather than retained forever');
+        assert.deepEqual(restored.prune(LOCAL_MODEL_HISTORY_KEYS.MODELS, validateModelFilePath), [], 'deleted custom language models must be forgotten rather than retained forever');
         const afterDelete = new LocalModelHistoryStore({ filePath: storePath });
         assert.deepEqual(afterDelete.list(LOCAL_MODEL_HISTORY_KEYS.MODELS), []);
+        assert.deepEqual(afterDelete.list(LOCAL_MODEL_HISTORY_KEYS.DIFFUSION_MODELS), [fs.realpathSync(diffusion)]);
         assert.deepEqual(afterDelete.list(LOCAL_MODEL_HISTORY_KEYS.PROJECTORS), [fs.realpathSync(projector)]);
     } finally {
         fs.rmSync(directory, { recursive: true, force: true });
@@ -21193,7 +23795,7 @@ test('custom model parent directories participate in the same stable filesystem-
     monitor.stop();
 });
 
-test('persistent custom model/projector inventory is wired into startup listing and renderer dropdowns without changing workflow authority', () => {
+test('persistent LM, diffusion, and projector histories are wired independently without changing workflow authority', () => {
     const main = read('backend/app/run-main-app.js');
     const ipc = read('backend/ipc/register-llama-ipc.js');
     const uiIpc = read('backend/ipc/register-ui-ipc.js');
@@ -21205,18 +23807,21 @@ test('persistent custom model/projector inventory is wired into startup listing 
     assert.match(serverProcess, /const path = require\('node:path'\);/u, 'server process must bind node:path before executable-path inspection');
     assert.match(ipc, /const \{ LOCAL_MODEL_HISTORY_KEYS \} = require\('\.\.\/preferences\/local-model-history-store'\);/u, 'llama IPC must import the history keys it reads during startup');
     assert.doesNotMatch(uiIpc, /rememberProjector/u, 'UI projector detection must not reference llama IPC private history helpers');
-    assert.match(ipc, /rememberedModels[\s\S]*?allModels[\s\S]*?projectors: rememberedProjectors/u);
+    assert.match(ipc, /rememberedModels[\s\S]*?rememberedDiffusionModels[\s\S]*?allModels[\s\S]*?diffusionModels: rememberedDiffusionModels\(\)[\s\S]*?projectors: rememberedProjectors/u);
+    assert.match(ipc, /kind === 'diffusion'[\s\S]*?rememberDiffusionModel\(result\.selectedPath\)/u,
+        'diffusion selections must persist through generic GGUF validation instead of LM inspectModel');
     assert.match(ipc, /watchPaths: modelWatchPaths\(\)[\s\S]*?watchPaths: projectorWatchPaths\(\)/u);
-    assert.match(server, /projectorInventory[\s\S]*?response\.projectors[\s\S]*?applyModelInventory\(records, projectors\)/u);
+    assert.match(server, /diffusionModelInventory[\s\S]*?response\.diffusionModels[\s\S]*?applyModelInventory\(records, projectors, diffusionModels\)/u);
     assert.match(loadModel, /root\.Darkstar\.projectorInventory[\s\S]*?\(Unavailable\)/u);
     assert.match(loadModel, /rememberProjectorSelection[\s\S]*?browseModelFiles\(\{ kind: 'projector', path: projectorPath \}\)[\s\S]*?onParameterChange[\s\S]*?rememberProjectorSelection\(params\.projectorPath\)/u, 'choosing a detected projector from the dropdown must persist it immediately, even before model load');
 });
 
-test('local browser spawn locations persist independently for model, projector, tools, skills, and images', () => {
+test('local browser spawn locations persist independently for LM, diffusion, projector, tools, skills, and images', () => {
     const rootDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-browser-locations-'));
     const storePath = path.join(rootDirectory, 'dialog-locations.json');
     const kinds = [
         [DIALOG_LOCATION_KEYS.MODELS, 'models'],
+        [DIALOG_LOCATION_KEYS.DIFFUSION_MODELS, 'diffusion-models'],
         [DIALOG_LOCATION_KEYS.PROJECTORS, 'projectors'],
         [DIALOG_LOCATION_KEYS.TOOLS, 'tools'],
         [DIALOG_LOCATION_KEYS.SKILLS, 'skills'],
@@ -21239,7 +23844,7 @@ test('local browser spawn locations persist independently for model, projector, 
             'one picker must never inherit another picker’s remembered spawn location');
 
         const ipcSource = read('backend/ipc/register-llama-ipc.js');
-        assert.match(ipcSource, /model: DIALOG_LOCATION_KEYS\.MODELS, projector: DIALOG_LOCATION_KEYS\.PROJECTORS,[\s\S]*?tool: DIALOG_LOCATION_KEYS\.TOOLS, skill: DIALOG_LOCATION_KEYS\.SKILLS, image: DIALOG_LOCATION_KEYS\.IMAGES/u);
+        assert.match(ipcSource, /model: DIALOG_LOCATION_KEYS\.MODELS, diffusion: DIALOG_LOCATION_KEYS\.DIFFUSION_MODELS, projector: DIALOG_LOCATION_KEYS\.PROJECTORS,[\s\S]*?tool: DIALOG_LOCATION_KEYS\.TOOLS, skill: DIALOG_LOCATION_KEYS\.SKILLS, image: DIALOG_LOCATION_KEYS\.IMAGES/u);
         assert.match(ipcSource, /getDirectory\(locationKey, fallback\)[\s\S]*?rememberDirectory\(locationKey, result\.currentPath\)/u);
     } finally {
         fs.rmSync(rootDirectory, { recursive: true, force: true });
@@ -21247,7 +23852,7 @@ test('local browser spawn locations persist independently for model, projector, 
 });
 
 test('Skills and composer image loading use the Darkstar browser with mode-appropriate selection semantics', async () => {
-    const skillsSource = read('backend/renderer/nodes/builtin/skills.js');
+    const skillsSource = read('backend/renderer/nodes/builtin/loader.js');
     const imageSource = read('backend/renderer/image.js');
     const listenerSource = read('backend/renderer/event-listeners.js');
     const modalSource = read('backend/renderer/workflow-file-modal.js');
@@ -21282,7 +23887,7 @@ test('Skills and composer image loading use the Darkstar browser with mode-appro
     sandbox.globalThis = sandbox;
     const context = vm.createContext(sandbox);
     vm.runInContext(read('backend/renderer/nodes/builtin/common.js'), context, { filename: 'backend/renderer/nodes/builtin/common.js' });
-    vm.runInContext(skillsSource, context, { filename: 'backend/renderer/nodes/builtin/skills.js' });
+    vm.runInContext(skillsSource, context, { filename: 'backend/renderer/nodes/builtin/loader.js' });
     const node = definition.factory('skills-browser', 0, 0);
     await definition.onAction(node, 'add-skill-file');
     assert.deepEqual(inspected, selected, 'every browser-selected skill must still pass through the existing skill inspector');
@@ -21380,7 +23985,7 @@ test('tool browser multi-select supports normal, Ctrl, Shift, and empty-area dra
 });
 
 test('Tools and Load Tool use Darkstar tool browser instead of the native chooser, and Tools loads every selected file', async () => {
-    const toolsSource = read('backend/renderer/nodes/builtin/tools.js');
+    const toolsSource = read('backend/renderer/nodes/builtin/loader.js');
     const loadToolSource = read('backend/renderer/nodes/builtin/load-tool.js');
     assert.doesNotMatch(toolsSource, /chooseToolFile/u);
     assert.doesNotMatch(loadToolSource, /chooseToolFile/u);
@@ -21407,7 +24012,7 @@ test('Tools and Load Tool use Darkstar tool browser instead of the native choose
     sandbox.globalThis = sandbox;
     const context = vm.createContext(sandbox);
     vm.runInContext(read('backend/renderer/nodes/builtin/common.js'), context, { filename: 'backend/renderer/nodes/builtin/common.js' });
-    vm.runInContext(toolsSource, context, { filename: 'backend/renderer/nodes/builtin/tools.js' });
+    vm.runInContext(toolsSource, context, { filename: 'backend/renderer/nodes/builtin/loader.js' });
     const node = definition.factory('tools-browser', 0, 0);
     await definition.onAction(node, 'add-tool-file');
     assert.ok(node.params.providers.some((provider) => provider.path === selected[0]));
@@ -21496,6 +24101,32 @@ test('Filesystem Access exposes exactly three ordered levels and defaults new wo
         policy.setLevel('1');
         assert.equal(await policy.resolvePath(path.join(outside, 'outside.txt'), workspace), path.resolve(outside, 'outside.txt'));
     } finally {
+        fs.rmSync(temporary, { recursive: true, force: true });
+    }
+});
+
+test('project-owned .darkstar metadata stays out of the workspace UI and scoped model filesystem access', async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-project-metadata-boundary-'));
+    const home = path.join(temporary, 'home');
+    const workspaceRoot = path.join(home, 'project');
+    const metadataRoot = path.join(workspaceRoot, '.darkstar');
+    fs.mkdirSync(metadataRoot, { recursive: true });
+    fs.writeFileSync(path.join(workspaceRoot, 'visible.txt'), 'visible');
+    fs.writeFileSync(path.join(metadataRoot, 'chat-session.dscs'), 'private');
+    const workspaces = new WorkspaceRegistry();
+    const policy = new FilesystemAccessPolicyService({ baseDir: root, homeDir: home, level: '3' });
+    try {
+        await workspaces.setRoot('project-9', workspaceRoot);
+        const entries = await workspaces.listDirectory('project-9', '');
+        assert.deepEqual(entries.map((entry) => entry.name), ['visible.txt']);
+        await assert.rejects(workspaces.listDirectory('project-9', '.darkstar'), /metadata is reserved/u);
+        await assert.rejects(policy.resolvePath('.darkstar/chat-session.dscs', workspaceRoot), /metadata is reserved/u);
+        policy.setLevel('2');
+        await assert.rejects(policy.resolvePath(path.join(metadataRoot, 'chat-session.dscs'), workspaceRoot), /metadata is reserved/u);
+        policy.setLevel('1');
+        assert.equal(await policy.resolvePath(path.join(metadataRoot, 'chat-session.dscs'), workspaceRoot), path.resolve(metadataRoot, 'chat-session.dscs'));
+    } finally {
+        workspaces.close?.();
         fs.rmSync(temporary, { recursive: true, force: true });
     }
 });
@@ -21988,10 +24619,84 @@ test('change_working_directory remains an ordinary autodetected Python provider,
     assert.deepEqual(provider.description.tools.map((entry) => entry.function.name), ['change_working_directory']);
 });
 
+test('Internet Access toggle flushes workflow persistence before the UI commit retires', async () => {
+    const source = read('backend/renderer/internet-access-policy.js');
+    let clickHandler = null;
+    let persistedEnabled = null;
+    let scheduleCalls = 0;
+    let saveCalls = 0;
+    let releaseSave = null;
+    const saveGate = new Promise((resolve) => { releaseSave = resolve; });
+    const button = {
+        dataset: {}, disabled: false, title: '',
+        classList: { toggle() {} },
+        setAttribute() {},
+        addEventListener(type, handler) { if (type === 'click') clickHandler = handler; },
+    };
+    const sandbox = {
+        console, Promise,
+        document: { getElementById(id) { return id === 'nodeInternetAccessButton' ? button : null; } },
+        darkstar: { internetAccess: {
+            async get() { return { success: true, enabled: false }; },
+            async set(enabled) { return { success: true, enabled: enabled === true }; },
+        } },
+        scheduleWorkflowSessionSave() { scheduleCalls += 1; },
+        async saveWorkflowSessionNow(options) {
+            saveCalls += 1;
+            assert.equal(options && options.force, true);
+            persistedEnabled = sandbox.getDarkstarInternetAccessEnabled();
+            assert.equal(button.disabled, true, 'the toggle must remain busy until durable workflow persistence finishes');
+            await saveGate;
+            return true;
+        },
+    };
+    sandbox.globalThis = sandbox;
+    vm.createContext(sandbox);
+    vm.runInContext(source, sandbox, { filename: 'internet-access-policy.js' });
+    await sandbox.initializeInternetAccessUi();
+    assert.equal(typeof clickHandler, 'function');
+    clickHandler();
+    for (let index = 0; index < 20 && saveCalls === 0; index += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(scheduleCalls, 1);
+    assert.equal(saveCalls, 1);
+    assert.equal(persistedEnabled, true);
+    assert.equal(button.disabled, true);
+    releaseSave();
+    for (let index = 0; index < 20 && button.disabled; index += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(button.disabled, false);
+    assert.equal(sandbox.getDarkstarInternetAccessEnabled(), true);
+});
+
+test('Filesystem Access does not retain a selected-level outline after its panel closes', () => {
+    const styles = read('backend/shell/styles.css');
+    assert.doesNotMatch(styles, /#nodeFilesystemAccessButton\[data-level=['"]1['"]\]/u,
+        'Filesystem Access Level 1 must not be styled as though its settings panel is still selected');
+    assert.match(styles, /#nodeFilesystemAccessButton\.is-open\s*\{/u,
+        'the open settings panel should retain its intentional active affordance');
+});
+
+test('Internet Access is a direct Settings sidebar pressed-state toggle matching Traces, with no slider or settings panel', () => {
+    const html = read('backend/shell/index.html');
+    const renderer = read('backend/renderer/internet-access-policy.js');
+    const styles = read('backend/shell/styles.css');
+    assert.match(html, /id="nodeInternetAccessButton"[^>]*aria-pressed="true"[^>]*data-enabled="true"/u);
+    assert.doesNotMatch(html, /internetAccessPanel|internetAccessSlider|internetAccessStages|internetAccessClose/u,
+        'Internet Access must not open a settings panel or expose a slider');
+    assert.match(renderer, /target\.addEventListener\('click', function\(\) \{ toggleInternetAccess\(\); \}\);/u,
+        'clicking the globe must toggle Internet Access directly');
+    assert.match(renderer, /target\.setAttribute\('aria-pressed', enabled \? 'true' : 'false'\)/u);
+    assert.match(renderer, /target\.classList\.toggle\('is-active', enabled\)/u);
+    assert.match(renderer, /commitEnabled\(!state\.enabled, \{ persistWorkflow: true \}\)/u);
+    assert.match(styles, /#nodeInternetAccessButton\.is-active/u,
+        'Internet Access must use the same pressed-state visual convention as the Traces toggle');
+});
+
 test('permission policy is workflow-owned durable state while execution enforcement remains Core-owned', async () => {
     const services = read('backend/app/services.js');
     const permissionUi = read('backend/renderer/permission-policy.js');
     const filesystemUi = read('backend/renderer/filesystem-access-policy.js');
+    const internetUi = read('backend/renderer/internet-access-policy.js');
+    const workflowMigration = read('backend/renderer/workflow-local-pipeline-migration.js');
     const workflow = read('backend/renderer/workflow.js');
     const ipc = read('backend/ipc/register-app-ipc.js');
     const preload = read('backend/shell/preload.js');
@@ -22000,7 +24705,10 @@ test('permission policy is workflow-owned durable state while execution enforcem
     assert.match(ipc, /FILESYSTEM_ACCESS_GET[\s\S]*?filesystemAccess\.snapshot\(\)[\s\S]*?FILESYSTEM_ACCESS_SET[\s\S]*?filesystemAccess\.setLevel/u);
     assert.match(preload, /permissionPolicyApi[\s\S]*?permissionPolicy:\s*permissionPolicyApi/u);
     assert.match(preload, /filesystemAccessApi[\s\S]*?filesystemAccess:\s*filesystemAccessApi/u);
-    assert.match(permissionUi, /workflowSecuritySnapshot[\s\S]*?modelActionPermissionLevel[\s\S]*?filesystemAccessLevel/u);
+    assert.match(ipc, /INTERNET_ACCESS_GET[\s\S]*?internetAccess\.internetAccessSnapshot\(\)[\s\S]*?INTERNET_ACCESS_SET[\s\S]*?internetAccess\.setInternetAccess/u);
+    assert.match(preload, /internetAccessApi[\s\S]*?internetAccess:\s*internetAccessApi/u);
+    assert.match(permissionUi, /workflowSecuritySnapshot[\s\S]*?modelActionPermissionLevel[\s\S]*?filesystemAccessLevel[\s\S]*?internetAccessEnabled/u);
+    assert.match(internetUi, /restoreInternetAccessEnabled[\s\S]*?commitEnabled/u);
     assert.match(filesystemUi, /restoreFilesystemAccessLevel[\s\S]*?DEFAULT_FILESYSTEM_ACCESS_LEVEL/u);
     assert.match(permissionUi, /root\.getDarkstarWorkflowSecurity = workflowSecuritySnapshot/u);
     assert.match(permissionUi, /root\.restoreDarkstarWorkflowSecurity = restoreWorkflowSecurity/u);
@@ -22010,6 +24718,7 @@ test('permission policy is workflow-owned durable state while execution enforcem
     const levels = ['full-review', 'change-guard', 'connected-guard', 'boundary-guard', 'unrestricted'].map((id) => ({ id, label: id, description: id }));
     let restoredLevel = null;
     let restoredFilesystemLevel = null;
+    let restoredInternetAccess = null;
     const sandbox = {
         console, structuredClone, WeakMap, Map, Set, Date, RegExp, ArrayBuffer, Number, String, Boolean, Object, Math,
         setTimeout, clearTimeout,
@@ -22018,6 +24727,10 @@ test('permission policy is workflow-owned durable state while execution enforcem
             permissionPolicy: {
                 async set(level) { restoredLevel = String(level); return { success: true, level: restoredLevel, levels }; },
                 async get() { return { success: true, level: restoredLevel || 'boundary-guard', levels }; },
+            },
+            internetAccess: {
+                async set(enabled) { restoredInternetAccess = enabled === true; return { success: true, enabled: restoredInternetAccess }; },
+                async get() { return { success: true, enabled: restoredInternetAccess !== false }; },
             },
             filesystemAccess: {
                 async set(level) { restoredFilesystemLevel = String(level); return { success: true, level: restoredFilesystemLevel, homeRoot: '/virtual-profile', levels: ['1', '2', '3'].map((id) => ({ id, label: `Level ${id}`, description: id })) }; },
@@ -22031,20 +24744,26 @@ test('permission policy is workflow-owned durable state while execution enforcem
     vm.createContext(sandbox);
     vm.runInContext(permissionUi, sandbox, { filename: 'permission-policy.js' });
     vm.runInContext(filesystemUi, sandbox, { filename: 'filesystem-access-policy.js' });
+    vm.runInContext(internetUi, sandbox, { filename: 'internet-access-policy.js' });
+    vm.runInContext(workflowMigration, sandbox, { filename: 'workflow-local-pipeline-migration.js' });
     vm.runInContext(workflow, sandbox, { filename: 'workflow.js' });
     await sandbox.restoreDarkstarPermissionPolicyLevel('unrestricted');
     await sandbox.restoreDarkstarFilesystemAccessLevel('1');
+    await sandbox.restoreDarkstarInternetAccessEnabled(false);
     const snapshot = sandbox.createWorkflowSnapshot();
     assert.equal(snapshot.version, 2);
     assert.equal(snapshot.security.modelActionPermissionLevel, 'unrestricted');
     assert.equal(snapshot.security.filesystemAccessLevel, '1');
-    await sandbox.restoreWorkflowSnapshot({ format: 'darkstar-workflow-snapshot', version: 2, security: { modelActionPermissionLevel: 'full-review', filesystemAccessLevel: '2' }, editor: { nodes: [], connections: [] } });
+    assert.equal(snapshot.security.internetAccessEnabled, false);
+    await sandbox.restoreWorkflowSnapshot({ format: 'darkstar-workflow-snapshot', version: 2, security: { modelActionPermissionLevel: 'full-review', filesystemAccessLevel: '2', internetAccessEnabled: true }, editor: { nodes: [], connections: [] } });
     assert.equal(restoredLevel, 'full-review');
     assert.equal(restoredFilesystemLevel, '2');
-    restoredLevel = null; restoredFilesystemLevel = null;
+    assert.equal(restoredInternetAccess, true);
+    restoredLevel = null; restoredFilesystemLevel = null; restoredInternetAccess = null;
     await sandbox.restoreWorkflowSnapshot({ format: 'darkstar-workflow-snapshot', version: 1, editor: { nodes: [], connections: [] } });
     assert.equal(restoredLevel, 'boundary-guard', 'legacy workflows must migrate Authorization to the secure default');
     assert.equal(restoredFilesystemLevel, '3', 'legacy workflows must migrate Filesystem Access to the strict working-directory default');
+    assert.equal(restoredInternetAccess, true, 'legacy workflows must preserve historical online-browser availability');
 });
 
 test('Authorization slider uses a one-based five-step scale aligned independently from Filesystem Access', () => {
@@ -22075,7 +24794,7 @@ test('Authorization and Filesystem Access sliders highlight the live preview sta
     assert.doesNotMatch(filesystemUi, /stage\.className = 'permission-policy-stage' \+ \(index === currentIndex \? ' is-current' : ''\);/u);
 });
 
-test('Auth Controls and Filesystem Access share one Nodes sidebar subsection using standard stacked labels', () => {
+test('Auth Controls, Filesystem Access, and Internet Access share one Settings sidebar security subsection', () => {
     const html = read('backend/shell/index.html');
     const styles = read('backend/shell/styles.css');
     const sidebarMatch = html.match(/<nav class="node-workflow-sidebar"[\s\S]*?<\/nav>/u);
@@ -22090,12 +24809,12 @@ test('Auth Controls and Filesystem Access share one Nodes sidebar subsection usi
         '<button class="node-editor-sidebar-button" id="nodeFilesystemAccessButton"[\\s\\S]*?<span class="node-editor-sidebar-label node-editor-sidebar-label-stacked"><span>Filesystem<\\/span><span>Access<\\/span><\\/span>[\\s\\S]*?<\\/button>\\s*' +
         divider.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
         'u'
-    ), 'Auth Controls and Filesystem Access must remain together between the same two sidebar dividers');
+    ), 'all three security controls must remain together between the same two sidebar dividers');
     assert.match(styles, /\.node-workflow-sidebar\s*\{[^}]*width:\s*76px;/u);
     assert.match(styles, /\.node-editor-sidebar-button\s*\{[^}]*width:\s*64px;/u);
     assert.match(styles, /#nodePermissionPolicyButton \.node-editor-sidebar-label\s*\{[^}]*width:\s*max-content;[^}]*overflow:\s*visible;[^}]*text-overflow:\s*clip;/u);
     assert.match(styles, /#nodeFilesystemAccessButton \.node-editor-sidebar-label\s*\{[^}]*width:\s*max-content;[^}]*overflow:\s*visible;[^}]*text-overflow:\s*clip;/u);
-    assert.match(styles, /\.node-editor-view \.grid-canvas\s*\{\s*left:\s*84px;\s*\}/u);
+    assert.match(styles, /\.node-editor-view \.grid-canvas\s*\{\s*left:\s*76px;\s*\}/u);
 });
 
 test('model idle unload normalizes control values and never unloads while an Authorization decision is pending', async () => {
@@ -22136,17 +24855,18 @@ test('model idle unload normalizes control values and never unloads while an Aut
     } finally { controller.close(); }
 });
 
-test('Control node persists an OFF-by-default idle-unload toggle and sends only 0 or the fixed 600 seconds to the sampler', async () => {
+test('Orchestrator owns local idle unload while legacy Control preserves the fixed API control contract', async () => {
     const control = read('backend/renderer/nodes/builtin/control.js');
     const sampler = read('backend/renderer/nodes/builtin/sampler.js');
     assert.doesNotMatch(control, /controls\.numberInput\('Model idle unload \(seconds\)'[\s\S]*?modelIdleUnloadSeconds/u);
     assert.match(control, /controls\.toggle\('Model idle unload'[\s\S]*?modelIdleUnloadEnabled/u);
-    assert.match(control, /modelIdleUnloadSeconds:\s*node\.params\.modelIdleUnloadEnabled === true \? FIXED_MODEL_IDLE_UNLOAD_SECONDS : 0/u);
-    assert.match(sampler, /var runtimeControl = Object\.assign\(\{\}, inputs\.while/u);
+    assert.match(control, /modelIdleUnloadSeconds:\s*params\.modelIdleUnloadEnabled === true \? FIXED_MODEL_IDLE_UNLOAD_SECONDS : 0/u);
+    assert.match(sampler, /controlPolicy\.runtimeControl\(p\)/u);
+    assert.doesNotMatch(sampler, /inputs\.while/u);
     assert.match(sampler, /control:\s*runtimeControl/u);
 });
 
-test('workflow restoration applies the persisted model idle unload toggle immediately', async () => {
+test('workflow restoration applies Orchestrator idle unload immediately and retains legacy Control fallback', async () => {
     const configured = [];
     const nodes = {
         controls: { toggle() { return ''; }, numberInput() { return ''; }, status() { return ''; } },
@@ -22156,7 +24876,7 @@ test('workflow restoration applies the persisted model idle unload toggle immedi
     };
     const sandbox = {
         console, String, Number, Array, Object,
-        nodeEditorState: { nodes: [{ type: 'control', params: { nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: true } }] },
+        nodeEditorState: { nodes: [{ type: 'sampler', params: { modelIdleUnloadEnabled: true } }] },
         Darkstar: {
             nodes,
             chatRuntime: { async configureModelIdleUnload(seconds) { configured.push(seconds); return seconds; } },
@@ -22169,10 +24889,21 @@ test('workflow restoration applies the persisted model idle unload toggle immedi
     sandbox.syncDarkstarModelIdleUnloadPolicy();
     await Promise.resolve(); await Promise.resolve();
     assert.deepEqual(configured, [600]);
+    sandbox.nodeEditorState.nodes = [
+        { type: 'sampler', params: { modelIdleUnloadEnabled: false } },
+        { type: 'control', params: { modelIdleUnloadEnabled: true } },
+    ];
+    sandbox.syncDarkstarModelIdleUnloadPolicy();
+    await Promise.resolve(); await Promise.resolve();
+    assert.deepEqual(configured, [600, 0], 'local Orchestrator must take precedence over a legacy/API Control node');
+    sandbox.nodeEditorState.nodes = [{ type: 'control', params: { modelIdleUnloadEnabled: true } }];
+    sandbox.syncDarkstarModelIdleUnloadPolicy();
+    await Promise.resolve(); await Promise.resolve();
+    assert.deepEqual(configured, [600, 0, 600], 'legacy/API Control must remain a compatible fallback owner');
     sandbox.nodeEditorState.nodes = [];
     sandbox.syncDarkstarModelIdleUnloadPolicy();
     await Promise.resolve(); await Promise.resolve();
-    assert.deepEqual(configured, [600, 0], 'restoring a graph without Control must disable an older idle-unload policy');
+    assert.deepEqual(configured, [600, 0, 600, 0], 'restoring a graph without either owner must disable an older idle-unload policy');
     assert.match(read('backend/renderer/workflow.js'), /syncDarkstarModelIdleUnloadPolicy/u);
 });
 
@@ -22189,6 +24920,205 @@ test('renderer permission UI submits only Allow or Reject and never resumes the 
     assert.match(agentLoop, /USER_REJECTED_COMMAND[\s\S]*?The user has rejected this command\./u);
     assert.match(html, />Allow<\/button>[\s\S]*?>Reject<\/button>/u);
     assert.doesNotMatch(html, /Tell the model to do something else|agentAttentionRedirect/u);
+});
+});
+
+
+// ============================================================================
+// TEST MODULE: backend/Dev/tests/dm-sampler-custom-node-regression.test.js
+// ============================================================================
+TEST_FACTORIES.set("backend/Dev/tests/dm-sampler-custom-node-regression.test.js", function(module, exports, require, __filename, __dirname) {
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+const vm = require('node:vm');
+
+const ROOT = path.resolve(__dirname, '..', '..', '..');
+const read = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8');
+
+function loadHarness(options = {}) {
+    const definitions = new Map();
+    const legacyLocalSampler = {
+        id: 'localSampler',
+        title: 'L_Sampler',
+        badge: 'SAMPLER',
+        inputs: [],
+        outputs: [{ name: 'samplerParameters', label: 'LM Sampler', type: 'SAMPLER_PARAMETERS' }],
+        factory(nodeId, x, y) {
+            return { id: nodeId, type: 'localSampler', title: 'L_Sampler', x, y, params: {}, inputs: [], outputs: this.outputs.slice() };
+        },
+        normalizeNode(node) {
+            if (!node.title) node.title = 'L_Sampler';
+        },
+        buildContentHTML() { return ''; },
+        execute() { return { samplerParameters: {} }; },
+    };
+    definitions.set('localSampler', legacyLocalSampler);
+    const nodeRegistry = { localSampler: legacyLocalSampler };
+    const controls = {
+        numberInput(label) { return `<number>${label}</number>`; },
+        slider(label) { return `<slider>${label}</slider>`; },
+        dropdown(label, value, nodeId, param, dropdownOptions) { return `<dropdown data-param="${String(param || '')}">${label}:${(dropdownOptions || []).map((item) => String(item.label || item.value || item)).join('|')}</dropdown>`; },
+        textInput(label, value) { return `<text>${label}:${String(value)}</text>`; },
+        status(_node, text) { return `<status>${text}</status>`; },
+        group(title, _description, content) { return `<group data-title="${String(title)}">${String(content || '')}</group>`; },
+    };
+    const registry = {
+        register(definition, options) {
+            if (definitions.has(definition.id) && !(options && options.replace === true)) throw new Error(`duplicate ${definition.id}`);
+            definitions.set(definition.id, definition);
+            return definition;
+        },
+    };
+    const nodes = {
+        controls,
+        PORT_TYPES: { DM_SAMPLER: 'DM_SAMPLER' },
+        registry,
+        getNodeDefinition(id) { return definitions.get(id) || null; },
+        registerNode(definition) {
+            registry.register(definition);
+            nodeRegistry[definition.id] = definition;
+            return definition;
+        },
+    };
+    const sandbox = { console, Darkstar: { nodes }, darkstar: { nodes: { listDiffusionDevices: options.listDiffusionDevices || (async () => ({ success: true, available: false, devices: [], autoDeviceId: '', autoDeviceLabel: '' })) } }, NODE_REGISTRY: nodeRegistry };
+    sandbox.globalThis = sandbox;
+    vm.createContext(sandbox);
+    vm.runInContext(read('custom_nodes/dm-sampler/renderer.js'), sandbox, { filename: 'custom_nodes/dm-sampler/renderer.js' });
+    return { definitions, nodeRegistry };
+}
+
+test('DM Sampler is renderer-only and exposes exactly one direct Orchestrator-compatible output', () => {
+    const manifest = JSON.parse(read('custom_nodes/dm-sampler/node.json'));
+    assert.equal(manifest.id, 'com.darkstar.dm-sampler');
+    assert.equal(manifest.renderer, 'renderer.js');
+    assert.equal(Object.hasOwn(manifest, 'backend'), false);
+    assert.equal(Object.hasOwn(manifest, 'permissions'), false);
+
+    const source = read('custom_nodes/dm-sampler/renderer.js');
+    assert.doesNotMatch(source, /invokeBackend|customNodes\.invoke|fetch\s*\(/u);
+    assert.doesNotMatch(source, /value:\s*['"]xformers['"]/u, 'xFormers must not be exposed as a fake native attention implementation');
+    const core = read('backend/Darkstar_Core.js');
+    assert.match(core, /LIST_DIFFUSION_DEVICES: 'llama:nodes:list-diffusion-devices'/u);
+    assert.match(core, /listDiffusionDevices: \(\) => ipcRenderer\.invoke\(CHANNELS\.LIST_DIFFUSION_DEVICES\)/u);
+    assert.match(core, /options\.diffusionRuntime\?\.listDevices\?\.\(\)/u);
+    const { definitions } = loadHarness();
+    const definition = definitions.get('com.darkstar.dm-sampler.sampler');
+    assert.ok(definition);
+    assert.equal(definition.outputNode, false);
+    assert.deepEqual(Array.from(definition.inputs, (input) => [input.name, input.label, input.type, input.required]), [
+        ['diffusionModel', 'Diffusion Model', 'DIFFUSION_MODEL', false],
+    ]);
+    assert.deepEqual(Array.from(definition.outputs, (output) => [output.name, output.label, output.type]), [
+        ['dmSampler', 'DM Sampler', 'DM_SAMPLER'],
+    ]);
+});
+
+test('DM Sampler uses the shared Settings information architecture instead of a private two-column node layout', () => {
+    const source = read('custom_nodes/dm-sampler/renderer.js');
+    assert.match(source, /var UI_WIDTH = 880;/u);
+    assert.match(source, /\.ds-dm-sampler\{width:100%;min-width:0;box-sizing:border-box\}/u);
+    assert.doesNotMatch(source, /grid-template-columns:repeat\(2|min-width:560px|ds-dm-sampler-column/u,
+        'the custom sampler must not reintroduce its old node-era grid');
+    const { definitions } = loadHarness();
+    const definition = definitions.get('com.darkstar.dm-sampler.sampler');
+    const node = definition.factory('dm-settings', 0, 0);
+    const html = definition.buildContentHTML(node);
+    assert.match(html, /<group data-title="Generation">/u);
+    assert.match(html, /<group data-title="Sampling algorithm">/u);
+    assert.ok(html.indexOf('Generation') < html.indexOf('Sampling algorithm'));
+    assert.equal(node.uiWidth, 880);
+    node.uiWidth = 620;
+    definition.normalizeNode(node);
+    assert.equal(node.uiWidth, 880, 'restored legacy DM Samplers must retain their serialized width metadata');
+});
+
+test('DM Sampler normalizes and emits a versioned KSampler-style diffusion policy without executing diffusion', () => {
+    const { definitions } = loadHarness();
+    const definition = definitions.get('com.darkstar.dm-sampler.sampler');
+    const node = definition.factory('dm-1', 10, 20);
+    assert.deepEqual(JSON.parse(JSON.stringify(node.params)), {
+        seed: -1, steps: 0, cfgScale: 7, sampler: 'auto', scheduler: 'auto', attentionMode: 'auto', computeDevice: 'auto', denoise: 1, generationPrefix: 'masterpiece, best quality',
+    });
+    const html = definition.buildContentHTML(node);
+    assert.match(html, /<input type="range" class="node-slider" min="0" max="150" step="1" value="0"[\s\S]*aria-valuetext="Auto"/u);
+    assert.match(html, /<input type="range" class="node-slider" min="0" max="30" step="0\.1" value="7"/u);
+    assert.doesNotMatch(html, /0 = Auto|Sampling policy only|ds-dm-sampler-step-help|ds-dm-sampler-note/u);
+    assert.match(html, /Generation Prefix/u);
+    assert.match(html, /Compute Device:Auto\|CPU/u);
+    assert.match(html, /Attention:Auto \(runtime default\)\|Standard \(GGML\)\|Flash Attention \(Diffusion\)\|Flash Attention \(All supported modules\)/u);
+    assert.match(html, /masterpiece, best quality/u);
+    assert.equal(definition.getParameterDisplayValue(node, 'steps'), 'Auto');
+    assert.equal(definition.getParameterDisplayValue(node, 'cfgScale'), '7');
+    node.params.steps = 150;
+    node.params.cfgScale = 0;
+    assert.equal(definition.getParameterDisplayValue(node, 'steps'), '150');
+    assert.equal(definition.getParameterDisplayValue(node, 'cfgScale'), 'Auto');
+    node.params = { seed: 42, steps: 28, cfgScale: 5.5, sampler: 'euler', scheduler: 'karras', attentionMode: 'flash', computeDevice: 'vulkan1', denoise: 0.65 };
+    assert.deepEqual(JSON.parse(JSON.stringify(definition.execute({ diffusionModel: { kind: 'darkstar-diffusion-model', path: 'model.gguf' } }, node).dmSampler)), {
+        diffusionModel: { kind: 'darkstar-diffusion-model', path: 'model.gguf' },
+        schemaVersion: 2,
+        kind: 'darkstar-dm-sampler',
+        seed: 42,
+        steps: 28,
+        cfgScale: 5.5,
+        sampler: 'euler',
+        scheduler: 'karras',
+        attentionMode: 'flash',
+        computeDevice: 'vulkan1',
+        denoise: 0.65,
+        generationPrefix: 'masterpiece, best quality',
+    });
+    node.params = { seed: -99, steps: -9, cfgScale: 999, sampler: 'not-real', scheduler: 'not-real', attentionMode: 'xformers', denoise: -3 };
+    definition.normalizeNode(node);
+    assert.deepEqual(JSON.parse(JSON.stringify(node.params)), {
+        seed: -1, steps: 0, cfgScale: 30, sampler: 'auto', scheduler: 'auto', attentionMode: 'auto', computeDevice: 'auto', denoise: 0, generationPrefix: 'masterpiece, best quality',
+    });
+});
+
+test('DM Sampler discovers individual diffusion GPUs and keeps Auto and CPU as stable compute choices', async () => {
+    const { definitions } = loadHarness({
+        async listDiffusionDevices() {
+            return {
+                success: true,
+                available: true,
+                autoDeviceId: 'vulkan1',
+                autoDeviceLabel: 'NVIDIA GeForce RTX 4090',
+                devices: [
+                    { id: 'vulkan1', name: 'NVIDIA GeForce RTX 4090', description: 'NVIDIA GeForce RTX 4090' },
+                    { id: 'vulkan0', name: 'Intel Arc A770', description: 'Intel Arc A770' },
+                ],
+            };
+        },
+    });
+    const definition = definitions.get('com.darkstar.dm-sampler.sampler');
+    const node = definition.factory('dm-gpu', 0, 0);
+    assert.equal(await definition.onMount(node), true);
+    const html = definition.buildContentHTML(node);
+    assert.match(html, /Compute Device:Auto\|CPU\|NVIDIA GeForce RTX 4090 · vulkan1\|Intel Arc A770 · vulkan0/u);
+    node.params.computeDevice = 'vulkan0';
+    const emitted = definition.execute({ diffusionModel: { kind: 'darkstar-diffusion-model', path: 'model.gguf' } }, node).dmSampler;
+    assert.equal(emitted.computeDevice, 'vulkan0');
+    assert.equal(await definition.onMount(node), false, 'device inventory should not be re-enumerated on every rerender');
+});
+
+test('DM Sampler custom package renames the existing localSampler presentation to LM Sampler without changing its stable type', () => {
+    const { definitions, nodeRegistry } = loadHarness();
+    const localSampler = definitions.get('localSampler');
+    assert.equal(localSampler.title, 'LM Sampler');
+    assert.equal(nodeRegistry.localSampler.title, 'LM Sampler');
+    const created = localSampler.factory('lm-1', 0, 0);
+    assert.equal(created.type, 'localSampler');
+    assert.equal(created.title, 'LM Sampler');
+    const restored = { type: 'localSampler', title: 'L_Sampler', params: {} };
+    localSampler.normalizeNode(restored);
+    assert.equal(restored.title, 'LM Sampler');
+    const customTitle = { type: 'localSampler', title: 'My sampler', params: {} };
+    localSampler.normalizeNode(customTitle);
+    assert.equal(customTitle.title, 'My sampler', 'user-defined titles must remain untouched');
 });
 });
 
@@ -22336,7 +25266,7 @@ Module._load = function load(request, parent, isMain) {
 }
 
 
-// Release guard: the shared spectrum must stay fast/dense, the packaged quote catalog is exact,
+// Release guard: live activity motion must stay compositor-scoped, the packaged quote catalog is exact,
 // and managed project deletion must work even when the live workspace registry has not
 // been restored yet (the renderer supplies the known managed root as a fallback).
 {
@@ -22344,20 +25274,24 @@ Module._load = function load(request, parent, isMain) {
     const assert = require('node:assert/strict');
     const os = require('node:os');
 
-    test('global activity spectrum is fast, dense, continuously shared, and theme-owned', () => {
+    test('live activity motion is compositor-scoped and never animates inherited root state', () => {
         const css = fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'styles.css'), 'utf8');
-        assert.match(css, /--darkstar-spectrum-period:\s*768px/u);
-        assert.match(css, /--darkstar-spectrum-duration:\s*6\.4s/u);
-        assert.match(css, /@property --darkstar-spectrum-y/u);
-        assert.match(css, /@property --darkstar-spectrum-angle/u);
-        assert.match(css, /@keyframes darkstarSpectrumDrift[\s\S]*from \{ --darkstar-spectrum-phase: 0px; \}[\s\S]*to \{ --darkstar-spectrum-phase: var\(--darkstar-spectrum-period\); \}/u,
-            'horizontal spectrum travel must remain constant-speed with no intermediate phase keyframes');
-        assert.match(css, /@keyframes darkstarSpectrumVertical[\s\S]*-118px[\s\S]*146px/u);
-        assert.match(css, /@keyframes darkstarSpectrumSway[\s\S]*78deg[\s\S]*108deg/u);
-        const spectrum = css.match(/--darkstar-activity-spectrum:\s*linear-gradient\([\s\S]*?\);/u)?.[0] || '';
-        assert.ok((spectrum.match(/var\(--darkstar-spectrum-[a-d]\)/gu) || []).length >= 14,
-            'the shared field must contain dense chromatic variation rather than four broad bands');
-        assert.match(css, /html\[data-theme='light'\][\s\S]*--darkstar-spectrum-a:\s*rgba\(79,70,229/u);
+        assert.match(css, /\.thinking-block\.in-progress \.activity-title,[\s\S]*animation:\s*darkstarActivityPulse 1\.8s ease-in-out infinite alternate;/u,
+            'only the small active title wrappers should own continuous motion');
+        assert.match(css, /@keyframes darkstarActivityPulse[\s\S]*from \{ opacity: \.72; \}[\s\S]*to \{ opacity: 1; \}/u,
+            'activity motion must remain opacity-only so Chromium can composite it cheaply');
+        assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*\.thinking-block\.in-progress \.activity-title[\s\S]*animation:\s*none;/u,
+            'reduced motion must still disable live activity animation');
+        assert.doesNotMatch(css, /@property --darkstar-spectrum-/u,
+            'registered inherited spectrum properties must not return');
+        assert.doesNotMatch(css, /darkstarSpectrum(?:Drift|Vertical|Sway)/u,
+            'the old document-wide spectrum clocks must remain removed');
+        assert.doesNotMatch(css, /animation:\s*reasoningTextFlow/u,
+            'background-position animation must not return on activity labels or glyphs');
+        assert.doesNotMatch(css, /will-change:\s*background-position/u,
+            'activity surfaces must not request repaint-oriented background-position promotion');
+        assert.doesNotMatch(css, /background-attachment:\s*fixed/u,
+            'viewport-fixed animated activity backgrounds must remain removed');
     });
 
     test('packaged welcome quote catalog uses only the approved lines', () => {
@@ -22579,30 +25513,33 @@ Module._load = function load(request, parent, isMain) {
 }
 
 
-// Licensing regression guards: Darkstar first-party source has one Apache-2.0
-// license, while third-party components retain their own upstream terms.
+// Licensing regression guards: Darkstar first-party materials use Apache-2.0,
+// while third-party components retain their upstream terms.
 {
     const { test } = require('node:test');
     const assert = require('node:assert/strict');
     const readRoot = (file) => fs.readFileSync(path.join(ROOT, file), 'utf8');
 
-    test('Darkstar Harness exposes one first-party Apache-2.0 license', () => {
-        const license = readRoot('LICENSE');
+    test('Darkstar exposes the standard Apache License 2.0 for first-party materials', () => {
+        const license = readRoot('LICENSE.md');
         const readme = readRoot('README.md');
         assert.match(license, /Apache License\s+Version 2\.0, January 2004/u);
         assert.match(license, /TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION/u);
-        assert.match(readme, /released under the \*\*Apache License 2\.0\*\*/u);
-        assert.match(readme, /complete first-party source code is included/u);
-        for (const obsolete of ['LICENSING.md', 'COMMUNITY_LICENSE.md', 'COMMERCIAL_LICENSE.md', 'CLA.md', 'THIRD_PARTY_NOTICES.md', 'RUNTIME_LICENSE_POLICY.json']) {
-            assert.equal(fs.existsSync(path.join(ROOT, obsolete)), false, `${obsolete} must remain removed`);
+        assert.match(license, /7\. Disclaimer of Warranty/u);
+        assert.match(license, /8\. Limitation of Liability/u);
+        assert.match(license, /END OF TERMS AND CONDITIONS/u);
+        assert.doesNotMatch(license, /Darkstar Software License v1\.0/u);
+        assert.match(readme, /licensed under the \*\*Apache License 2\.0\*\*/u);
+        assert.match(readme, /See `LICENSE\.md`/u);
+        for (const obsolete of ['LICENSE', 'LICENSING.md', 'COMMUNITY_LICENSE.md', 'COMMERCIAL_LICENSE.md', 'CLA.md', 'THIRD_PARTY_NOTICES.md', 'RUNTIME_LICENSE_POLICY.json']) {
+            assert.equal(fs.existsSync(path.join(ROOT, obsolete)), false, `${obsolete} must remain absent`);
         }
         assert.equal(fs.existsSync(path.join(ROOT, 'backend', 'runtime-component-policy.json')), true, 'internal runtime component policy must remain available');
     });
 
-    test('first-party executable source uses Apache-2.0 while third-party code retains upstream licensing', () => {
+    test('first-party executable source uses Apache-2.0 SPDX while third-party code retains upstream licensing', () => {
         const files = [
             'Launch_Darkstar.bat',
-            'backend/scripts/launch-darkstar-hidden.vbs',
             'backend/Darkstar_Core.js',
             'backend/Darkstar_Renderer.js',
             'backend/Dev/Darkstar_Tests.js',
@@ -22614,6 +25551,7 @@ Module._load = function load(request, parent, isMain) {
             'backend/uip/windows-memory.ps1',
             'backend/uip/windows-uia.ps1',
             'backend/uip/windows-uip.ps1',
+            'backend/scripts/bootstrap-python.ps1',
             'backend/scripts/bootstrap-electron.ps1',
             'backend/scripts/bootstrap-llamacpp.ps1',
             'backend/renderer/node-editor.css',
@@ -22624,26 +25562,840 @@ Module._load = function load(request, parent, isMain) {
         for (const file of files) {
             const head = readRoot(file).slice(0, 512);
             assert.match(head, /SPDX-License-Identifier: Apache-2\.0/u, `${file} must identify Apache-2.0`);
-            assert.doesNotMatch(head, /LicenseRef-Darkstar-Harness/u, `${file} must not retain the retired proprietary identifier`);
+            assert.doesNotMatch(head, /LicenseRef-Darkstar-Software-License-1\.0/u, `${file} must not retain the old Darkstar LicenseRef`);
         }
         assert.match(readRoot('backend/vendor/three/r184/three.core.js').slice(0, 1024), /SPDX-License-Identifier: MIT/u, 'vendored three.js must retain its upstream MIT identifier');
         assert.doesNotMatch(readRoot('agent_assets/skills/Skill Manual/SKILL.md').slice(0, 1024), /SPDX-License-Identifier: Apache-2\.0/u,
-            'third-party Skill Manual must not be relabeled as first-party Darkstar code');
+            'third-party Skill Manual must not be relabeled as first-party Apache-2.0 code');
     });
 
-    test('package metadata and offline release identify Apache-2.0 and ship only the root first-party license', () => {
+    test('package metadata and offline release identify and ship LICENSE.md as Apache-2.0', () => {
         const packageJson = JSON.parse(readRoot('backend/shell/package.json'));
         const build = productionSources.get('backend/scripts/build-offline.js');
         assert.equal(packageJson.license, 'Apache-2.0');
-        assert.ok(packageJson.build.files.includes('LICENSE'));
-        for (const obsolete of ['LICENSING.md', 'COMMUNITY_LICENSE.md', 'COMMERCIAL_LICENSE.md', 'THIRD_PARTY_NOTICES.md', 'RUNTIME_LICENSE_POLICY.json']) {
+        assert.ok(packageJson.build.files.includes('LICENSE.md'));
+        assert.equal(packageJson.build.files.includes('LICENSE'), false);
+        for (const obsolete of ['LICENSE', 'LICENSING.md', 'COMMUNITY_LICENSE.md', 'COMMERCIAL_LICENSE.md', 'THIRD_PARTY_NOTICES.md', 'RUNTIME_LICENSE_POLICY.json']) {
             assert.equal(packageJson.build.files.includes(obsolete), false, `${obsolete} must not be packaged as a root legal document`);
             assert.equal(build.includes(`'${obsolete}'`), false, `${obsolete} must not be copied beside the offline executable`);
         }
-        assert.match(build, /for \(const file of \['LICENSE'\]\)/u);
+        assert.match(build, /for \(const file of \['LICENSE\.md'\]\)/u);
     });
 }
 
+
+// Generate Image is an end-to-end privileged media feature: Python requests the action,
+// Core owns native diffusion execution, renderer previews remain transient, and only the final
+// image is promoted into normal multimodal chat context.
+{
+    const { test } = require('node:test');
+    const assert = require('node:assert/strict');
+    const os = require('node:os');
+    const { DiffusionRuntime, estimateDiffusionPipelineResidentBytes, normalizeDiffusionConfiguration, prepareImageEdit, finalizeImageEdit } = productionRuntime.requireModule('backend/runtime/diffusion-runtime.js');
+    const { decodePngRgba, encodePngRgba } = productionRuntime.requireModule('backend/runtime/png-rgba.js');
+    const { applyRamParkingLaunchArgs, estimateLanguageModelMemory, ramParkingPlan, temporarilyReleaseVramForExternalWork } = productionRuntime.requireModule('backend/runtime/external-work-lifecycle.js');
+    const { LlamaRuntime } = productionRuntime.requireModule('backend/llama-runtime.js');
+    const { resolveToolResultAction } = productionRuntime.requireModule('backend/agent/tool-runtime.js');
+
+    const ONE_PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+
+    function diffusionConfiguration(modelPath) {
+        return {
+            kind: 'darkstar-dm-sampler', schemaVersion: 1,
+            diffusionModel: {
+                kind: 'darkstar-diffusion-model', path: modelPath,
+                selectedPaths: { diffusionModelPath: modelPath },
+                analysis: { family: 'Fixture', variant: 'unit', architecture: 'fixture', requirements: [] },
+            },
+            seed: 123, steps: 4, stepsAuto: false, cfgScale: 6.5, sampler: 'euler', scheduler: 'karras', attentionMode: 'auto', computeDevice: 'auto', denoise: 1, generationPrefix: '',
+        };
+    }
+
+    test('Generate Image Python tool is bundled, schema-bounded, and requests only the Core-owned generate_image action', () => {
+        const source = fs.readFileSync(path.join(ROOT, 'agent_assets', 'tools', 'generate_image.py'), 'utf8');
+        assert.match(source, /registry\.register[\s\S]*name=SCHEMA\["name"\][\s\S]*toolset="media"/u);
+        assert.match(source, /"name": "generate_image"/u);
+        assert.match(source, /"__darkstarAction": "generate_image"/u);
+        assert.match(source, /MIN_DIMENSION = 64[\s\S]*MAX_DIMENSION = 4096[\s\S]*DIMENSION_MULTIPLE = 8/u);
+        assert.match(source, /MIN_IMAGE_COUNT = 1[\s\S]*MAX_IMAGE_COUNT = 50/u);
+        assert.match(source, /"image_count": \{[\s\S]*"minimum": MIN_IMAGE_COUNT,[\s\S]*"maximum": MAX_IMAGE_COUNT/u);
+        assert.match(source, /Images are generated one after another, not as a native batch/u);
+        assert.match(source, /"steps": \{[\s\S]*"minimum": MIN_STEPS,[\s\S]*"maximum": MAX_STEPS/u);
+        assert.match(source, /"cfg_scale": \{[\s\S]*"minimum": MIN_CFG_SCALE,[\s\S]*"maximum": MAX_CFG_SCALE/u);
+        assert.match(source, /"sampler": \{[\s\S]*"enum": SAMPLER_VALUES/u);
+        assert.match(source, /More complex prompts or higher-fidelity requests generally benefit from more steps/u);
+        assert.match(source, /Higher CFG generally follows the prompt more strongly/u);
+        assert.doesNotMatch(source, /subprocess|os\.system|Popen|sd-cli/u, 'Python provider must not bypass the privileged Core runtime boundary');
+    });
+
+    test('Diffusion runtime normalizes the DM triangle and streams validated previews before returning the final PNG', async (t) => {
+        const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-diffusion-runtime-'));
+        t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+        const modelPath = path.join(fixture, 'model.gguf');
+        fs.writeFileSync(modelPath, 'fixture-model');
+        const executable = path.join(fixture, 'fake-sd-cli.js');
+        const script = `#!/usr/bin/env node
+const fs=require('node:fs');
+const png=Buffer.from('${ONE_PIXEL_PNG}','base64');
+const a=process.argv.slice(2);
+if(a.includes('--help')){console.log('stable-diffusion.cpp sd-cli --diffusion-model --prompt --negative-prompt --output --steps --cfg-scale --sampling-method --scheduler --preview --preview-path --preview-interval --auto-fit --backend --list-devices --diffusion-fa --fa euler karras');process.exit(0);}
+if(a.includes('--list-devices')){console.log('vulkan0\tNVIDIA GeForce RTX 3080');console.log('vulkan1\tNVIDIA GeForce RTX 4090');process.exit(0);}
+const val=(...names)=>{for(const n of names){const i=a.indexOf(n);if(i>=0)return a[i+1];}return '';};
+const preview=val('--preview-path'); const output=val('-o','--output');
+setTimeout(()=>fs.writeFileSync(preview,png),35);
+setTimeout(()=>process.stderr.write('1 / 4\\n'),55);
+setTimeout(()=>fs.writeFileSync(preview,Buffer.concat([png,Buffer.from('x')])),70);
+setTimeout(()=>{fs.writeFileSync(output,png);process.exit(0);},145);
+`;
+        fs.writeFileSync(executable, script, { mode: 0o755 });
+        fs.chmodSync(executable, 0o755);
+
+        const config = diffusionConfiguration(modelPath);
+        config.generationPrefix = 'masterpiece, best quality';
+        config.attentionMode = 'flash';
+        const normalized = normalizeDiffusionConfiguration(config);
+        assert.equal(normalized.kind, 'darkstar-diffusion-runtime-config');
+        assert.equal(normalized.paths.diffusionModelPath, modelPath);
+        assert.equal(normalized.steps, 4);
+        assert.equal(normalized.generationPrefix, 'masterpiece, best quality');
+        assert.equal(normalized.computeDevice, 'auto');
+        assert.equal(normalized.attentionMode, 'flash');
+        assert.deepEqual(normalizeDiffusionConfiguration(normalized), normalized, 'runtime diffusion normalization must be idempotent');
+        const argumentProbe = new DiffusionRuntime({ baseDir: fixture, executable });
+        const autoFitArgs = argumentProbe._arguments(normalized, { prompt: 'x', negative_prompt: '', width: 512, height: 512 }, { output: 'o.png', preview: 'p.png' }, 123, '--auto-fit --diffusion-fa --fa euler karras', 4, 6.5, 'euler');
+        assert.ok(autoFitArgs.includes('--auto-fit'), 'legacy automatic fitting remains available only when no concrete compute target has been resolved');
+        const explicitDeviceArgs = argumentProbe._arguments(normalized, { prompt: 'x', negative_prompt: '', width: 512, height: 512 }, { output: 'o.png', preview: 'p.png' }, 123, '--auto-fit --backend --diffusion-fa --fa euler karras', 4, 6.5, 'euler', { deviceId: 'vulkan1' });
+        assert.equal(explicitDeviceArgs[explicitDeviceArgs.indexOf('--backend') + 1], 'vulkan1');
+        assert.equal(explicitDeviceArgs.includes('--auto-fit'), false, 'an explicit device must not be overridden by --auto-fit');
+        assert.equal(autoFitArgs.includes('-n'), false, 'an empty negative prompt must not emit a native negative-prompt flag');
+        const negativeArgs = argumentProbe._arguments(normalized, { prompt: 'x', negative_prompt: 'bad anatomy', width: 512, height: 512 }, { output: 'o.png', preview: 'p.png' }, 123, '--diffusion-fa --fa euler karras', 4, 6.5, 'euler');
+        assert.equal(negativeArgs[negativeArgs.indexOf('-n') + 1], 'bad anatomy');
+
+        const standardConfig = { ...normalized, attentionMode: 'standard' };
+        const standardArgs = argumentProbe._arguments(standardConfig, { prompt: 'x', negative_prompt: '', width: 512, height: 512 }, { output: 'o.png', preview: 'p.png' }, 123, '--diffusion-fa --fa euler karras', 4, 6.5, 'euler');
+        assert.equal(standardArgs.includes('--diffusion-fa'), false);
+        assert.equal(standardArgs.includes('--fa'), false);
+        const flashArgs = argumentProbe._arguments({ ...normalized, attentionMode: 'flash' }, { prompt: 'x', negative_prompt: '', width: 512, height: 512 }, { output: 'o.png', preview: 'p.png' }, 123, '--diffusion-fa --fa euler karras', 4, 6.5, 'euler');
+        assert.equal(flashArgs.includes('--diffusion-fa'), true);
+        assert.equal(flashArgs.includes('--fa'), false);
+        const fullFlashArgs = argumentProbe._arguments({ ...normalized, attentionMode: 'flash_full' }, { prompt: 'x', negative_prompt: '', width: 512, height: 512 }, { output: 'o.png', preview: 'p.png' }, 123, '--diffusion-fa --fa euler karras', 4, 6.5, 'euler');
+        assert.equal(fullFlashArgs.includes('--fa'), true);
+        assert.throws(() => argumentProbe._arguments({ ...normalized, attentionMode: 'flash' }, { prompt: 'x', negative_prompt: '', width: 512, height: 512 }, { output: 'o.png', preview: 'p.png' }, 123, 'euler karras', 4, 6.5, 'euler'), /requires --diffusion-fa/u);
+        assert.throws(() => argumentProbe._arguments({ ...normalized, attentionMode: 'flash_full' }, { prompt: 'x', negative_prompt: '', width: 512, height: 512 }, { output: 'o.png', preview: 'p.png' }, 123, '--diffusion-fa euler karras', 4, 6.5, 'euler'), /requires --fa/u);
+
+        const progress = [];
+        let spawnedArgs = null;
+        const nativeSpawn = require('node:child_process').spawn;
+        const runtime = new DiffusionRuntime({ baseDir: fixture, executable, listCudaDevices: async () => ({ available: true, devices: [{ index: 0, name: 'NVIDIA GeForce RTX 3080', memoryTotalMiB: 10240 }, { index: 1, name: 'NVIDIA GeForce RTX 4090', memoryTotalMiB: 24576 }] }), spawn(command, args, options) { spawnedArgs = args.slice(); return nativeSpawn(command, args, options); } });
+        t.after(() => runtime.shutdown());
+        const inventory = await runtime.listDevices({ refresh: true });
+        assert.deepEqual(inventory.devices.map((device) => device.id), ['vulkan1', 'vulkan0']);
+        assert.equal(inventory.autoDeviceId, 'vulkan1', 'Auto should prefer the stronger discrete GPU when NVIDIA VRAM telemetry differentiates the devices');
+        const explicitTarget = await runtime._resolveComputeTarget('vulkan0');
+        assert.equal(explicitTarget.deviceId, 'vulkan0');
+        const cpuTarget = await runtime._resolveComputeTarget('cpu');
+        assert.equal(cpuTarget.deviceId, 'cpu');
+        const result = await runtime.generate(normalized, { prompt: 'a fixture image', width: 512, height: 320 }, {
+            onProgress(event) { progress.push(event); },
+        });
+        assert.equal(result.__darkstarMultimodal, true);
+        assert.equal(result.__darkstarDisplayWithoutVision, true);
+        assert.equal(result.images.length, 1);
+        assert.equal(result.images[0].mimeType, 'image/png');
+        assert.equal(Buffer.from(result.images[0].base64, 'base64').subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+        assert.equal(result.metadata.seed, 123);
+        assert.equal(result.metadata.steps, 4);
+        assert.equal(result.metadata.attentionMode, 'flash');
+        assert.ok(spawnedArgs);
+        assert.equal(spawnedArgs[spawnedArgs.indexOf('--backend') + 1], 'vulkan1', 'Auto must resolve to the highest-ranked available GPU before native launch');
+        assert.equal(spawnedArgs.includes('--auto-fit'), false, 'resolved Auto GPU selection must not be overridden by --auto-fit');
+        assert.equal(result.metadata.computeDevice, 'vulkan1');
+        assert.equal(spawnedArgs[spawnedArgs.indexOf('-p') + 1], 'masterpiece, best quality, a fixture image');
+        assert.equal(spawnedArgs.includes('-n'), false);
+        assert.equal(spawnedArgs.includes('--diffusion-fa'), true);
+        assert.equal(spawnedArgs.includes('--fa'), false);
+        assert.ok(progress.some((event) => event.phase === 'loading'));
+        assert.ok(progress.some((event) => event.phase === 'denoising' && event.base64), 'at least one transient preview frame must cross the progress callback');
+        assert.ok(progress.some((event) => event.phase === 'finalizing' && event.progress === 1));
+        assert.ok(progress.some((event) => event.finalImage === true && event.base64), 'the completed PNG must be published before language-model restoration');
+        const oversizedPrefix = diffusionConfiguration(modelPath);
+        oversizedPrefix.generationPrefix = 'x'.repeat(12000);
+        await assert.rejects(() => runtime.generate(oversizedPrefix, { prompt: 'y', width: 512, height: 320 }), /prompt plus DM Sampler Generation Prefix must be at most 12000 characters/u);
+    });
+
+    test('Diffusion runtime salvages and publishes a valid PNG even when sd-cli exits nonzero after writing it', async (t) => {
+        const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-diffusion-salvage-'));
+        t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+        const modelPath = path.join(fixture, 'model.gguf');
+        fs.writeFileSync(modelPath, 'fixture-model');
+        const executable = path.join(fixture, 'fake-sd-cli-crash.js');
+        const script = `#!/usr/bin/env node
+const fs=require('node:fs');
+const png=Buffer.from('${ONE_PIXEL_PNG}','base64');
+const a=process.argv.slice(2);
+if(a.includes('--help')){console.log('stable-diffusion.cpp sd-cli --diffusion-model --prompt --negative-prompt --output --steps --cfg-scale --sampling-method --scheduler --preview --preview-path --preview-interval --auto-fit euler karras');process.exit(0);}
+const val=(...names)=>{for(const n of names){const i=a.indexOf(n);if(i>=0)return a[i+1];}return '';};
+const output=val('-o','--output');
+fs.writeFileSync(output,png);
+setTimeout(()=>process.exit(5),80);
+`;
+        fs.writeFileSync(executable, script, { mode: 0o755 });
+        fs.chmodSync(executable, 0o755);
+        const progress = [];
+        const runtime = new DiffusionRuntime({ baseDir: fixture, executable });
+        t.after(() => runtime.shutdown());
+        const result = await runtime.generate(diffusionConfiguration(modelPath), { prompt: 'salvage', width: 512, height: 512 }, { onProgress(event) { progress.push(event); } });
+        assert.equal(result.__darkstarMultimodal, true);
+        assert.equal(result.metadata.nativeExitCode, 5);
+        assert.equal(result.metadata.recoveredFromNativeExit, true);
+        assert.ok(progress.some((event) => event.phase === 'image-ready' && event.finalImage === true && event.base64));
+    });
+
+    test('generate_image action is capability-bound to the named Python tool and forwards DM configuration plus progress into Core diffusion runtime', async () => {
+        const calls = [];
+        const diffusion = { kind: 'darkstar-dm-sampler' };
+        const progress = () => undefined;
+        const runtime = { async generate(configuration, request, options) { calls.push({ configuration, request, options }); return { ok: true }; } };
+        await assert.rejects(() => resolveToolResultAction({ __darkstarAction: 'generate_image', prompt: 'x' }, {
+            toolName: 'some_other_tool', diffusionRuntime: runtime, diffusion,
+        }), /Only the generate_image Python Tool/u);
+        const result = await resolveToolResultAction({ __darkstarAction: 'generate_image', prompt: 'x', negative_prompt: 'must disappear', width: 512, height: 512, image_count: 1, steps: 48, cfg_scale: 5.1, sampler: 'er_sde' }, {
+            toolName: 'generate_image', diffusionRuntime: runtime, diffusion, onToolProgress: progress, dynamicVramEnabled: true,
+        });
+        assert.deepEqual(result, { ok: true });
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0].configuration, diffusion);
+        assert.equal(calls[0].request.prompt, 'x');
+        assert.equal(calls[0].request.negative_prompt, '', 'Negative Prompt OFF must discard even a forged tool result value');
+        assert.equal(calls[0].request.steps, 48);
+        assert.equal(calls[0].request.cfg_scale, 5.1);
+        assert.equal(calls[0].request.sampler, 'er_sde');
+        assert.equal(calls[0].options.onProgress, progress);
+        assert.equal(calls[0].options.dynamicVramEnabled, true);
+        await assert.rejects(() => resolveToolResultAction({ __darkstarAction: 'generate_image', prompt: 'x' }, {
+            toolName: 'generate_image', diffusionRuntime: runtime, diffusion, negativePromptEnabled: true,
+        }), /Negative Prompt is enabled[\s\S]*non-empty negative_prompt/u);
+        await resolveToolResultAction({ __darkstarAction: 'generate_image', prompt: 'x', negative_prompt: '  bad anatomy  ', image_count: 1 }, {
+            toolName: 'generate_image', diffusionRuntime: runtime, diffusion, negativePromptEnabled: true,
+        });
+        assert.equal(calls.length, 2);
+        assert.equal(calls[1].request.negative_prompt, 'bad anatomy');
+    });
+
+    test('Generate Image executes model-selected or Settings-forced counts as sequential single-image generations', async () => {
+        const calls = [];
+        const progress = [];
+        const runtime = {
+            async generate(configuration, request, options) {
+                const index = calls.length + 1;
+                calls.push({ configuration: { ...configuration }, request: { ...request } });
+                options.onProgress?.({ phase: 'loading', statusText: 'Loading diffusion model…' });
+                options.onProgress?.({ phase: 'finalizing', finalImage: true, mimeType: 'image/png', base64: ONE_PIXEL_PNG, imageName: `image-${index}.png`, width: 1, height: 1 });
+                return {
+                    __darkstarMultimodal: true,
+                    __darkstarDisplayWithoutVision: true,
+                    text: `Generated image ${index}.`,
+                    images: [{ mimeType: 'image/png', name: `image-${index}.png`, base64: ONE_PIXEL_PNG }],
+                    metadata: { seed: configuration.seed },
+                };
+            },
+        };
+        const diffusion = { kind: 'darkstar-dm-sampler', seed: 900 };
+        const modelSelected = await resolveToolResultAction({ __darkstarAction: 'generate_image', prompt: 'sequence', image_count: 3 }, {
+            toolName: 'generate_image', diffusionRuntime: runtime, diffusion, onToolProgress(event) { progress.push(event); }, imageCountOverride: 0,
+        });
+        assert.equal(calls.length, 3);
+        assert.deepEqual(calls.map((entry) => entry.configuration.seed), [900, 901, 902], 'fixed DM seed should advance per sequential image so a multi-image request does not reproduce identical pixels');
+        assert.ok(calls.every((entry) => !Object.hasOwn(entry.request, 'image_count')), 'image_count is orchestration metadata and must not reach stable-diffusion.cpp request normalization');
+        assert.equal(modelSelected.images.length, 3);
+        assert.equal(modelSelected.metadata.imageCount, 3);
+        assert.equal(modelSelected.metadata.countSource, 'model');
+        assert.deepEqual(progress.filter((event) => event.finalImage).map((event) => [event.imageIndex, event.imageCount]), [[1, 3], [2, 3], [3, 3]]);
+        assert.ok(progress.some((event) => /Image 2\/3/u.test(event.statusText)));
+
+        calls.length = 0;
+        const settingsForced = await resolveToolResultAction({ __darkstarAction: 'generate_image', prompt: 'forced', image_count: 49 }, {
+            toolName: 'generate_image', diffusionRuntime: runtime, diffusion, imageCountOverride: 2,
+        });
+        assert.equal(calls.length, 2, 'a nonzero Settings value must override the model-provided count');
+        assert.equal(settingsForced.images.length, 2);
+        assert.equal(settingsForced.metadata.countSource, 'settings');
+        await assert.rejects(() => resolveToolResultAction({ __darkstarAction: 'generate_image', prompt: 'missing count' }, {
+            toolName: 'generate_image', diffusionRuntime: runtime, diffusion, imageCountOverride: 0,
+        }), /image_count must be an integer between 1 and 50/u);
+    });
+
+    test('Generate Image tool schema requires model-selected auto fields and hides fixed DM overrides', () => {
+        const { projectDiffusionDefinition } = productionRuntime.requireModule('backend/agent/tool-capabilities.js');
+        const base = {
+            type: 'function',
+            function: {
+                name: 'generate_image',
+                description: 'Generate an image.',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        prompt: { type: 'string' },
+                        negative_prompt: { type: 'string' },
+                        width: { type: 'integer', minimum: 64, maximum: 4096 },
+                        height: { type: 'integer', minimum: 64, maximum: 4096 },
+                        image_count: { type: 'integer', minimum: 1, maximum: 50 },
+                        steps: { type: 'integer', minimum: 1, maximum: 150 },
+                        cfg_scale: { type: 'number', minimum: 0.1, maximum: 30 },
+                        sampler: { type: 'string', enum: ['euler', 'er_sde'] },
+                    },
+                    required: ['prompt'],
+                    additionalProperties: false,
+                },
+            },
+        };
+        const automatic = projectDiffusionDefinition(base, { steps: 0, stepsAuto: true, cfgScale: 0, cfgScaleAuto: true, sampler: 'auto', generationPrefix: 'masterpiece, best quality' }, false, 0);
+        assert.deepEqual(new Set(automatic.function.parameters.required), new Set(['prompt', 'image_count', 'steps', 'cfg_scale', 'sampler']));
+        assert.ok(automatic.function.parameters.properties.image_count);
+        assert.match(automatic.function.parameters.properties.image_count.description, /Choose an integer from 1 to 50/u);
+        assert.ok(automatic.function.parameters.properties.steps);
+        assert.ok(automatic.function.parameters.properties.cfg_scale);
+        assert.ok(automatic.function.parameters.properties.sampler);
+        assert.equal(Object.hasOwn(automatic.function.parameters.properties, 'negative_prompt'), false);
+        assert.match(automatic.function.description, /automatically prepends the configured DM Sampler Generation Prefix/u);
+        assert.match(automatic.function.description, /MUST choose steps between 1 and 150/u);
+        assert.match(automatic.function.description, /MUST choose cfg_scale between 0\.1 and 30/u);
+        assert.match(automatic.function.description, /MUST choose the sampler/u);
+        const negativeEnabled = projectDiffusionDefinition(base, { steps: 0, stepsAuto: true, cfgScale: 0, cfgScaleAuto: true, sampler: 'auto' }, true, 0);
+        assert.equal(negativeEnabled.function.parameters.properties.negative_prompt.minLength, 1);
+        assert.ok(negativeEnabled.function.parameters.required.includes('negative_prompt'));
+        assert.match(negativeEnabled.function.parameters.properties.negative_prompt.description, /Required because Negative Prompt is enabled/u);
+        const fixed = projectDiffusionDefinition(base, { steps: 32, stepsAuto: false, cfgScale: 6.5, cfgScaleAuto: false, sampler: 'euler' }, false, 4);
+        assert.equal(Object.hasOwn(fixed.function.parameters.properties, 'image_count'), false);
+        assert.equal(Object.hasOwn(fixed.function.parameters.properties, 'steps'), false);
+        assert.equal(Object.hasOwn(fixed.function.parameters.properties, 'cfg_scale'), false);
+        assert.equal(Object.hasOwn(fixed.function.parameters.properties, 'sampler'), false);
+        assert.deepEqual(fixed.function.parameters.required, ['prompt']);
+        assert.match(fixed.function.description, /fixed at 32/u);
+        assert.match(fixed.function.description, /fixed at 6\.5/u);
+        assert.match(fixed.function.description, /fixed at euler/u);
+        assert.match(fixed.function.description, /fixes image count at 4/u);
+
+        const armedEdit = projectDiffusionDefinition(base, { steps: 32, stepsAuto: false, cfgScale: 6.5, cfgScaleAuto: false, sampler: 'euler' }, false, 1, {
+            version: 1, mode: 'selection', sourceBase64: 'opaque-user-owned-source', sourceWidth: 64, sourceHeight: 64,
+            region: { x: 8, y: 8, width: 24, height: 20 },
+        });
+        assert.equal(Object.hasOwn(armedEdit.function.parameters.properties, 'width'), false);
+        assert.equal(Object.hasOwn(armedEdit.function.parameters.properties, 'height'), false);
+        assert.equal(Object.hasOwn(armedEdit.function.parameters.properties, 'mask'), false);
+        assert.equal(Object.hasOwn(armedEdit.function.parameters.properties, 'sourceBase64'), false);
+        assert.match(armedEdit.function.description, /user-authored inpainting edit is armed/u);
+        assert.match(armedEdit.function.description, /hard-preserves every pixel outside the user-approved region/u);
+        assert.match(armedEdit.function.description, /Do not attempt to choose a mask, crop, width, or height/u);
+    });
+
+    test('inpainting preparation derives an authoritative mask and finalization hard-preserves every pixel outside the user-approved region', () => {
+        const width = 8, height = 8;
+        const sourceData = Buffer.alloc(width * height * 4);
+        for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) {
+            const offset = (y * width + x) * 4;
+            sourceData[offset] = x * 17; sourceData[offset + 1] = y * 19; sourceData[offset + 2] = 73; sourceData[offset + 3] = 255;
+        }
+        const sourcePng = encodePngRgba({ width, height, data: sourceData });
+        const region = { x: 2, y: 3, width: 3, height: 2 };
+        const prepared = prepareImageEdit({ version: 1, mode: 'selection', sourceBase64: sourcePng.toString('base64'), sourceWidth: width, sourceHeight: height, region });
+        assert.ok(prepared);
+        const mask = decodePngRgba(prepared.maskPng);
+        assert.ok(mask.data.some((value, index) => index % 4 !== 3 && value === 255), 'prepared mask must contain editable white pixels');
+        assert.ok(mask.data.some((value, index) => index % 4 !== 3 && value === 0), 'prepared mask must contain protected black pixels');
+        const generatedData = Buffer.alloc(prepared.processing.width * prepared.processing.height * 4);
+        for (let offset = 0; offset < generatedData.length; offset += 4) {
+            generatedData[offset] = 250; generatedData[offset + 1] = 11; generatedData[offset + 2] = 22; generatedData[offset + 3] = 255;
+        }
+        const finalPng = finalizeImageEdit(encodePngRgba({ width: prepared.processing.width, height: prepared.processing.height, data: generatedData }), prepared);
+        const finalImage = decodePngRgba(finalPng);
+        for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) {
+            const offset = (y * width + x) * 4;
+            const inside = x >= region.x && x < region.x + region.width && y >= region.y && y < region.y + region.height;
+            if (inside) assert.deepEqual(Array.from(finalImage.data.subarray(offset, offset + 4)), [250, 11, 22, 255], `editable pixel ${x},${y} should come from the generated patch`);
+            else assert.deepEqual(Array.from(finalImage.data.subarray(offset, offset + 4)), Array.from(sourceData.subarray(offset, offset + 4)), `protected pixel ${x},${y} must remain byte-identical to the pristine source`);
+        }
+    });
+
+    test('diffusion inpainting routes init/mask/strength to stable-diffusion.cpp and returns only the hard-composited full-resolution image', async (t) => {
+        const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-inpaint-runtime-'));
+        t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+        const modelPath = path.join(fixture, 'model.gguf'); fs.writeFileSync(modelPath, 'fixture-model');
+        const capturePath = path.join(fixture, 'captured-args.json');
+        const executable = path.join(fixture, 'fake-sd-inpaint.js');
+        const script = `#!/usr/bin/env node
+const fs=require('node:fs');
+const a=process.argv.slice(2);
+if(a.includes('--help')){console.log('stable-diffusion.cpp sd-cli --diffusion-model --prompt --negative-prompt --output --steps --cfg-scale --sampling-method --scheduler --preview --preview-path --preview-interval --auto-fit --init-img --mask --strength euler karras');process.exit(0);}
+const val=(...names)=>{for(const n of names){const i=a.indexOf(n);if(i>=0)return a[i+1];}return '';};
+fs.writeFileSync(${JSON.stringify(capturePath)},JSON.stringify(a));
+fs.copyFileSync(val('--init-img'),val('-o','--output'));
+`;
+        fs.writeFileSync(executable, script, { mode: 0o755 }); fs.chmodSync(executable, 0o755);
+        const sourceWidth = 64, sourceHeight = 64, sourceData = Buffer.alloc(sourceWidth * sourceHeight * 4);
+        for (let offset = 0; offset < sourceData.length; offset += 4) { sourceData[offset] = 31; sourceData[offset + 1] = 61; sourceData[offset + 2] = 91; sourceData[offset + 3] = 255; }
+        const sourcePng = encodePngRgba({ width: sourceWidth, height: sourceHeight, data: sourceData });
+        const region = { x: 16, y: 16, width: 24, height: 24 };
+        const runtime = new DiffusionRuntime({ baseDir: fixture, executable }); t.after(() => runtime.shutdown());
+        const progress = [];
+        const config = diffusionConfiguration(modelPath); config.denoise = 0.42;
+        const result = await runtime.generate(config, { prompt: 'replace the selected object' }, {
+            imageEdit: { version: 1, mode: 'selection', sourceBase64: sourcePng.toString('base64'), sourceWidth, sourceHeight, region },
+            onProgress(event) { progress.push(event); },
+        });
+        const args = JSON.parse(fs.readFileSync(capturePath, 'utf8'));
+        assert.ok(args.includes('--init-img')); assert.ok(args.includes('--mask')); assert.ok(args.includes('--strength'));
+        assert.equal(args[args.indexOf('--strength') + 1], '0.42');
+        assert.equal(result.metadata.kind, 'darkstar-inpainted-image');
+        assert.equal(result.metadata.width, sourceWidth); assert.equal(result.metadata.height, sourceHeight);
+        assert.equal(result.metadata.inpaint.hardPreserveOutsideRegion, true);
+        const finalImage = decodePngRgba(Buffer.from(result.images[0].base64, 'base64'));
+        assert.equal(finalImage.width, sourceWidth); assert.equal(finalImage.height, sourceHeight);
+        assert.equal(progress.filter((event) => event.finalImage === true).length, 1, 'inpainting must never publish the uncomposited native output as a final image');
+        assert.match(progress.find((event) => event.finalImage === true)?.statusText || '', /protected pixels preserved/u);
+    });
+
+    test('inpainting fails closed when the installed native runtime lacks init-image or mask support', () => {
+        const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-inpaint-flags-'));
+        const modelPath = path.join(fixture, 'model.gguf'); fs.writeFileSync(modelPath, 'fixture-model');
+        try {
+            const runtime = new DiffusionRuntime({ baseDir: fixture, executable: process.execPath });
+            const config = normalizeDiffusionConfiguration(diffusionConfiguration(modelPath));
+            assert.throws(() => runtime._arguments(config, { prompt: 'x', width: 512, height: 512 }, { output: 'out.png', preview: 'preview.png', init: 'init.png', mask: 'mask.png' }, 1,
+                '--diffusion-model --prompt --negative-prompt --output --steps --cfg-scale --sampling-method --scheduler --preview --preview-path --preview-interval euler karras --init-img',
+                4, 6.5, 'euler'), /does not support the required --init-img \+ --mask inpainting contract/u);
+            runtime.shutdown();
+        } finally { fs.rmSync(fixture, { recursive: true, force: true }); }
+    });
+
+    test('Diffusion runtime honors per-request auto steps, cfg, and sampler only when the matching DM controls are Auto and otherwise enforces the fixed values', async (t) => {
+        const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-diffusion-steps-'));
+        t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+        const modelPath = path.join(fixture, 'model.gguf');
+        fs.writeFileSync(modelPath, 'fixture-model');
+        const executable = path.join(fixture, 'fake-sd-cli.js');
+        const script = `#!/usr/bin/env node
+const fs=require('node:fs');
+const png=Buffer.from('${ONE_PIXEL_PNG}','base64');
+const a=process.argv.slice(2);
+if(a.includes('--help')){console.log('stable-diffusion.cpp sd-cli --diffusion-model --prompt --negative-prompt --output --steps --cfg-scale --sampling-method --scheduler --preview --preview-path --preview-interval --auto-fit euler er_sde karras');process.exit(0);}
+const out=(...names)=>{for(const n of names){const i=a.indexOf(n);if(i>=0)return a[i+1];}return '';};
+fs.writeFileSync(out('--output','-o'), png);
+process.stdout.write('STEPFLAG=' + out('--steps') + '\\n');
+process.stdout.write('CFGFLAG=' + out('--cfg-scale') + '\\n');
+process.stdout.write('SAMPLERFLAG=' + out('--sampling-method') + '\\n');
+`;
+        fs.writeFileSync(executable, script, { mode: 0o755 });
+        fs.chmodSync(executable, 0o755);
+        const runtime = new DiffusionRuntime({ baseDir: fixture, executable });
+        t.after(() => runtime.shutdown());
+        let logs = []; runtime.log = (entry) => { logs.push(entry); };
+        const autoConfig = diffusionConfiguration(modelPath);
+        autoConfig.steps = 0; autoConfig.stepsAuto = true;
+        autoConfig.cfgScale = 0; autoConfig.cfgScaleAuto = true;
+        autoConfig.sampler = 'auto';
+        const autoResult = await runtime.generate(autoConfig, { prompt: 'flower', steps: 37, cfg_scale: 4.4, sampler: 'er_sde', width: 512, height: 512 });
+        assert.equal(autoResult.metadata.steps, 37);
+        assert.equal(autoResult.metadata.cfgScale, 4.4);
+        assert.equal(autoResult.metadata.sampler, 'er_sde');
+        await assert.rejects(
+            () => runtime.generate(autoConfig, { prompt: 'flower', width: 512, height: 512 }),
+            /Steps is Auto[\s\S]*must choose steps between 1 and 150/u,
+        );
+        await assert.rejects(
+            () => runtime.generate(Object.assign({}, autoConfig, { steps: 8, stepsAuto: false }), { prompt: 'flower', sampler: 'er_sde', width: 512, height: 512 }),
+            /CFG is Auto[\s\S]*must choose cfg_scale between 0\.1 and 30/u,
+        );
+        await assert.rejects(
+            () => runtime.generate(Object.assign({}, autoConfig, { steps: 8, stepsAuto: false, cfgScale: 5, cfgScaleAuto: false }), { prompt: 'flower', width: 512, height: 512 }),
+            /Sampler is Auto[\s\S]*must choose a sampler/u,
+        );
+        await assert.rejects(
+            () => runtime.generate(autoConfig, { prompt: 'flower', steps: 151, cfg_scale: 4.4, sampler: 'er_sde', width: 512, height: 512 }),
+            /steps must be an integer between 1 and 150/u,
+        );
+        await assert.rejects(
+            () => runtime.generate(autoConfig, { prompt: 'flower', steps: 12, cfg_scale: 31, sampler: 'er_sde', width: 512, height: 512 }),
+            /cfg_scale must be a number between 0\.1 and 30/u,
+        );
+        await assert.rejects(
+            () => runtime.generate(autoConfig, { prompt: 'flower', steps: 12, cfg_scale: 4.4, sampler: 'not-real', width: 512, height: 512 }),
+            /sampler must be one of:/u,
+        );
+        const fixedConfig = diffusionConfiguration(modelPath);
+        fixedConfig.steps = 12; fixedConfig.stepsAuto = false;
+        fixedConfig.cfgScale = 6.5; fixedConfig.cfgScaleAuto = false;
+        fixedConfig.sampler = 'euler';
+        const fixedResult = await runtime.generate(fixedConfig, { prompt: 'flower', steps: 48, cfg_scale: 2.2, sampler: 'er_sde', width: 512, height: 512 });
+        assert.equal(fixedResult.metadata.steps, 12);
+        assert.equal(fixedResult.metadata.cfgScale, 6.5);
+        assert.equal(fixedResult.metadata.sampler, 'euler');
+    });
+
+    test('Dynamic VRAM RAM parking requires free system RAM to be strictly greater than language-model weights + KV cache + diffusion pipeline memory', async (t) => {
+        const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-dynamic-vram-ram-plan-'));
+        t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+        const modelPath = path.join(fixture, 'model.gguf');
+        const diffusionPath = path.join(fixture, 'diffusion.gguf');
+        const textEncoderPath = path.join(fixture, 'text-encoder.gguf');
+        const vaePath = path.join(fixture, 'vae.safetensors');
+        fs.writeFileSync(modelPath, Buffer.alloc(4096));
+        fs.writeFileSync(diffusionPath, Buffer.alloc(100));
+        fs.writeFileSync(textEncoderPath, Buffer.alloc(200));
+        fs.writeFileSync(vaePath, Buffer.alloc(300));
+
+        const diffusionConfig = normalizeDiffusionConfiguration({
+            ...diffusionConfiguration(diffusionPath),
+            diffusionModel: {
+                ...diffusionConfiguration(diffusionPath).diffusionModel,
+                selectedPaths: { diffusionModelPath: diffusionPath, llmPath: textEncoderPath, vaePath },
+            },
+        });
+        const diffusionBytes = estimateDiffusionPipelineResidentBytes(diffusionConfig);
+        assert.equal(diffusionBytes, (512 * 1024 * 1024) + 600, 'diffusion RAM estimate must include the diffusion model, text encoder, and VAE');
+
+        const events = [];
+        function fakeRuntime() {
+            return {
+                loadedModelId: modelPath,
+                loadedProjectorPath: null,
+                processMode: 'legacy',
+                process: { pid: 1 },
+                server: { config: { backend: 'cuda', contextSize: 8192, cacheTypeK: 'f16', cacheTypeV: 'f16' }, requestedConfig: { backend: 'cuda', contextSize: 8192 } },
+                activeBackend: 'cuda',
+                activeStreams: new Map([['owner', { controller: new AbortController(), slotId: 0 }]]),
+                pendingStreams: new Map(),
+                slotCacheOwners: new Map([[0, 'owner']]),
+                cacheEpoch: 1,
+                inputTokenCountCache: {},
+                logLines: ['stderr: CUDA0 KV buffer size = 64.00 MiB'],
+                transport: { requestJson: async () => ({}) },
+                modelIdleUnload: { modelActivityStarted() {}, modelUnloaded() {}, refresh() {} },
+                resolveModelSelection() { return { local: { path: modelPath } }; },
+                enqueueLifecycle(operation) { return Promise.resolve().then(operation); },
+                async stopProcessForExternalWork() { events.push('gpu-unload'); this.process = null; },
+                log() {},
+            };
+        }
+
+        const sizingRuntime = fakeRuntime();
+        const language = estimateLanguageModelMemory(sizingRuntime);
+        assert.equal(language.reliable, true);
+        assert.equal(language.kvCacheBytes, 64 * 1024 * 1024);
+        assert.deepEqual(applyRamParkingLaunchArgs({ ramParkingMode: true }, ['--n-gpu-layers', '0'], { noMmap: true }), ['--n-gpu-layers', '0', '--no-mmap']);
+        assert.throws(() => applyRamParkingLaunchArgs({ ramParkingMode: true }, [], { noMmap: false }), /cannot guarantee RAM parking/u);
+        assert.deepEqual(applyRamParkingLaunchArgs({ ramParkingMode: false }, ['--model', modelPath], { noMmap: false }), ['--model', modelPath]);
+        assert.match(productionSources.get('backend/runtime/server-process.js'), /noMmap: text\.includes\('--no-mmap'\)/u);
+        const roomy = ramParkingPlan(sizingRuntime, { preferRam: true, diffusionResidentBytes: diffusionBytes, freeSystemRamBytes: Number.MAX_SAFE_INTEGER });
+        assert.equal(roomy.canPark, true);
+        assert.equal(roomy.requiredBytes, language.totalBytes + diffusionBytes);
+        const exactBoundary = ramParkingPlan(sizingRuntime, { preferRam: true, diffusionResidentBytes: diffusionBytes, freeSystemRamBytes: roomy.requiredBytes });
+        assert.equal(exactBoundary.canPark, false, 'free RAM equal to the requirement is not enough; policy is strictly greater-than');
+
+        const runtime = fakeRuntime();
+        const strategies = [];
+        const lease = await temporarilyReleaseVramForExternalWork(runtime, {
+            allowDuringActiveStream: true,
+            preferRam: true,
+            diffusionResidentBytes: diffusionBytes,
+            freeSystemRamBytes: roomy.requiredBytes + 1,
+            onStrategy(event) { strategies.push(event.strategy); },
+            async createRamParkingRuntime() {
+                events.push('ram-park-start');
+                return { async stop() { events.push('ram-park-stop'); } };
+            },
+        });
+        assert.equal(lease.parkedInRam, true);
+        assert.equal(lease.strategy, 'ram');
+        assert.deepEqual(strategies, ['ram']);
+        assert.deepEqual(events, ['ram-park-start', 'gpu-unload'], 'RAM copy must be established before the GPU-resident model is released');
+        await lease.release();
+        assert.deepEqual(events, ['ram-park-start', 'gpu-unload', 'ram-park-stop']);
+        assert.equal(runtime.externalWorkLease, null);
+
+        const fallbackRuntime = fakeRuntime();
+        let parkingAttempted = false;
+        const fallback = await temporarilyReleaseVramForExternalWork(fallbackRuntime, {
+            allowDuringActiveStream: true,
+            preferRam: true,
+            diffusionResidentBytes: diffusionBytes,
+            freeSystemRamBytes: roomy.requiredBytes,
+            async createRamParkingRuntime() { parkingAttempted = true; return null; },
+        });
+        assert.equal(parkingAttempted, false, 'insufficient RAM must use the existing unload path without attempting RAM parking');
+        assert.equal(fallback.parkedInRam, false);
+        assert.equal(fallback.strategy, 'unload');
+        await fallback.release();
+
+        const pressureRuntime = fakeRuntime();
+        const pressureEvents = [];
+        const pressureLease = await temporarilyReleaseVramForExternalWork(pressureRuntime, {
+            allowDuringActiveStream: true, preferRam: true, diffusionResidentBytes: diffusionBytes,
+            freeSystemRamBytes: roomy.requiredBytes + 1, getFreeSystemRamBytes: () => diffusionBytes,
+            async createRamParkingRuntime() {
+                pressureEvents.push('ram-park-start');
+                return { async stop() { pressureEvents.push('ram-park-stop'); } };
+            },
+        });
+        assert.equal(pressureLease.strategy, 'unload', 'if post-parking free RAM falls to the diffusion requirement, Darkstar must drop the RAM copy and retain the normal unload strategy');
+        assert.equal(pressureLease.parkedInRam, false);
+        assert.deepEqual(pressureEvents, ['ram-park-start', 'ram-park-stop']);
+        await pressureLease.release();
+    });
+
+    test('Diffusion Dynamic VRAM passes current free RAM and the complete pipeline estimate into adaptive language-model parking', async (t) => {
+        const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-dynamic-vram-adaptive-'));
+        t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+        const modelPath = path.join(fixture, 'diffusion.gguf');
+        const encoderPath = path.join(fixture, 'encoder.gguf');
+        const vaePath = path.join(fixture, 'vae.safetensors');
+        fs.writeFileSync(modelPath, Buffer.alloc(11));
+        fs.writeFileSync(encoderPath, Buffer.alloc(13));
+        fs.writeFileSync(vaePath, Buffer.alloc(17));
+        const config = normalizeDiffusionConfiguration({
+            ...diffusionConfiguration(modelPath),
+            diffusionModel: {
+                ...diffusionConfiguration(modelPath).diffusionModel,
+                selectedPaths: { diffusionModelPath: modelPath, llmPath: encoderPath, vaePath },
+            },
+        });
+        const expectedPipeline = (512 * 1024 * 1024) + 41;
+        const calls = [];
+        const lmRuntime = {
+            async temporarilyReleaseVramForExternalWork(options) {
+                calls.push(options);
+                options.onStrategy?.({ strategy: 'ram' });
+                return { unloaded: true, parkedInRam: true, strategy: 'ram', async restore() {} };
+            },
+        };
+        const progress = [];
+        const runtime = new DiffusionRuntime({ baseDir: fixture, languageModelRuntime: lmRuntime, freeSystemMemory: () => 987654321 });
+        t.after(() => runtime.shutdown());
+        const lease = await runtime._temporarilyUnloadLanguageModel(config, { dynamicVramEnabled: true }, (event) => progress.push(event.statusText));
+        assert.equal(lease.parkedInRam, true);
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0].freeSystemRamBytes, 987654321);
+        assert.equal(calls[0].diffusionResidentBytes, expectedPipeline);
+        assert.equal(calls[0].preferRam, true);
+        assert.ok(progress.includes('Moving language model to system RAM…'));
+        assert.ok(progress.includes('Language model parked in system RAM. Preparing diffusion…'));
+    });
+
+    test('Diffusion runtime temporarily unloads the language model during image generation when Dynamic VRAM is enabled and restores it afterward', async (t) => {
+        const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-dynamic-vram-'));
+        t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+        const modelPath = path.join(fixture, 'model.gguf');
+        fs.writeFileSync(modelPath, 'fixture-model');
+        const executable = path.join(fixture, 'fake-sd-cli.js');
+        const script = `#!/usr/bin/env node
+const fs=require('node:fs');
+const png=Buffer.from('${ONE_PIXEL_PNG}','base64');
+const a=process.argv.slice(2);
+if(a.includes('--help')){console.log('stable-diffusion.cpp sd-cli --diffusion-model --prompt --negative-prompt --output --steps --cfg-scale --sampling-method --scheduler --preview --preview-path --preview-interval euler karras');process.exit(0);}
+const val=(...names)=>{for(const n of names){const i=a.indexOf(n);if(i>=0)return a[i+1];}return '';};
+const preview=val('--preview-path'); const output=val('-o','--output');
+setTimeout(()=>fs.writeFileSync(preview,png),20);
+setTimeout(()=>{fs.writeFileSync(output,png);process.exit(0);},60);
+`;
+        fs.writeFileSync(executable, script, { mode: 0o755 });
+        fs.chmodSync(executable, 0o755);
+
+        const events = [];
+        const lmRuntime = {
+            async temporarilyUnloadForExternalWork() {
+                events.push('unload');
+                return {
+                    unloaded: true,
+                    async restore() { events.push('restore'); return { success: true, restored: true }; },
+                };
+            },
+        };
+        const progress = [];
+        const runtime = new DiffusionRuntime({ baseDir: fixture, executable, languageModelRuntime: lmRuntime });
+        t.after(() => runtime.shutdown());
+        const result = await runtime.generate(diffusionConfiguration(modelPath), { prompt: 'flower', width: 512, height: 512 }, {
+            dynamicVramEnabled: true,
+            onProgress(event) { progress.push(event.phase); },
+        });
+        assert.equal(result.__darkstarMultimodal, true);
+        assert.deepEqual(events, ['unload', 'restore']);
+        assert.ok(progress.includes('preparing-runtime'));
+        assert.ok(progress.includes('restoring-language-model'));
+    });
+
+    test('Dynamic VRAM legacy unload preserves the owning agent stream, invalidates KV residency, blocks races, and restores through the same lifecycle', async (t) => {
+        const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-dynamic-vram-llama-'));
+        t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+        const modelPath = path.join(fixture, 'fixture.gguf');
+        const header = Buffer.alloc(24);
+        header.write('GGUF', 0, 'ascii');
+        header.writeUInt32LE(3, 4);
+        header.writeBigUInt64LE(0n, 8);
+        header.writeBigUInt64LE(0n, 16);
+        fs.writeFileSync(modelPath, header);
+
+        const runtime = new LlamaRuntime({ baseDir: fixture, modelsDir: fixture, log() {} });
+        t.after(() => runtime.modelIdleUnload?.close?.());
+        const ownerController = new AbortController();
+        runtime.activeStreams.set('owner', { controller: ownerController, slotId: 0 });
+        runtime.processMode = 'legacy';
+        runtime.server = { config: { contextSize: 8192, parallel: 1 }, requestedConfig: { contextSize: 8192, parallel: 1 }, gpuSelection: null };
+        runtime.loadedModelId = modelPath;
+        runtime.loadedProjectorPath = null;
+        runtime.slotCacheOwners.set(0, 'old-owner');
+        const startingEpoch = runtime.cacheEpoch;
+        const events = [];
+        runtime.stopProcessForExternalWork = async () => { events.push('stop-preserving-owner'); runtime.process = null; };
+        runtime.loadLegacyModel = async (modelId, projectorPath, options) => {
+            events.push('reload');
+            assert.equal(options.allowDuringActiveStream, true);
+            assert.equal(modelId, modelPath);
+            assert.equal(projectorPath, null);
+            assert.equal(ownerController.signal.aborted, false, 'restoration must not abort the owning agent stream');
+            runtime.loadedModelId = modelId;
+            runtime.loadedProjectorPath = projectorPath;
+            return { modelId, status: 'loaded' };
+        };
+
+        const lease = await runtime.temporarilyUnloadForExternalWork({ allowDuringActiveStream: true });
+        assert.equal(lease.unloaded, true);
+        assert.equal(ownerController.signal.aborted, false, 'temporary unload must preserve the current generate_image controller');
+        assert.equal(runtime.activeStreams.has('owner'), true, 'the current stream reservation must survive model evacuation');
+        assert.equal(runtime.loadedModelId, null);
+        assert.equal(runtime.cacheEpoch, startingEpoch + 1, 'unload must invalidate the physical KV epoch');
+        assert.equal(runtime.slotCacheOwners.size, 0, 'unload must clear slot residency ownership');
+        await assert.rejects(runtime.streamChat('racing-tab', {}, {}), (error) => error?.code === 'MODEL_TEMPORARILY_UNAVAILABLE');
+        assert.throws(() => runtime.loadModel({ modelId: modelPath }), (error) => error?.code === 'MODEL_TEMPORARILY_UNAVAILABLE');
+
+        const restored = await lease.restore();
+        assert.equal(restored.restored, true);
+        assert.equal(runtime.loadedModelId, modelPath);
+        assert.equal(runtime.externalWorkLease, null);
+        assert.equal(ownerController.signal.aborted, false);
+        assert.deepEqual(events, ['stop-preserving-owner', 'reload']);
+    });
+
+    test('Dynamic VRAM refuses to evict the language model when another tab is active or queued', async (t) => {
+        const fixture = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-dynamic-vram-race-'));
+        t.after(() => fs.rmSync(fixture, { recursive: true, force: true }));
+        const runtime = new LlamaRuntime({ baseDir: fixture, modelsDir: fixture, log() {} });
+        t.after(() => runtime.modelIdleUnload?.close?.());
+        runtime.activeStreams.set('owner', { controller: new AbortController(), slotId: 0 });
+        runtime.activeStreams.set('other', { controller: new AbortController(), slotId: 1 });
+        assert.throws(
+            () => runtime.temporarilyUnloadForExternalWork({ allowDuringActiveStream: true }),
+            /another tab generation is active or queued/u,
+        );
+        assert.equal(runtime.externalWorkLease, null);
+    });
+
+    test('Generate Image is exposed only when Orchestrator supplies DM configuration and preview frames are not persisted as durable timeline payloads', () => {
+        const toolService = productionSources.get('backend/agent/tool-service.js');
+        const sampler = productionSources.get('backend/renderer/nodes/builtin/sampler.js');
+        const dmSamplerSource = fs.readFileSync(path.join(ROOT, 'custom_nodes', 'dm-sampler', 'renderer.js'), 'utf8');
+        const nodeServices = productionSources.get('backend/renderer/nodes/services.js');
+        const chat = productionSources.get('backend/renderer/chat.js');
+        const preview = productionSources.get('backend/renderer/image-generation-preview.js');
+        const styles = fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'styles.css'), 'utf8');
+        assert.match(toolService, /diffusion = normalizeDiffusionConfiguration\(toolConfiguration\.diffusion\)/u);
+        assert.match(toolService, /diffusionEnabled = Boolean\(diffusion\)/u);
+        assert.match(toolService, /dynamicVramEnabled: toolConfiguration\.dynamicVramEnabled === true/u);
+        assert.match(toolService, /dynamicVramEnabled: runtime\.dynamicVramEnabled === true/u);
+        assert.match(toolService, /negativePromptEnabled = toolConfiguration\.negativePromptEnabled === true/u);
+        assert.match(toolService, /negativePromptEnabled: runtime\.negativePromptEnabled === true/u);
+        assert.match(toolService, /imageCountOverride = normalizeGenerateImageCountOverride\(toolConfiguration\.imageCountOverride\)/u);
+        assert.match(toolService, /imageCountOverride: normalizeGenerateImageCountOverride\(runtime\.imageCountOverride\)/u);
+        assert.match(toolService, /name === 'generate_image' && diffusionEnabled !== true/u);
+        const agentLoop = productionSources.get('backend/runtime/agent-loop.js');
+        const diffusionRuntimeSource = productionSources.get('backend/runtime/diffusion-runtime.js');
+        assert.match(agentLoop, /progressPayload\?\.finalImage === true[\s\S]*progressPayload\.imageIndex[\s\S]*type: 'context-image'/u);
+        assert.match(diffusionRuntimeSource, /help\.includes\('--auto-fit'\)[\s\S]*args\.push\('--auto-fit'\)/u);
+        assert.match(diffusionRuntimeSource, /--list-devices/u);
+        assert.match(diffusionRuntimeSource, /args\.push\('--backend', computeTarget\.deviceId\)/u);
+        assert.match(dmSamplerSource, /controls\.dropdown\('Compute Device'/u);
+        assert.match(sampler, /dynamicVramEnabled: p\.dynamicVramEnabled === true/u);
+        assert.match(sampler, /negativePromptEnabled: p\.negativePromptEnabled === true/u);
+        assert.match(sampler, /imageCountOverride: controlPolicy\.normalizeImageCountOverride\(p\.imageCountOverride\)/u);
+        assert.match(dmSamplerSource, /var MIN_STEP_COUNT = 0;[\s\S]*var MAX_STEP_COUNT = 150;/u);
+        assert.match(dmSamplerSource, /function stepDisplayValue\(value\)[\s\S]*steps === 0 \? 'Auto' : String\(steps\)/u);
+        assert.match(dmSamplerSource, /getParameterDisplayValue:[\s\S]*stepDisplayValue/u);
+        assert.match(dmSamplerSource, /controls\.textInput\('Generation Prefix'/u);
+        assert.match(dmSamplerSource, /DEFAULT_GENERATION_PREFIX = 'masterpiece, best quality'/u);
+        const control = productionSources.get('backend/renderer/nodes/builtin/control.js');
+        assert.match(control, /controls\.toggle\('Dynamic VRAM'/u);
+        assert.match(control, /controls\.toggle\('Negative Prompt'[\s\S]*negativePromptEnabled/u);
+        assert.match(control, /controls\.toggle\('Negative Prompt'[\s\S]{0,320}description:\s*'Allow Generate Image to use an explicit negative prompt for unwanted visual elements\.'/u,
+            'Negative Prompt should carry the same concise explanatory treatment as the neighboring Control options');
+        assert.match(control, /MAX_IMAGE_COUNT_OVERRIDE = 50/u);
+        assert.match(sampler, /controls\.slider\('Image count \(0 = Model\)'[\s\S]*controlPolicy\.minImageCountOverride[\s\S]*controlPolicy\.maxImageCountOverride/u);
+        assert.match(sampler, /diffusion: inputs\.dmSampler[\s\S]*JSON\.parse\(JSON\.stringify\(inputs\.dmSampler\)\)/u);
+        assert.match(nodeServices, /if \(terminal\) pair\.toolCall\.imageGeneration = null/u);
+        assert.match(nodeServices, /Object\.assign\(\{\}, pair\.toolCall\.imageGeneration \|\| \{\}, payload\.imageGeneration\)/u);
+        assert.match(chat, /Darkstar\.imageGenerationPreview\.normalize\(segment\.imageGeneration\)/u);
+        assert.match(preview, /imageData\.safeDataUrl/u);
+        assert.match(preview, /function stageHtml\(\)/u);
+        assert.match(preview, /function render\(block, segment, isActive, setText\)/u);
+        assert.match(preview, /finalDelivered = Boolean\(state && state\.finalImage && state\.mimeType && state\.base64\)/u);
+        assert.match(preview, /isActive\(segment\.state, segment\.status\) && !finalDelivered/u, 'a delivered final PNG must retire the animated preview immediately');
+        assert.match(chat, /function imageGenerationRestoreActive\(segment\)/u);
+        assert.match(chat, /Image ready · restoring language model/u);
+        assert.match(chat, /function createImageBlock\(\)[\s\S]*?chatTraceExpansionEnabled \? 'true' : 'false'/u, 'image trace blocks must be collapsed by default with the other traces');
+        assert.match(styles, /\.image-generation-grid[\s\S]*darkstarImageGridDrift/u);
+        assert.match(styles, /prefers-reduced-motion: reduce/u);
+    });
+
+    test('Generate Image context is attached only for an active multimodal projector', async () => {
+        const { ToolService } = productionRuntime.requireModule('backend/agent/tool-service.js');
+        const service = new ToolService({ baseDir: ROOT });
+        const definition = {
+            type: 'function',
+            function: {
+                name: 'generate_image',
+                description: 'fixture',
+                parameters: { type: 'object', properties: {}, additionalProperties: false },
+            },
+        };
+        const handler = {
+            definition,
+            execute: async () => ({
+                __darkstarMultimodal: true,
+                __darkstarDisplayWithoutVision: true,
+                text: 'Generated image.',
+                images: [{ mimeType: 'image/png', name: 'fixture.png', base64: ONE_PIXEL_PNG }],
+            }),
+        };
+        const runtime = {
+            handlers: new Map([['generate_image', handler]]),
+            definitions: [definition],
+            executionDisabled: false,
+            workspaceRoot: null,
+            dynamicVramEnabled: false,
+            diffusion: null,
+            workspaceId: 'default', projectId: 1, tabId: 1, browserId: '1',
+        };
+        const call = { id: 'call-image', function: { name: 'generate_image', arguments: '{}' } };
+
+        const multimodal = await service.execute(runtime, call, { visionEnabled: true });
+        assert.equal(multimodal.contextMessages.length, 1);
+        assert.equal(multimodal.contextMessages[0].role, 'user');
+        assert.equal(multimodal.contextMessages[0].content[1].type, 'image_url');
+        assert.match(multimodal.contextMessages[0].content[1].image_url.url, /^data:image\/png;base64,/u);
+
+        const textOnly = await service.execute(runtime, call, { visionEnabled: false });
+        assert.deepEqual(textOnly.contextMessages, []);
+        await service.shutdown();
+    });
+
+    test('agent vision capability follows the active Orchestrator projector descriptor across runtime lifecycle transitions', () => {
+        const { agentVisionEnabled } = productionRuntime.requireModule('backend/runtime/agent-loop.js');
+        assert.equal(agentVisionEnabled({ loadedProjectorPath: 'C:/models/mmproj.gguf' }, {}), true);
+        assert.equal(agentVisionEnabled({ loadedProjectorPath: null }, { vision: { enabled: true, projectorPath: 'C:/models/mmproj.gguf' } }), true,
+            'the active graph projector descriptor must preserve generated-image context eligibility even if runtime residency is transitioning');
+        assert.equal(agentVisionEnabled({ loadedProjectorPath: null }, { vision: { enabled: false, projectorPath: 'C:/models/mmproj.gguf' } }), false);
+        assert.equal(agentVisionEnabled({ loadedProjectorPath: null }, { vision: { enabled: true, projectorPath: '' } }), false);
+    });
+
+}
 
 // Native release licensing must fail closed: every shipped runtime binary has an
 // explicit component classification and the exact required notices are present.
@@ -22676,6 +26428,15 @@ Module._load = function load(request, parent, isMain) {
         }
     }
 
+    function writeManagedDiffusionEngines(fixture) {
+        for (const backend of ['cpu', 'vulkan']) {
+            writeFixture(fixture, `backend/bin/diffusion/${backend}/sd-cli.exe`, `fake-${backend}-sd-cli`);
+            writeFixture(fixture, `backend/bin/diffusion/${backend}/stable-diffusion.dll`, `fake-${backend}-stable-diffusion`);
+            writeFixture(fixture, `backend/bin/diffusion/${backend}/ggml-cpu-fixture.dll`, `fake-${backend}-ggml-cpu`);
+        }
+        writeFixture(fixture, 'backend/bin/diffusion/vulkan/ggml-vulkan.dll', 'fake-vulkan');
+    }
+
     test('runtime licensing audit classifies llama.cpp/CUDA and rejects missing notices or unknown binaries', () => {
         const { fixture } = runtimeLicenseFixture();
         try {
@@ -22702,6 +26463,23 @@ Module._load = function load(request, parent, isMain) {
 
             writeFixture(fixture, 'backend/bin/mystery-vendor.dll', 'mystery');
             assert.throws(() => auditRuntimeLicenses({ root: fixture, requireLlama: true }), /Unclassified native binary/u);
+        } finally {
+            fs.rmSync(fixture, { recursive: true, force: true });
+        }
+    });
+
+    test('runtime licensing audit requires the pinned stable-diffusion.cpp CPU/Vulkan engines and both MIT notices for offline releases', () => {
+        const { fixture } = runtimeLicenseFixture();
+        try {
+            writeManagedDiffusionEngines(fixture);
+            assert.throws(() => auditRuntimeLicenses({ root: fixture, requireDiffusion: true }), /stable-diffusion\.cpp-LICENSE/u);
+            writeFixture(fixture, 'backend/bin/licenses/stable-diffusion.cpp-LICENSE', 'Permission is hereby granted, free of charge. THE SOFTWARE IS PROVIDED AS IS. '.repeat(2));
+            assert.throws(() => auditRuntimeLicenses({ root: fixture, requireDiffusion: true }), /stable-diffusion\.cpp-ggml-LICENSE/u);
+            writeFixture(fixture, 'backend/bin/licenses/stable-diffusion.cpp-ggml-LICENSE', 'Permission is hereby granted, free of charge. THE SOFTWARE IS PROVIDED AS IS. '.repeat(2));
+            const manifest = auditRuntimeLicenses({ root: fixture, requireDiffusion: true });
+            assert.deepEqual(manifest.runtime.components.map((entry) => entry.id), ['stable-diffusion.cpp']);
+            fs.rmSync(path.join(fixture, 'backend', 'bin', 'diffusion', 'vulkan', 'sd-cli.exe'));
+            assert.throws(() => auditRuntimeLicenses({ root: fixture, requireDiffusion: true }), /diffusion\/vulkan\/sd-cli\.exe/u);
         } finally {
             fs.rmSync(fixture, { recursive: true, force: true });
         }
@@ -22736,7 +26514,8 @@ Module._load = function load(request, parent, isMain) {
     test('offline build runs strict runtime licensing audit and emits legal manifest beside the executable', () => {
         const build = productionSources.get('backend/scripts/build-offline.js');
         const packageJson = JSON.parse(fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'package.json'), 'utf8'));
-        assert.match(build, /auditRuntimeLicenses\(\{ root, requireLlama: true \}\)/u);
+        assert.match(build, /auditRuntimeLicenses\(\{ root, requireLlama: true, requireDiffusion: true \}\)/u);
+        assert.match(build, /diffusionEngines = \['cpu', 'vulkan'\]/u);
         assert.match(build, /THIRD_PARTY_RUNTIME_MANIFEST\.json/u);
         assert.match(build, /licenses['"]?, ['"]runtime/u, 'release root must mirror runtime notices for discoverability');
         assert.equal(packageJson.scripts['runtime-license-audit'], 'node ../Darkstar_Core.js --darkstar-command=runtime-license-audit');
@@ -22749,6 +26528,504 @@ Module._load = function load(request, parent, isMain) {
         assert.ok(packageJson.scripts.verify.includes('npm run runtime-license-audit'));
         assert.ok(packageJson.build.files.includes('backend/'));
         assert.ok(fs.existsSync(path.join(ROOT, 'backend', 'runtime-component-policy.json')));
+    });
+}
+
+
+// Agent-capability routing regression: the Loader's combined Tools + Skills surface
+// must not let unrelated filesystem tools substitute for direct image generation.
+{
+    const test = require('node:test');
+    const assert = require('node:assert/strict');
+    const { agentInputBody, directImageGenerationIntent, toolCallFingerprint } = productionRuntime.requireModule('backend/runtime/agent-loop.js');
+
+    const definition = (name) => ({ type: 'function', function: { name, description: `${name} test tool`, parameters: { type: 'object', properties: {}, additionalProperties: false } } });
+
+    test('direct image requests project the first model round to generate_image instead of unrelated union tools', async () => {
+        const generate = definition('generate_image');
+        const remove = definition('delete');
+        const createFolder = definition('create_folder');
+        const handlers = new Map([['generate_image', {}], ['delete', {}], ['create_folder', {}]]);
+        const runtime = {
+            loadedProjectorPath: '',
+            normalizeChatRequest(request) { return { model: 'model.gguf', messages: structuredClone(request.messages), stream: true }; },
+            toolService: {
+                hasApplicationInterfaceTargets() { return false; },
+                async buildRuntime() { return { definitions: [createFolder, remove, generate], handlers, toolChoice: 'auto', catalog: '', skills: [] }; },
+            },
+        };
+        const body = await agentInputBody(runtime, { messages: [{ role: 'user', content: 'make an image of a dog' }], tools: { providers: [] }, skills: { skills: [] } });
+        assert.deepEqual(body.tools.map((entry) => entry.function.name), ['generate_image']);
+        assert.equal(body.tool_choice, 'required');
+    });
+
+    test('direct image requests cannot fall through to filesystem tools when image generation is unavailable', async () => {
+        const remove = definition('delete');
+        const createFolder = definition('create_folder');
+        const runtime = {
+            loadedProjectorPath: '',
+            normalizeChatRequest(request) { return { model: 'model.gguf', messages: structuredClone(request.messages), stream: true }; },
+            toolService: {
+                hasApplicationInterfaceTargets() { return false; },
+                async buildRuntime() { return { definitions: [createFolder, remove], handlers: new Map([['delete', {}], ['create_folder', {}]]), toolChoice: 'auto', catalog: '', skills: [] }; },
+            },
+        };
+        const body = await agentInputBody(runtime, { messages: [{ role: 'user', content: 'create a picture of a dog' }], tools: { providers: [] }, skills: { skills: [] } });
+        assert.equal(Object.hasOwn(body, 'tools'), false);
+        assert.match(body.messages[0].content, /generate_image is not available/u);
+        assert.match(body.messages[0].content, /Do not substitute filesystem/u);
+    });
+
+    test('image intent detection remains narrow and repeated tool-call fingerprints normalize JSON whitespace', () => {
+        assert.equal(directImageGenerationIntent([{ role: 'user', content: 'generate an image of a dog' }]), true);
+        assert.equal(directImageGenerationIntent([{ role: 'user', content: 'explain how image generation works' }]), false);
+        assert.equal(toolCallFingerprint({ function: { name: 'delete', arguments: '{"path":"images"}' } }), toolCallFingerprint({ function: { name: 'delete', arguments: '{ "path": "images" }' } }));
+        const agentLoop = productionSources.get('backend/runtime/agent-loop.js');
+        assert.match(agentLoop, /REPEATED_FAILED_TOOL_CALL/u);
+        assert.match(agentLoop, /exact same tool name and arguments have already failed twice/u);
+    });
+
+    test('identical failed tool calls are circuit-broken instead of looping indefinitely', async () => {
+        const { streamAgent } = productionRuntime.requireModule('backend/runtime/agent-loop.js');
+        const remove = definition('delete');
+        let completions = 0;
+        const runtime = {
+            loadedProjectorPath: '',
+            normalizeChatRequest(request) { return { model: 'model.gguf', messages: structuredClone(request.messages), stream: true }; },
+            async performChatCompletion() {
+                completions += 1;
+                return { text: '', reasoning: '', usage: null, finishReason: 'tool_calls', contextUsage: null, toolCalls: [{ id: `call-${completions}`, type: 'function', function: { name: 'delete', arguments: '{"path":"missing"}' } }] };
+            },
+            toolService: {
+                hasApplicationInterfaceTargets() { return false; },
+                async buildRuntime() { return { definitions: [remove], handlers: new Map([['delete', {}]]), toolChoice: 'auto', catalog: '', skills: [], maxRounds: null }; },
+                describeCall(call) { return { name: call.function.name, rawArguments: call.function.arguments, arguments: { path: 'missing' }, displayCommand: 'delete({"path":"missing"})' }; },
+                async execute() { const error = new Error('Path does not exist: missing'); error.code = 'TOOL_EXECUTION_FAILED'; throw error; },
+            },
+        };
+        await assert.rejects(() => streamAgent(runtime, { messages: [{ role: 'user', content: 'remove the missing test path' }], tools: { providers: [{}] }, skills: { skills: [] } }, new AbortController()), (error) => error && error.code === 'REPEATED_FAILED_TOOL_CALL');
+        assert.equal(completions, 3);
+    });
+}
+
+// Image-generation chat presentation regression: keep the transient diffusion
+// preview compact and never expose Darkstar's temporary generated filename.
+{
+    const test = require('node:test');
+    const assert = require('node:assert/strict');
+    const fs = require('node:fs');
+    const path = require('node:path');
+
+    test('live diffusion preview stays compact and generated temp filenames stay hidden', () => {
+        const css = fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'styles.css'), 'utf8');
+        const chat = productionSources.get('backend/renderer/chat.js');
+        assert.match(css, /\.image-generation-stage\s*\{[\s\S]*?width:\s*min\(510px,\s*100%\)/u);
+        assert.match(css, /\.image-generation-frame\s*\{[\s\S]*?min-height:\s*150px;[\s\S]*?max-height:\s*min\(42vh,\s*420px\)/u);
+        assert.doesNotMatch(css, /context-image-meta/u, 'image patches must not retain dead filename-caption presentation rules');
+        assert.match(css, /\.context-image-block \.context-image-frame\.generated-image-frame\s*\{\s*border-radius:\s*30px;\s*\}/u);
+        assert.match(chat, /classList\.toggle\('generated-image-frame',[\s\S]*?generated-[\s\S]*?webp/u);
+        assert.doesNotMatch(chat, /context-image-meta|metaText/u,
+            'tool-produced image filenames must not be rendered beneath final or captured images');
+    });
+}
+
+// Show Image presentation regression: context-image patches remain diagnostic,
+// while the model can explicitly promote a prior tool image into the visible answer.
+{
+    const test = require('node:test');
+    const assert = require('node:assert/strict');
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const vm = require('node:vm');
+    const ONE_PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+
+    test('Show Image is a bundled presentation-only tool with no filesystem capability', () => {
+        const source = fs.readFileSync(path.join(ROOT, 'agent_assets', 'tools', 'show_image.py'), 'utf8');
+        assert.match(source, /"name": "show_image"/u);
+        assert.match(source, /"__darkstarAction": "show_image"/u);
+        assert.match(source, /filesystem="none"/u);
+        assert.match(source, /permission=\{"risk": "read"\}/u);
+        assert.match(source, /exact image_id returned by a previous image-producing tool call/iu);
+        assert.doesNotMatch(source, /args\.get\(["']path["']\)|base64|read_bytes|subprocess|os\.system/iu, 'Show Image must not become a second filesystem/image-loading surface');
+    });
+
+    test('image-producing tools expose stable image_id values and Show Image promotes only an exact current-interaction id', async () => {
+        const { ToolService } = productionRuntime.requireModule('backend/agent/tool-service.js');
+        const service = new ToolService({ baseDir: ROOT });
+        const generateDefinition = { type: 'function', function: { name: 'generate_image', parameters: { type: 'object', properties: {}, additionalProperties: false } } };
+        const showDefinition = { type: 'function', function: { name: 'show_image', parameters: { type: 'object', properties: { image_id: { type: 'string' } }, required: ['image_id'], additionalProperties: false }, 'x-darkstar-filesystem': 'none', 'x-darkstar-permission': { risk: 'read' } } };
+        const runtime = {
+            handlers: new Map([
+                ['generate_image', { definition: generateDefinition, execute: async () => ({ __darkstarMultimodal: true, __darkstarDisplayWithoutVision: true, text: 'Generated.', images: [{ mimeType: 'image/png', name: 'internal-temp-name.png', base64: ONE_PIXEL_PNG }] }) }],
+                ['show_image', { definition: showDefinition, execute: async (args) => ({ __darkstarAction: 'show_image', image_id: args.image_id }) }],
+            ]),
+            definitions: [generateDefinition, showDefinition], executionDisabled: false, workspaceRoot: null, dynamicVramEnabled: false,
+            diffusion: null, workspaceId: 'default', projectId: 1, tabId: 1, browserId: '1',
+        };
+        const imageRegistry = new Map();
+        const generated = await service.execute(runtime, { id: 'generated-call', function: { name: 'generate_image', arguments: '{}' } }, { visionEnabled: false, imageRegistry, showImageAvailable: true });
+        const modelResult = JSON.parse(generated.result);
+        assert.equal(modelResult.images[0].image_id, 'task:generated-call:0');
+        assert.equal(Object.hasOwn(modelResult.images[0], 'name'), false, 'model-facing presentation references do not need temporary filenames');
+        assert.match(modelResult.text, /call show_image with its image_id/u);
+        assert.equal(imageRegistry.size, 1);
+
+        const shown = await service.execute(runtime, { id: 'show-call', function: { name: 'show_image', arguments: JSON.stringify({ image_id: modelResult.images[0].image_id }) } }, { visionEnabled: false, imageRegistry, showImageAvailable: true });
+        assert.deepEqual(shown.presentedImageIds, ['task:generated-call:0']);
+        assert.deepEqual(shown.contextMessages, [], 'presentation must not create another multimodal/context-image patch');
+        assert.doesNotMatch(shown.result, /base64|internal-temp-name/u, 'Show Image result must not echo image bytes or filenames back into model text');
+        await assert.rejects(() => service.execute(runtime, { id: 'bad-show', function: { name: 'show_image', arguments: JSON.stringify({ image_id: 'task:other-call:0' }) } }, { visionEnabled: false, imageRegistry, showImageAvailable: true }), /Unknown image_id/u);
+        await service.shutdown();
+    });
+
+    test('renderer resolves presented image ids from the durable image timeline without duplicating image bytes in message state', () => {
+        const source = productionSources.get('backend/renderer/chat.js');
+        const start = source.indexOf('function presentedImageRecords(message)');
+        const end = source.indexOf('function syncPresentedMessageImages', start);
+        const context = { Map, Array, String, Object };
+        context.globalThis = context; vm.createContext(context);
+        vm.runInContext(source.slice(start, end), context, { filename: 'presented-image-records.js' });
+        const message = {
+            presentedImageIds: ['task:call-b:0', 'task:call-a:0'],
+            agentTimeline: [
+                { type: 'image', imageSource: { id: 'task:call-a:0' }, base64: 'AAA', mimeType: 'image/png', name: 'secret-a.png' },
+                { type: 'image', imageSource: { id: 'task:call-b:0' }, base64: 'BBB', mimeType: 'image/webp', name: 'secret-b.webp' },
+            ],
+        };
+        const records = context.presentedImageRecords(message);
+        assert.deepEqual(Array.from(records, (record) => [record.base64, record.mimeType, record.name]), [['BBB', 'image/webp', ''], ['AAA', 'image/png', '']]);
+        assert.equal(Object.hasOwn(message, 'images'), false, 'clean presentation should reference the already-durable timeline image rather than duplicate base64 in message.images');
+    });
+
+
+    test('renderer transport preserves Show Image presentation through generation completion', async () => {
+        const source = productionSources.get('backend/renderer/nodes/services.js');
+        const listeners = {};
+        const bridge = {
+            onChatChunk(callback) { listeners.chunk = callback; return () => {}; },
+            onChatComplete(callback) { listeners.complete = callback; return () => {}; },
+            onChatError(callback) { listeners.error = callback; return () => {}; },
+            onChatToolEvent(callback) { listeners.tool = callback; return () => {}; },
+            startChat: async () => ({ success: true }),
+            cancelChat: async () => ({ success: true }),
+        };
+        const context = {
+            console, Promise, Map, Set, Array, String, Object, Number, Math, Date, Error,
+            setTimeout, clearTimeout, structuredClone,
+            darkstarStopDiagnosticDetails: () => ({}),
+            window: { darkstar: { nodes: bridge } },
+        };
+        context.globalThis = context;
+        vm.createContext(context);
+        vm.runInContext(source, context, { filename: 'renderer-node-services.js' });
+
+        const resultPromise = context.Darkstar.chatRuntime.streamChat({}, { requestId: 'show-image-completion' });
+        listeners.tool({
+            requestId: 'show-image-completion', type: 'context-image', toolCallId: 'generated-call',
+            image: {
+                id: 'task:generated-call:0', source: { kind: 'agent-tool-image', id: 'task:generated-call:0' },
+                mimeType: 'image/png', name: 'internal-temp-name.png', base64: ONE_PIXEL_PNG,
+            },
+        });
+        listeners.tool({ requestId: 'show-image-completion', type: 'response-image', imageId: 'task:generated-call:0' });
+        listeners.complete({ requestId: 'show-image-completion', text: 'Done.', finishReason: 'stop', toolMessages: [] });
+
+        const result = await resultPromise;
+        assert.deepEqual(Array.from(result.presentedImageIds), ['task:generated-call:0'], 'the response-image event must survive the transport completion boundary');
+        assert.equal(result.agentTimeline.filter((segment) => segment.type === 'image').length, 1, 'the presented image must still resolve to its durable timeline bytes');
+    });
+
+
+    test('Orchestrator and graph output preserve Show Image presentation ids to chat finalization', async () => {
+        const samplerSource = productionSources.get('backend/renderer/nodes/builtin/sampler.js');
+        let samplerDefinition = null;
+        const samplerContext = {
+            console, Promise, Map, Set, Array, String, Object, Number, Math, Date, Error, JSON, RegExp,
+            structuredClone,
+            Darkstar: {
+                chatRuntime: {
+                    async streamChat() {
+                        return {
+                            text: 'Done.', reasoning: '', usage: null, contextUsage: null, finishReason: 'stop',
+                            working: [], toolMessages: [], agentTimeline: [], presentedImageIds: ['task:generated-call:0'],
+                            agentRounds: 2, toolRounds: 2
+                        };
+                    }
+                },
+                nodes: {
+                    builtinCommon: { baseNode(_definition, nodeId, x, y, extra) { return Object.assign({ id: nodeId, x, y }, extra); } },
+                    controls: { group() { return ''; }, slider() { return ''; }, status() { return ''; } },
+                    PORT_TYPES: { SAMPLER_PARAMETERS: 'samplerParameters', DM_SAMPLER: 'dmSampler', SKILLS: 'skills', TOOLS: 'tools' },
+                    contextBuilder: {
+                        normalizeParams() { return { systemPrompt: '', includeHistory: true }; },
+                        buildMessages() { return { messages: [], imageEdit: null }; },
+                        buildControls() { return ''; }
+                    },
+                    orchestrationControl: {
+                        normalizeParams() { return { nameConversations: false, autoCompact: false, modelIdleUnloadEnabled: false, dynamicVramEnabled: false, negativePromptEnabled: false }; },
+                        runtimeControl() { return { nameConversations: false, autoCompact: false }; },
+                        normalizeImageCountOverride(value) { return Number(value) || 0; },
+                        minImageCountOverride: 0, maxImageCountOverride: 4, fixedIdleUnloadSeconds: 300,
+                        buildControls() { return ''; }, applyIdleUnloadPolicy() {},
+                    },
+                    registerNode(definition) { samplerDefinition = definition; }
+                }
+            }
+        };
+        samplerContext.globalThis = samplerContext;
+        vm.createContext(samplerContext);
+        vm.runInContext(samplerSource, samplerContext, { filename: 'sampler-show-image.js' });
+        assert.ok(samplerDefinition && typeof samplerDefinition.execute === 'function');
+        const samplerOutput = await samplerDefinition.execute({
+            samplerParameters: {
+                model: { id: 'model.gguf', multimodal: false, projectorPath: null },
+                reasoning: 'auto', seed: 0, temperature: 0.7, topK: 40, topP: 0.95, minP: 0.05,
+                typicalP: 1, repeatPenalty: 1.1, repeatLastN: 64, presencePenalty: 0, frequencyPenalty: 0,
+                dryMultiplier: 0, dryBase: 1.75, dryAllowedLength: 2, dryPenaltyLastN: -1,
+                mirostat: 0, mirostatTau: 5, mirostatEta: 0.1, samplers: [], stop: '', cachePrompt: true, ignoreEos: false
+            },
+            tools: { providers: [], maxRounds: 'auto', toolChoice: 'auto' }, skills: { skills: [] }
+        }, { params: {}, status: 'idle', statusMessage: '' }, {
+            tabId: 1, projectId: 1, workspaceId: 'default', uipScopeId: 'project-1', kvCacheReuseRequired: false
+        });
+        assert.deepEqual(Array.from(samplerOutput.presentedImageIds), ['task:generated-call:0'],
+            'the output node must not discard a successful Show Image presentation request');
+
+        const graphSource = productionSources.get('backend/renderer/graph-execution.js');
+        const graphStart = graphSource.indexOf('function adaptPrimaryOutput');
+        const graphEnd = graphSource.indexOf('function continuationMessageLocation', graphStart);
+        let graphNode = null;
+        let graphDefinition = null;
+        const graphContext = {
+            Array, String, Object, structuredClone,
+            graphCore() { return { nodeById() { return graphNode; } }; },
+            graphNodeById() { return graphNode; },
+            getNodeDef() { return graphDefinition; }
+        };
+        graphContext.globalThis = graphContext;
+        vm.createContext(graphContext);
+        vm.runInContext(graphSource.slice(graphStart, graphEnd), graphContext, { filename: 'graph-output-show-image.js' });
+        const adapted = graphContext.adaptPrimaryOutput('sampler', samplerOutput, []);
+        assert.deepEqual(Array.from(adapted.presentedImageIds), ['task:generated-call:0'],
+            'the graph result adapter must carry presentation ids into send-message finalization');
+
+        graphNode = { type: 'custom-output' };
+        graphDefinition = { resultAdapter(output) { return { text: output.text }; } };
+        const customAdapted = graphContext.adaptPrimaryOutput('custom', samplerOutput, [graphNode]);
+        assert.deepEqual(Array.from(customAdapted.presentedImageIds), ['task:generated-call:0'],
+            'custom output adapters must not accidentally erase model-neutral image presentation state');
+    });
+
+    test('Show Image renders the referenced image as the final content of the assistant answer', () => {
+        const source = productionSources.get('backend/renderer/chat.js');
+        const start = source.indexOf('function presentedImageRecords(message)');
+        const end = source.indexOf('function addMessage', start);
+
+        class FakeElement {
+            constructor(tag) { this.tagName = String(tag || '').toUpperCase(); this.children = []; this.dataset = {}; this.className = ''; this.parentNode = null; }
+            appendChild(child) { child.parentNode = this; this.children.push(child); return child; }
+            remove() { if (!this.parentNode) return; const index = this.parentNode.children.indexOf(this); if (index >= 0) this.parentNode.children.splice(index, 1); this.parentNode = null; }
+            setAttribute(name, value) { this[name] = String(value); }
+            querySelectorAll(selector) {
+                if (selector !== '.presented-response-image') return [];
+                return this.children.filter((child) => String(child.className || '').split(/\s+/u).includes('presented-response-image'));
+            }
+        }
+        const answer = new FakeElement('div');
+        const textNode = new FakeElement('p'); textNode.className = 'answer-text'; answer.appendChild(textNode);
+        const messageElement = { querySelector(selector) { return selector === '.message-answer' ? answer : null; } };
+        const context = {
+            Map, Array, String, Object,
+            document: { createElement(tag) { return new FakeElement(tag); } },
+            Darkstar: { imageData: { safeDataUrl(record) { return record && record.base64 ? 'data:' + record.mimeType + ';base64,' + record.base64 : ''; } } }
+        };
+        context.globalThis = context;
+        vm.createContext(context);
+        vm.runInContext(source.slice(start, end), context, { filename: 'show-image-dom.js' });
+        const message = {
+            presentedImageIds: ['task:generated-call:0'],
+            agentTimeline: [{ type: 'image', imageSource: { id: 'task:generated-call:0' }, base64: ONE_PIXEL_PNG, mimeType: 'image/png' }]
+        };
+        context.syncPresentedMessageImages(messageElement, message, 4);
+        assert.equal(answer.children.length, 2);
+        assert.equal(answer.children[0], textNode, 'Show Image must not place the image before the assistant text');
+        assert.match(answer.children[1].className, /presented-response-image/u, 'the promoted image must be the last answer element');
+        assert.equal(answer.children[1].children[0].src.startsWith('data:image/png;base64,'), true);
+        context.syncPresentedMessageImages(messageElement, message, 4);
+        assert.equal(answer.children.length, 2, 'rerenders must replace rather than duplicate the presented image');
+        assert.equal(answer.children[1].dataset && typeof answer.children[1].dataset, 'object');
+    });
+}
+
+
+
+// Program-wide theme persistence regression: the main UI must consume one
+// Core-owned selection, with Space as the first-launch default.
+{
+    const test = require('node:test');
+    const assert = require('node:assert/strict');
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const vm = require('node:vm');
+
+    test('Core theme preference store defaults to Space and persists the selected theme for the next launch', (t) => {
+        const { ThemePreferenceStore, DEFAULT_WINDOW_THEME, normalizeWindowTheme } = productionRuntime.requireModule('backend/preferences/window-theme.js');
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-theme-'));
+        t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+        const filePath = path.join(directory, 'ui-theme.json');
+
+        const firstLaunch = new ThemePreferenceStore(filePath);
+        assert.deepEqual(firstLaunch.load(), { theme: 'space', persisted: false });
+        assert.equal(DEFAULT_WINDOW_THEME, 'space');
+        assert.equal(normalizeWindowTheme('not-a-theme'), 'space');
+        assert.equal(firstLaunch.save('terminal'), 'terminal');
+
+        const nextLaunch = new ThemePreferenceStore(filePath);
+        assert.deepEqual(nextLaunch.load(), { theme: 'terminal', persisted: true });
+        assert.equal(JSON.parse(fs.readFileSync(filePath, 'utf8')).theme, 'terminal');
+    });
+
+    test('renderer always honors the Core launch theme and discards stale legacy localStorage theme state', async () => {
+        const source = productionSources.get('backend/renderer/preferences.js');
+        const stored = new Map([['darkstar.ui.theme', 'arctic']]);
+        const nativeThemes = [];
+        const fakeElement = () => ({
+            dataset: {}, attributes: {}, classList: { toggle() {} },
+            setAttribute(name, value) { this.attributes[name] = String(value); },
+            removeAttribute(name) { delete this.attributes[name]; },
+            querySelector() { return null; }
+        });
+        const body = fakeElement();
+        const documentElement = fakeElement();
+        const context = {
+            console, Promise,
+            setTimeout() { return 1; },
+            localStorage: {
+                getItem(key) { return stored.get(key) ?? null; },
+                setItem(key, value) { stored.set(key, String(value)); },
+                removeItem(key) { stored.delete(key); },
+            },
+            darkstar: { app: { initialTheme: 'space', async setTheme(theme) { nativeThemes.push(theme); } } },
+            Darkstar: { async: { runBestEffort(action) { return Promise.resolve().then(action); } } },
+            document: { body, documentElement, getElementById() { return null; }, querySelector() { return null; } },
+        };
+        context.globalThis = context;
+        context.window = context;
+        vm.createContext(context);
+        vm.runInContext(source, context, { filename: 'preferences-theme-authority.js' });
+        await Promise.resolve();
+        assert.equal(context.getDarkstarTheme(), 'space', 'stale renderer-local theme state must not override the Core-selected launch theme');
+        assert.equal(documentElement.attributes['data-theme'], 'space');
+        assert.equal(body.attributes['data-theme'], 'space');
+        assert.equal(stored.has('darkstar.ui.theme'), false, 'obsolete renderer-local theme state must be discarded');
+        assert.equal(nativeThemes.at(-1), 'space', 'renderer must reaffirm the same canonical theme through the Core persistence bridge');
+
+        const persistedContext = {
+            console, Promise,
+            setTimeout() { return 1; },
+            localStorage: {
+                getItem() { return null; },
+                setItem() {},
+                removeItem() {},
+            },
+            darkstar: { app: { initialTheme: 'terminal', async setTheme() {} } },
+            Darkstar: { async: { runBestEffort(action) { return Promise.resolve().then(action); } } },
+            document: { body: fakeElement(), documentElement: fakeElement(), getElementById() { return null; }, querySelector() { return null; } },
+        };
+        persistedContext.globalThis = persistedContext;
+        persistedContext.window = persistedContext;
+        vm.createContext(persistedContext);
+        vm.runInContext(source, persistedContext, { filename: 'preferences-theme-persisted.js' });
+        assert.equal(persistedContext.getDarkstarTheme(), 'terminal', 'an existing Core-persisted selection must survive later launches');
+    });
+
+    test('Deep Blue is retired everywhere selectable and legacy selections migrate safely to Space', () => {
+        const themeSource = productionSources.get('backend/preferences/window-theme.js');
+        const preferencesSource = productionSources.get('backend/renderer/preferences.js');
+        const css = fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'styles.css'), 'utf8');
+        assert.doesNotMatch(themeSource, /'deep-blue':\s*Object\.freeze/u, 'Core must not expose Deep Blue as a window theme');
+        assert.match(themeSource, /theme === 'deep-blue'[^?]*\? 'space'/u, 'old persisted Deep Blue preferences must migrate to Space');
+        assert.doesNotMatch(preferencesSource, /id:\s*'deep-blue'/u, 'renderer theme cycling must not expose Deep Blue');
+        assert.match(preferencesSource, /'deep-blue': 'space'/u, 'renderer must safely normalize an old Deep Blue launch value');
+        assert.doesNotMatch(css, /html\[data-theme='deep-blue'\]/u, 'main UI must ship no Deep Blue visual palette');
+    });
+
+    test('main window launch contract carries the canonical theme and Space is the static no-script default', () => {
+        const mainWindowSource = productionSources.get('backend/app/main-window.js');
+        const indexHtml = fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'index.html'), 'utf8');
+        assert.match(mainWindowSource, /--darkstar-ui-theme=\$\{initialTheme\.normalized\}/u);
+        assert.doesNotMatch(mainWindowSource, /darkstar-ui-theme-persisted/u, 'main-window preload arguments must carry only the canonical theme, not a renderer migration mode');
+        assert.match(indexHtml, /<html lang="en" data-theme="space">/u);
+        assert.match(indexHtml, /id="nodeThemeButton"[^>]*title="Current: Space · Next: Light"[^>]*data-current-theme="space"[^>]*data-next-theme="light"/u,
+            'main shell must present Space consistently even before renderer JavaScript initializes');
+    });
+}
+
+
+// ThreeJS environment inspection regression: the portable application bundles a
+// browser runtime independently of whether the active project has an npm package.
+{
+    const test = require('node:test');
+    const assert = require('node:assert/strict');
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const { spawnSync } = require('node:child_process');
+
+    test('ThreeJS inspection reports the packaged embedded-browser runtime clearly without conflating Node package availability', (t) => {
+        const python = process.env.DARKSTAR_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+        const probe = spawnSync(python, ['-B', '-c', 'import sys; raise SystemExit(0 if sys.version_info[0] == 3 else 1)'], { windowsHide: true, stdio: 'ignore' });
+        if (probe.status !== 0) { t.skip('Python 3 is unavailable on this test host.'); return; }
+
+        const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-threejs-inspection-'));
+        t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+        fs.writeFileSync(path.join(workspace, 'package.json'), JSON.stringify({ name: 'no-three-project', private: true }));
+
+        const runner = path.join(ROOT, 'backend', 'agent', 'python-tool-runner.py');
+        const tool = path.join(ROOT, 'agent_assets', 'tools', 'threejs_inspection.py');
+        const request = JSON.stringify({
+            id: 1, action: 'execute', tool: 'inspect_threejs_environment', arguments: {},
+            context: {
+                workspace,
+                skills_root: path.join(ROOT, 'agent_assets', 'skills'),
+                filesystem_access: { level: '1', unrestricted: true, allow_subprocess: true },
+            },
+        });
+        const shutdown = JSON.stringify({ id: 2, action: 'shutdown' });
+        const child = spawnSync(python, ['-B', runner, tool, '--serve'], {
+            cwd: ROOT, windowsHide: true, encoding: 'utf8', input: request + '\n' + shutdown + '\n',
+            env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' }, maxBuffer: 4 * 1024 * 1024,
+        });
+        assert.equal(child.status, 0, child.stderr || 'ThreeJS inspection provider failed');
+        const response = JSON.parse(child.stdout.trim().split(/\r?\n/u)[0]);
+        assert.equal(response.success, true);
+        const report = JSON.parse(response.result);
+
+        const revisionRoot = path.join(ROOT, 'backend', 'vendor', 'three');
+        const packagedRevision = fs.readdirSync(revisionRoot)
+            .map((name) => /^r(\d+)$/u.exec(name)).filter(Boolean).map((match) => Number(match[1]))
+            .sort((a, b) => b - a)[0];
+        assert.ok(Number.isInteger(packagedRevision));
+        assert.equal(report.threejs_availability.browser.available, true);
+        assert.equal(report.threejs_availability.browser.environment, 'darkstar_embedded_browser');
+        assert.equal(report.threejs_availability.browser.source, 'darkstar_bundled_browser_runtime');
+        assert.equal(report.threejs_availability.browser.revision, String(packagedRevision));
+        assert.equal(report.threejs_availability.browser.access, 'window.THREE');
+        assert.equal(report.threejs_availability.browser.already_loaded, true);
+        assert.equal(report.threejs_availability.browser.network_required, false);
+        assert.match(report.threejs_availability.browser.instruction, /use window\.THREE directly/iu);
+        assert.equal(report.threejs_availability.preferred_for_darkstar_browser_html, 'browser');
+
+        assert.equal(report.darkstar_host.browser_three_runtime.available, true);
+        assert.equal(report.darkstar_host.browser_three_runtime.embedded_browser_ready, true);
+        assert.equal(report.darkstar_host.browser_three_runtime.configured_as_browser_preload, true);
+        assert.equal(report.darkstar_host.browser_three_runtime.mode, 'document-start');
+
+        assert.equal(report.threejs_availability.node.available, false,
+            'bundled browser ThreeJS must not be misreported as an active-project Node package');
+        assert.equal(report.active_project.three.node_import.importable, false);
+        assert.ok(report.compatibility_rules.some((rule) => /window\.THREE/u.test(rule)));
     });
 }
 
