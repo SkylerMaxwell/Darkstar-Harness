@@ -1,9 +1,0 @@
-# Python packages used by Darkstar's bundled PDF/image tools.
-# Installed into the portable app venv at build time.
-Pillow>=10,<13
-PyMuPDF>=1.24,<2
-pdfplumber>=0.11,<1
-pypdf>=5,<7
-pypdfium2>=4,<6
-pytesseract>=0.3.13,<1
-ReportLab>=4,<5

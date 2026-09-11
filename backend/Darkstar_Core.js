@@ -776,6 +776,7 @@ class ChatSessionStore {
         this.filePath = this.legacyFilePath;
         this.registryPath = path.resolve(String(options.registryPath || path.join(path.dirname(this.legacyFilePath), 'chat-project-roots.json')));
         this.baseDir = path.resolve(String(options.baseDir || path.join(__dirname, '..', '..')));
+        this.projectsRoot = path.resolve(String(options.projectsRoot || path.join(this.baseDir, 'Darkstar-Projects')));
         this.protector = options.protector || null;
         this.rootForProject = typeof options.rootForProject === 'function' ? options.rootForProject : null;
         this.onDiagnosticEvent = typeof options.onDiagnosticEvent === 'function' ? options.onDiagnosticEvent : null;
@@ -975,7 +976,7 @@ class ChatSessionStore {
     }
 
     _managedProjectRoots() {
-        const projectsRoot = path.join(this.baseDir, 'projects');
+        const projectsRoot = this.projectsRoot;
         try {
             const root = fs.realpathSync(projectsRoot);
             return fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => {
@@ -2170,7 +2171,7 @@ function normalizeWorkflowFileName(value) {
     const raw = String(value || '').trim();
     if (!raw) throw new Error('Workflow name is required.');
     if (raw === '.' || raw === '..' || raw !== path.basename(raw) || /[\\/]/u.test(raw)) {
-        throw new Error('Workflow name must be a file name inside workflows/.');
+        throw new Error('Workflow name must be a file name inside Workflows/.');
     }
     if (/[<>:"|?*\u0000-\u001f]/u.test(raw) || /[. ]$/u.test(raw)) {
         throw new Error('Workflow name contains characters that are not valid in a file name.');
@@ -2184,14 +2185,16 @@ function normalizeWorkflowFileName(value) {
 }
 
 function workflowDirectoryPath(defaultDirectory = '') {
-    return path.resolve(String(defaultDirectory || path.join(PROJECT_ROOT, 'workflows')));
+    const supplied = String(defaultDirectory || '').trim();
+    if (!supplied) throw new Error('Workflow storage directory is not configured.');
+    return path.resolve(supplied);
 }
 
 function workflowPathForName(defaultDirectory, value) {
     const directory = workflowDirectoryPath(defaultDirectory);
     const fileName = normalizeWorkflowFileName(value);
     const targetPath = path.resolve(directory, fileName);
-    if (path.dirname(targetPath) !== directory) throw new Error('Workflow path escaped workflows/.');
+    if (path.dirname(targetPath) !== directory) throw new Error('Workflow path escaped Workflows/.');
     return { directory, fileName, targetPath };
 }
 
@@ -3701,6 +3704,279 @@ module.exports = {
 };
 // <DARKSTAR_SOURCE_END path="backend/app/project-layout.js">
 });
+// MODULE :: backend/app/managed-project-storage.js
+__darkstarDefineModule("backend/app/managed-project-storage.js", function darkstarModule(module, exports, require, __filename, __dirname) {
+// <DARKSTAR_SOURCE_BEGIN path="backend/app/managed-project-storage.js">
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const MANAGED_PROJECTS_DIRECTORY = 'Darkstar-Projects';
+const APPLICATION_DATA_DIRECTORY = 'Darkstar';
+
+function normalizedPath(value) {
+    const supplied = String(value || '').trim();
+    return supplied ? path.resolve(supplied) : '';
+}
+
+function sameFilesystemPath(left, right, platform = process.platform) {
+    const a = normalizedPath(left);
+    const b = normalizedPath(right);
+    if (!a || !b) return false;
+    return platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function resolveManagedProjectsRoot(options = {}) {
+    const portableDataRoot = normalizedPath(options.portableDataRoot);
+    if (portableDataRoot) return path.join(portableDataRoot, MANAGED_PROJECTS_DIRECTORY);
+
+    const platform = String(options.platform || process.platform);
+    const localAppData = normalizedPath(options.localAppData);
+    if (platform === 'win32' && localAppData) {
+        return path.join(localAppData, APPLICATION_DATA_DIRECTORY, MANAGED_PROJECTS_DIRECTORY);
+    }
+
+    const userDataDir = normalizedPath(options.userDataDir);
+    if (userDataDir) return path.join(userDataDir, MANAGED_PROJECTS_DIRECTORY);
+
+    const baseDir = normalizedPath(options.baseDir || process.cwd());
+    return path.join(baseDir, MANAGED_PROJECTS_DIRECTORY);
+}
+
+function legacyManagedProjectsRoots(options = {}) {
+    const roots = [];
+    const platform = String(options.platform || process.platform);
+    for (const parent of [options.dataRoot, options.baseDir, options.userDataDir]) {
+        const normalized = normalizedPath(parent);
+        if (!normalized) continue;
+        const candidate = path.join(normalized, 'projects');
+        if (!roots.some((existing) => sameFilesystemPath(existing, candidate, platform))) roots.push(candidate);
+    }
+    return roots;
+}
+
+function realDirectoryState(directory) {
+    try {
+        const stat = fs.lstatSync(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) return { exists: true, usable: false, entries: [] };
+        return { exists: true, usable: true, entries: fs.readdirSync(directory) };
+    } catch (error) {
+        if (error && error.code === 'ENOENT') return { exists: false, usable: false, entries: [] };
+        throw error;
+    }
+}
+
+function uniqueBackupPath(sourceRoot) {
+    const base = sourceRoot + '.migrated-backup';
+    if (!fs.existsSync(base)) return base;
+    let ordinal = 2;
+    while (fs.existsSync(base + '-' + ordinal)) ordinal += 1;
+    return base + '-' + ordinal;
+}
+
+function selectLegacyRoot(legacyRoots, projectsRoot, platform) {
+    const candidates = [];
+    for (const value of Array.isArray(legacyRoots) ? legacyRoots : []) {
+        const root = normalizedPath(value);
+        if (!root || sameFilesystemPath(root, projectsRoot, platform)) continue;
+        const state = realDirectoryState(root);
+        if (!state.exists || !state.usable) continue;
+        candidates.push({ root, entries: state.entries });
+    }
+    return candidates.find((candidate) => candidate.entries.length > 0) || candidates[0] || null;
+}
+
+function migrateLegacyManagedProjects(options = {}) {
+    const projectsRoot = normalizedPath(options.projectsRoot);
+    if (!projectsRoot) throw new Error('Managed projects root is required.');
+    const platform = String(options.platform || process.platform);
+    const logger = options.logger || console;
+    const existing = realDirectoryState(projectsRoot);
+    if (existing.exists && !existing.usable) {
+        throw new Error(`Darkstar managed projects path must be a real directory: ${projectsRoot}`);
+    }
+
+    const legacy = selectLegacyRoot(options.legacyRoots, projectsRoot, platform);
+    if (existing.exists && existing.entries.length > 0) {
+        if (legacy && legacy.entries.length > 0) {
+            logger.warn?.(`[Darkstar] Legacy managed projects remain at ${legacy.root}; canonical storage already contains data at ${projectsRoot}, so no automatic merge was attempted.`);
+        }
+        return { rootPath: projectsRoot, migrated: false, reason: 'canonical-populated', legacyRoot: legacy?.root || '' };
+    }
+
+    fs.mkdirSync(path.dirname(projectsRoot), { recursive: true });
+    if (!legacy) {
+        if (!existing.exists) fs.mkdirSync(projectsRoot, { recursive: true });
+        return { rootPath: projectsRoot, migrated: false, reason: 'no-legacy-root', legacyRoot: '' };
+    }
+
+    if (existing.exists) fs.rmdirSync(projectsRoot);
+    try {
+        fs.renameSync(legacy.root, projectsRoot);
+        logger.log?.(`[Darkstar] Migrated managed projects: ${legacy.root} -> ${projectsRoot}`);
+        return { rootPath: projectsRoot, migrated: true, mode: 'rename', legacyRoot: legacy.root, backupPath: '' };
+    } catch (renameError) {
+        const temporaryRoot = projectsRoot + `.migration-${process.pid}-${Date.now()}`;
+        try {
+            fs.cpSync(legacy.root, temporaryRoot, { recursive: true, force: false, errorOnExist: true, dereference: false, verbatimSymlinks: true });
+            const copied = realDirectoryState(temporaryRoot);
+            if (!copied.usable) throw new Error('Copied managed projects root was not a real directory.');
+            fs.renameSync(temporaryRoot, projectsRoot);
+            const backupPath = uniqueBackupPath(legacy.root);
+            fs.renameSync(legacy.root, backupPath);
+            logger.warn?.(`[Darkstar] Managed projects crossed storage volumes; copied them to ${projectsRoot} and retained the original tree as ${backupPath}.`);
+            return { rootPath: projectsRoot, migrated: true, mode: 'copy-backup', legacyRoot: legacy.root, backupPath };
+        } catch (copyError) {
+            try { fs.rmSync(temporaryRoot, { recursive: true, force: true }); } catch (_) {}
+            const detail = String(copyError?.message || copyError || renameError?.message || renameError || 'unknown migration failure');
+            throw new Error(`Darkstar could not migrate managed projects from ${legacy.root} to ${projectsRoot}: ${detail}`);
+        }
+    }
+}
+
+module.exports = {
+    APPLICATION_DATA_DIRECTORY,
+    MANAGED_PROJECTS_DIRECTORY,
+    legacyManagedProjectsRoots,
+    migrateLegacyManagedProjects,
+    resolveManagedProjectsRoot,
+};
+// <DARKSTAR_SOURCE_END path="backend/app/managed-project-storage.js">
+});
+// MODULE :: backend/app/managed-workflow-storage.js
+__darkstarDefineModule("backend/app/managed-workflow-storage.js", function darkstarModule(module, exports, require, __filename, __dirname) {
+// <DARKSTAR_SOURCE_BEGIN path="backend/app/managed-workflow-storage.js">
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const MANAGED_WORKFLOWS_DIRECTORY = 'Workflows';
+const DEFAULT_WORKFLOW_FILENAME = 'darkstar-workflow.dswf';
+const APPLICATION_DATA_DIRECTORY = 'Darkstar';
+
+function normalizedPath(value) {
+    const supplied = String(value || '').trim();
+    return supplied ? path.resolve(supplied) : '';
+}
+
+function sameFilesystemPath(left, right, platform = process.platform) {
+    const a = normalizedPath(left);
+    const b = normalizedPath(right);
+    if (!a || !b) return false;
+    return platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function resolveManagedWorkflowsRoot(options = {}) {
+    const portableDataRoot = normalizedPath(options.portableDataRoot);
+    if (portableDataRoot) return path.join(portableDataRoot, MANAGED_WORKFLOWS_DIRECTORY);
+    const platform = String(options.platform || process.platform);
+    const localAppData = normalizedPath(options.localAppData);
+    if (platform === 'win32' && localAppData) return path.join(localAppData, APPLICATION_DATA_DIRECTORY, MANAGED_WORKFLOWS_DIRECTORY);
+    const userDataDir = normalizedPath(options.userDataDir);
+    if (userDataDir) return path.join(userDataDir, MANAGED_WORKFLOWS_DIRECTORY);
+    return path.join(normalizedPath(options.baseDir || process.cwd()), MANAGED_WORKFLOWS_DIRECTORY);
+}
+
+function bundledDefaultWorkflowPath(baseDir) {
+    return path.join(normalizedPath(baseDir), 'backend', 'assets', 'default-workflow.dswf');
+}
+
+function legacyManagedWorkflowRoots(options = {}) {
+    const roots = [];
+    const platform = String(options.platform || process.platform);
+    for (const parent of [options.dataRoot, options.baseDir, options.userDataDir]) {
+        const normalized = normalizedPath(parent);
+        if (!normalized) continue;
+        for (const name of ['workflows', 'Workflows']) {
+            const candidate = path.join(normalized, name);
+            if (!roots.some((existing) => sameFilesystemPath(existing, candidate, platform))) roots.push(candidate);
+        }
+    }
+    return roots;
+}
+
+function ensureRealDirectory(directory) {
+    try {
+        const stat = fs.lstatSync(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Darkstar workflow storage path must be a real directory: ${directory}`);
+    } catch (error) {
+        if (!error || error.code !== 'ENOENT') throw error;
+        fs.mkdirSync(directory, { recursive: true });
+    }
+}
+
+function realWorkflowFiles(directory) {
+    try {
+        const stat = fs.lstatSync(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) return [];
+        return fs.readdirSync(directory, { withFileTypes: true })
+            .filter((entry) => entry.isFile() && path.extname(entry.name).toLowerCase() === '.dswf')
+            .map((entry) => entry.name);
+    } catch (error) {
+        if (error && error.code === 'ENOENT') return [];
+        throw error;
+    }
+}
+
+function copyFileExclusiveAtomic(source, destination) {
+    if (fs.existsSync(destination)) return false;
+    const temporary = `${destination}.import-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    try {
+        fs.copyFileSync(source, temporary, fs.constants.COPYFILE_EXCL);
+        fs.renameSync(temporary, destination);
+        return true;
+    } catch (error) {
+        try { fs.rmSync(temporary, { force: true }); } catch (_) {}
+        throw error;
+    }
+}
+
+function seedDefaultWorkflow(workflowsRoot, seedPath) {
+    const source = normalizedPath(seedPath);
+    const sourceStat = fs.lstatSync(source);
+    if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) throw new Error(`Bundled default workflow must be a real file: ${source}`);
+    const destination = path.join(workflowsRoot, DEFAULT_WORKFLOW_FILENAME);
+    if (fs.existsSync(destination)) {
+        const destinationStat = fs.lstatSync(destination);
+        if (!destinationStat.isFile() || destinationStat.isSymbolicLink()) throw new Error(`Darkstar default workflow path must be a real file: ${destination}`);
+        return destination;
+    }
+    copyFileExclusiveAtomic(source, destination);
+    return destination;
+}
+
+function initializeManagedWorkflows(options = {}) {
+    const workflowsRoot = normalizedPath(options.workflowsRoot);
+    if (!workflowsRoot) throw new Error('Managed workflows root is required.');
+    const platform = String(options.platform || process.platform);
+    const logger = options.logger || console;
+    ensureRealDirectory(workflowsRoot);
+    const imported = [];
+    const collisions = [];
+    for (const value of Array.isArray(options.legacyRoots) ? options.legacyRoots : []) {
+        const legacyRoot = normalizedPath(value);
+        if (!legacyRoot || sameFilesystemPath(legacyRoot, workflowsRoot, platform)) continue;
+        for (const fileName of realWorkflowFiles(legacyRoot)) {
+            const source = path.join(legacyRoot, fileName);
+            const target = path.join(workflowsRoot, fileName);
+            if (fs.existsSync(target)) { collisions.push(source); continue; }
+            if (copyFileExclusiveAtomic(source, target)) imported.push(source);
+        }
+    }
+    if (imported.length) logger.log?.(`[Darkstar] Imported ${imported.length} legacy workflow(s) into ${workflowsRoot}.`);
+    if (collisions.length) logger.warn?.(`[Darkstar] Skipped ${collisions.length} legacy workflow(s) whose names already exist in ${workflowsRoot}.`);
+    const defaultWorkflowPath = seedDefaultWorkflow(workflowsRoot, options.seedPath);
+    return { rootPath: workflowsRoot, defaultWorkflowPath, imported, collisions };
+}
+
+module.exports = {
+    APPLICATION_DATA_DIRECTORY, DEFAULT_WORKFLOW_FILENAME, MANAGED_WORKFLOWS_DIRECTORY,
+    bundledDefaultWorkflowPath, initializeManagedWorkflows, legacyManagedWorkflowRoots, resolveManagedWorkflowsRoot,
+};
+// <DARKSTAR_SOURCE_END path="backend/app/managed-workflow-storage.js">
+});
 // --------------------------------------------------------------------------
 // [2300] APPLICATION COMPOSITION :: main lifecycle, runtime icon and services
 // --------------------------------------------------------------------------
@@ -3730,6 +4006,8 @@ const { LocalModelHistoryStore } = require('../preferences/local-model-history-s
 const { WorkflowSessionStore } = require('../preferences/workflow-session-store');
 const { ChatSessionStore } = require('../preferences/chat-session-store');
 const { ThemePreferenceStore } = require('../preferences/window-theme');
+const { legacyManagedProjectsRoots, migrateLegacyManagedProjects, resolveManagedProjectsRoot } = require('./managed-project-storage');
+const { bundledDefaultWorkflowPath, initializeManagedWorkflows, legacyManagedWorkflowRoots, resolveManagedWorkflowsRoot } = require('./managed-workflow-storage');
 
 function createPowerProtection(powerSaveBlocker, logger = console) {
     let suspensionBlockerId = null;
@@ -3789,6 +4067,21 @@ function runMainApp(electron, baseDir, diagnostics = null) {
     const dataRoot = path.resolve(configuredDataRoot || baseDir);
     app.setName('Darkstar');
     configureWindowsAppIdentity(app);
+    const userDataDir = app.getPath('userData');
+    const projectsRoot = resolveManagedProjectsRoot({
+        baseDir,
+        userDataDir,
+        portableDataRoot: configuredDataRoot,
+        localAppData: process.env.LOCALAPPDATA,
+        platform: process.platform,
+    });
+    const legacyProjectsRoots = legacyManagedProjectsRoots({ baseDir, dataRoot, userDataDir, platform: process.platform });
+    const workflowsRoot = resolveManagedWorkflowsRoot({
+        baseDir, userDataDir, portableDataRoot: configuredDataRoot,
+        localAppData: process.env.LOCALAPPDATA, platform: process.platform,
+    });
+    const legacyWorkflowRoots = legacyManagedWorkflowRoots({ baseDir, dataRoot, userDataDir, platform: process.platform });
+    const defaultWorkflowSeedPath = bundledDefaultWorkflowPath(baseDir);
 
     // Electron's process-wide lock is the authoritative single-instance contract.
     // Browser-host children never enter runMainApp(), so they remain unaffected.
@@ -3875,6 +4168,8 @@ function runMainApp(electron, baseDir, diagnostics = null) {
     };
 
     const registerIpc = () => {
+        migrateLegacyManagedProjects({ projectsRoot, legacyRoots: legacyProjectsRoots, platform: process.platform, logger: console });
+        initializeManagedWorkflows({ workflowsRoot, legacyRoots: legacyWorkflowRoots, seedPath: defaultWorkflowSeedPath, platform: process.platform, logger: console });
         const runtimeServices = ensureRuntimeServices();
         const getWindow = () => mainWindow;
         const trustedIpcMain = createTrustedIpcMain({ ipcMain, getWindow, expectedUrl: trustedRendererUrl(baseDir), diagnostics });
@@ -3902,6 +4197,7 @@ function runMainApp(electron, baseDir, diagnostics = null) {
             legacyFilePath: path.join(app.getPath('userData'), 'chat-session.dscs'),
             registryPath: path.join(app.getPath('userData'), 'chat-project-roots.json'),
             baseDir: dataRoot,
+            projectsRoot,
             protector: safeStorage,
             rootForProject: (projectId) => runtimeServices.workspace.describeRoot(`project-${Number(projectId)}`)?.path || '',
             onDiagnosticEvent: (phase, details) => diagnostics?.record?.(`chat-session-${phase}`, details),
@@ -3922,7 +4218,7 @@ function runMainApp(electron, baseDir, diagnostics = null) {
         };
         llamaIpc = registerLlamaIpc({ ipcMain: trustedIpcMain, runtime: runtimeServices.runtime, diffusionRuntime: runtimeServices.diffusionRuntime, getWindow, diagnostics, modelFileBrowserPaths, localFileBrowserDefaults, dialogLocations, localModelHistory });
         registerPluginIpc({ ipcMain: trustedIpcMain, pluginManager });
-        registerAppIpc({ ipcMain: trustedIpcMain, dialog, getWindow, baseDir, projectBaseDir: dataRoot, workspace: runtimeServices.workspace, chatSessionStore, attention: runtimeServices.attention, permissionPolicy: runtimeServices.permissionPolicy, filesystemAccess: runtimeServices.filesystemAccess, internetAccess: runtimeServices.offlineBrowser, Notification, shell, clipboard, diagnostics });
+        registerAppIpc({ ipcMain: trustedIpcMain, dialog, getWindow, baseDir, projectBaseDir: dataRoot, projectsRoot, workspace: runtimeServices.workspace, chatSessionStore, attention: runtimeServices.attention, permissionPolicy: runtimeServices.permissionPolicy, filesystemAccess: runtimeServices.filesystemAccess, internetAccess: runtimeServices.offlineBrowser, Notification, shell, clipboard, diagnostics });
         registerAgentIpc({
             ipcMain: trustedIpcMain,
             dialog,
@@ -3940,7 +4236,7 @@ function runMainApp(electron, baseDir, diagnostics = null) {
             getWindow,
             runtime: runtimeServices.runtime,
             dialogLocations,
-            workflowDirectory: path.join(baseDir, 'workflows'),
+            workflowDirectory: workflowsRoot,
             workflowSessionStore,
             themePreferenceStore,
         });
@@ -4919,6 +5215,7 @@ class LlamaRuntime {
         this.modelIdleUnload?.inferenceStarted();
         const hasToolProviders = Array.isArray(request?.tools?.providers) && request.tools.providers.length > 0;
         const hasSkills = Array.isArray(request?.skills?.skills) && request.skills.skills.length > 0;
+        const hasSubAgents = request?.tools?.subAgentsEnabled === true;
         let released = false;
         const releaseReservation = async () => {
             if (released) return;
@@ -4944,7 +5241,7 @@ class LlamaRuntime {
                     handlers.onContextUsage?.(usage);
                 },
             });
-            const result = hasToolProviders || hasSkills
+            const result = hasToolProviders || hasSkills || hasSubAgents
                 ? await this.streamAgent(isolatedRequest, controller, ownershipHandlers, requestId)
                 : await this.performChatCompletion(this.normalizeChatRequest(isolatedRequest), controller.signal, ownershipHandlers);
             if (!cacheOwnershipCommitted) cacheOwnershipCommitted = commitCacheOwnership(this, isolatedRequest, reservation);
@@ -5041,6 +5338,7 @@ const { mergeUsage } = require('./tokens');
 const { classifyToolArgumentsJson } = require('./tool-call-state');
 const { createPreparationTracker } = require('./tool-preparation-tracker');
 const { parseArguments } = require('../agent/tool-schema');
+const { completeSubAgentHandoff, isSubAgentResult, normalizeSubAgentDepth, normalizeSubAgentMaxDepth, stripSubAgentEnvelope, subAgentDelegationAllowed, subAgentSpawnAllowed, SUBAGENT_DELEGATION_POLICY_VERSION, SPAWN_SUBAGENT_TOOL_NAME } = require('../agent/builtin/subagent-tool');
 function createToolActivity(call, description, round, now = new Date()) {
     return {
         id: `activity-${round}-${String(call.id || now.getTime())}`,
@@ -5068,6 +5366,7 @@ const UIP_CHROMIUM_TOOL_NAME = 'UIP_Chromium_Interface_Element';
 const TOOL_STRING_CHUNK_LIMIT = 3500;
 const MAX_SERVER_PROTOCOL_RETRIES = 1;
 const MAX_CONSECUTIVE_PROTOCOL_FAILURES = 1;
+let subAgentSequence = 0;
 
 const TOOL_EXECUTION_HEARTBEAT_MS = 1000;
 const MAX_GENERATED_IMAGES_PER_CALL = 50;
@@ -5144,6 +5443,9 @@ function resultUrls(rawResult, callArguments = {}) {
 
 function untrustedBrowserToolName(name, rawResult, callArguments = {}) {
     const normalizedName = String(name || '');
+    if (normalizedName === SPAWN_SUBAGENT_TOOL_NAME && isSubAgentResult(rawResult) && rawResult.browserCompartmentActivated === true) {
+        return String(rawResult.browserCompartmentToolName || 'browser_control');
+    }
     if (isOnlineBrowserResult(normalizedName, rawResult, callArguments)) return 'browser_control';
     if (normalizedName !== UIP_CHROMIUM_TOOL_NAME || !rawResult || typeof rawResult !== 'object') return '';
     const action = String(callArguments?.action || rawResult.action || rawResult?.metadata?.action || '').trim().toLowerCase();
@@ -5688,7 +5990,95 @@ async function executeToolCalls(runtime, options) {
     return { completedCalls, completedCallFingerprints, protocolFailures, failedCalls, browserCompartmentActivated, browserCompartmentToolName };
 }
 
-async function prepareAgentStart(runtime, request) {
+function systemContentText(content) {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+    return content.filter((part) => part && part.type === 'text')
+        .map((part) => String(part.text || ''))
+        .filter(Boolean)
+        .join('\n');
+}
+
+function subAgentSystemInstruction(args = {}, depth = 1, spawnAvailable = false) {
+    const lines = [
+        '<darkstar_subagent>',
+        'You are a temporary Darkstar sub-agent delegated by another agent.',
+        'Complete only the delegated task. Return a self-contained result to the parent agent; this result becomes the parent tool result.',
+        'You run independently from the parent conversation while this task is active.',
+        'You have the same active tools, skills, project/workspace scope, and permission policy as the parent agent.',
+        spawnAvailable ? 'The spawn_subagent tool is available in this run. You may delegate a focused subtask to another temporary sub-agent.' : 'The spawn_subagent tool is not available in this run. Complete the delegated task without spawning another sub-agent.',
+        `Sub-agent depth: ${depth}.`,
+    ];
+    const scope = String(args.scope || '').trim();
+    const extra = String(args.system_instructions || '').trim();
+    if (scope) lines.push('Delegated scope and boundaries:', scope);
+    if (extra) lines.push('Additional system instructions:', extra);
+    lines.push('</darkstar_subagent>');
+    return lines.join('\n');
+}
+
+function buildSubAgentRequest(parentRequest, args, metadata) {
+    const child = structuredClone(parentRequest || {});
+    const parentMessages = Array.isArray(parentRequest?.messages) ? parentRequest.messages : [];
+    const parentSystem = parentMessages
+        .filter((message) => message && message.role === 'system')
+        .map((message) => stripSubAgentEnvelope(systemContentText(message.content)))
+        .filter(Boolean)
+        .join('\n\n');
+    child.tools = {
+        ...(parentRequest?.tools || {}),
+        subAgentsEnabled: true,
+        subAgentDepth: metadata.depth,
+        subAgentId: metadata.id,
+        subAgentParentId: metadata.parentId,
+        subAgentRootRequestId: metadata.rootRequestId,
+        subAgentMaxDepth: normalizeSubAgentMaxDepth(parentRequest?.tools?.subAgentMaxDepth),
+        // Canonicalize the inherited policy. Unversioned requests include both
+        // truly old workflows and workflows that persisted the former generated
+        // default false, so they migrate to ON exactly once.
+        allowSubAgentsToSpawnSubAgents: subAgentDelegationAllowed(parentRequest?.tools || {}), subAgentDelegationPolicyVersion: SUBAGENT_DELEGATION_POLICY_VERSION,
+    };
+    const childSystem = subAgentSystemInstruction(args, metadata.depth, subAgentSpawnAllowed(child.tools));
+    child.messages = [
+        { role: 'system', content: [parentSystem, childSystem].filter(Boolean).join('\n\n') },
+        { role: 'user', content: String(args.task || '').trim() },
+    ];
+    child.cacheIdentity = `${String(parentRequest?.cacheIdentity || metadata.rootRequestId || 'darkstar')}:subagent:${metadata.id}`;
+    child.cacheReuseProven = false;
+    delete child.continueFinalMessage;
+    delete child.continue_final_message;
+    return child;
+}
+
+function subAgentMetadata(parentRequest, interactionId, args) {
+    const parentDepth = normalizeSubAgentDepth(parentRequest?.tools?.subAgentDepth);
+    const rootRequestId = String(parentRequest?.tools?.subAgentRootRequestId || interactionId || 'request');
+    const parentId = String(parentRequest?.tools?.subAgentId || interactionId || '');
+    subAgentSequence += 1;
+    return {
+        id: `subagent-${Date.now().toString(36)}-${subAgentSequence.toString(36)}`,
+        parentId,
+        rootRequestId,
+        depth: parentDepth + 1,
+        task: String(args?.task || '').trim(),
+        scope: String(args?.scope || '').trim(),
+    };
+}
+
+function forwardSubAgentToolEvent(handlers, metadata, payload) {
+    if (!payload || typeof payload !== 'object') return;
+    if (String(payload.type || '').startsWith('subagent-')) {
+        handlers.onToolEvent?.(payload);
+        return;
+    }
+    handlers.onToolEvent?.({
+        type: 'subagent-tool-event',
+        subAgent: { ...metadata },
+        event: structuredClone(payload),
+    });
+}
+
+async function prepareAgentStart(runtime, request, orchestrationOptions = {}) {
     if (!runtime.toolService) throw new Error('Agent tools are unavailable in this Darkstar build.');
     const baseBody = runtime.normalizeChatRequest(request);
     const requestedToolChoice = request?.tools?.toolChoice;
@@ -5703,7 +6093,7 @@ async function prepareAgentStart(runtime, request) {
     }
     const effectiveSkillConfiguration = staleDisabledSkills ? { ...(request.skills || {}), skills: [] } : (request.skills || {});
     const visionEnabled = agentVisionEnabled(runtime, request);
-    const agentRuntime = await runtime.toolService.buildRuntime({ ...(request.tools || {}), visionEnabled }, effectiveSkillConfiguration);
+    const agentRuntime = await runtime.toolService.buildRuntime({ ...(request.tools || {}), visionEnabled }, effectiveSkillConfiguration, orchestrationOptions);
     const imageIntent = directImageGenerationIntent(baseBody.messages);
     const directImageRuntime = imageIntent ? runtimeForSingleTool(agentRuntime, 'generate_image') : null;
     if (imageIntent && !directImageRuntime) {
@@ -5739,8 +6129,74 @@ async function agentInputBody(runtime, request) {
 }
 
 async function streamAgent(runtime, request, controller, handlers = {}, interactionId = '') {
-    const preparedStart = await prepareAgentStart(runtime, request);
+    let parentBaseBody = null;
+    const runSubAgent = async (args = {}) => {
+        const metadata = subAgentMetadata(request, interactionId, args);
+        const childRequest = buildSubAgentRequest(request, args, metadata);
+        const childController = new AbortController();
+        const abortChild = () => {
+            if (childController.signal.aborted) return;
+            try { childController.abort(controller.signal.reason || 'Parent generation stopped.'); }
+            catch (_) { childController.abort(); }
+        };
+        if (controller.signal.aborted) abortChild();
+        else controller.signal.addEventListener('abort', abortChild, { once: true });
+        handlers.onToolEvent?.({ type: 'subagent-start', subAgent: { ...metadata } });
+        try {
+            const result = await streamAgent(runtime, childRequest, childController, {
+                diagnosticContext: {
+                    ...(handlers?.diagnosticContext && typeof handlers.diagnosticContext === 'object' ? handlers.diagnosticContext : {}),
+                    subAgentId: metadata.id,
+                    subAgentDepth: metadata.depth,
+                },
+                onChunk: (chunk) => {
+                    handlers.onToolEvent?.({
+                        type: chunk?.roundStart === true ? 'subagent-round-start' : 'subagent-chunk',
+                        subAgent: { ...metadata },
+                        chunk: {
+                            content: typeof chunk?.content === 'string' ? chunk.content : '',
+                            reasoning: typeof chunk?.reasoning === 'string' ? chunk.reasoning : '',
+                            agentRound: Number(chunk?.agentRound) || 1,
+                            roundStart: chunk?.roundStart === true,
+                        },
+                    });
+                },
+                onToolEvent: (payload) => forwardSubAgentToolEvent(handlers, metadata, payload),
+                onContextUsage: (usage) => handlers.onToolEvent?.({
+                    type: 'subagent-context-usage',
+                    subAgent: { ...metadata },
+                    usage: usage && typeof usage === 'object' ? structuredClone(usage) : null,
+                }),
+            }, metadata.id);
+            const output = String(result?.text || '');
+            handlers.onToolEvent?.({
+                type: 'subagent-complete',
+                subAgent: { ...metadata },
+                output,
+                finishReason: result?.finishReason || null,
+                agentRounds: Number(result?.agentRounds) || 1,
+                toolRounds: Number(result?.toolRounds) || 0,
+            });
+            return completeSubAgentHandoff(handlers, metadata, output, result);
+        } catch (error) {
+            handlers.onToolEvent?.({
+                type: 'subagent-error',
+                subAgent: { ...metadata },
+                error: String(error?.message || error || 'Sub-agent failed.'),
+            });
+            throw error;
+        } finally {
+            controller.signal.removeEventListener?.('abort', abortChild);
+            // The child used the same physical llama slot during this synchronous tool
+            // call. The parent must reconcile its prompt before trusting KV reuse again.
+            if (parentBaseBody && typeof parentBaseBody === 'object') delete parentBaseBody._darkstar_cache_reuse_proven;
+            try { await runtime.toolService?.finishInteraction?.(metadata.id, childRequest?.tools?.browserId); }
+            catch (_) { /* Parent cleanup still owns the root interaction. */ }
+        }
+    };
+    const preparedStart = await prepareAgentStart(runtime, request, { runSubAgent });
     const { baseBody } = preparedStart;
+    parentBaseBody = baseBody;
     if (preparedStart.direct) return emptyAgentResult(await runtime.performChatCompletion(baseBody, controller.signal, handlers));
     const { agentRuntime, retainedOnlineBrowserTool, retainedOnlineImageContext, directIntentTool, workingMessages, visionEnabled } = preparedStart;
     const toolMessages = [], presentedImageIds = [], imageRegistry = new Map();
@@ -5837,6 +6293,7 @@ async function streamAgent(runtime, request, controller, handlers = {}, interact
                     agentRounds: modelRound,
                     toolRounds: toolRound,
                     browserCompartmentActivated,
+                    browserCompartmentToolName: browserCompartmentActivated ? browserCompartmentToolName : '',
                 };
             }
 
@@ -5973,6 +6430,7 @@ module.exports = {
     agentVisionEnabled,
     browserOnlyRuntime,
     buildAgentRequest,
+    buildSubAgentRequest,
     emptyAgentResult,
     ensureOnlineBrowserBoundary,
     ephemeralOnlineToolMessage,
@@ -14280,6 +14738,159 @@ module.exports = {
 };
 // <DARKSTAR_SOURCE_END path="backend/agent/builtin/uip-tools.js">
 });
+// MODULE :: backend/agent/builtin/subagent-tool.js
+__darkstarDefineModule("backend/agent/builtin/subagent-tool.js", function darkstarModule(module, exports, require, __filename, __dirname) {
+// <DARKSTAR_SOURCE_BEGIN path="backend/agent/builtin/subagent-tool.js">
+'use strict';
+
+const SPAWN_SUBAGENT_TOOL_NAME = 'spawn_subagent';
+const SUBAGENT_RESULT_MARKER = '__darkstarSubAgentResult';
+const SUBAGENT_DELEGATION_POLICY_VERSION = 1;
+const DEFAULT_SUBAGENT_MAX_DEPTH = 8;
+
+const SPAWN_SUBAGENT_DEFINITION = Object.freeze({
+    type: 'function',
+    function: {
+        name: SPAWN_SUBAGENT_TOOL_NAME,
+        description: 'Delegate one focused task to a temporary sub-agent. The sub-agent runs independently with the same active Darkstar tools, skills, project/workspace scope, and permission policy as this agent, then returns its final answer as this tool result and terminates.',
+        'x-darkstar-permission': 'read',
+        'x-darkstar-filesystem': 'none',
+        parameters: {
+            type: 'object',
+            properties: {
+                task: {
+                    type: 'string',
+                    minLength: 1,
+                    maxLength: 12000,
+                    description: 'The concrete task the sub-agent must complete. Make it self-contained and outcome-oriented.',
+                },
+                scope: {
+                    type: 'string',
+                    maxLength: 8000,
+                    description: 'Optional scope, boundaries, relevant context, or constraints for the delegated task.',
+                },
+                system_instructions: {
+                    type: 'string',
+                    maxLength: 8000,
+                    description: 'Optional additional system-level instructions for this sub-agent only.',
+                },
+            },
+            required: ['task'],
+            additionalProperties: false,
+        },
+    },
+});
+
+function normalizeSubAgentDepth(value) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function normalizeSubAgentMaxDepth(value) {
+    const parsed = Number.parseInt(value, 10);
+    if (parsed === 0) return 0;
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_SUBAGENT_MAX_DEPTH;
+}
+
+function stripSubAgentEnvelope(value) {
+    return String(value || '').replace(/<darkstar_subagent>[\s\S]*?<\/darkstar_subagent>/gu, '').replace(/\n{3,}/gu, '\n\n').trim();
+}
+
+function createSubAgentReturnEvent(metadata = {}) {
+    const depth = normalizeSubAgentDepth(metadata.depth);
+    if (depth <= 1 || !metadata.parentId) return null;
+    return { type: 'subagent-return', subAgent: { ...metadata }, returnTo: { id: String(metadata.parentId), rootRequestId: String(metadata.rootRequestId || ''), depth: depth - 1 } };
+}
+
+function completeSubAgentHandoff(handlers, metadata, output, result = {}) {
+    const returnEvent = createSubAgentReturnEvent(metadata);
+    if (returnEvent) handlers?.onToolEvent?.(returnEvent);
+    return createSubAgentResult(output, {
+        childId: metadata?.id, parentId: metadata?.parentId, rootRequestId: metadata?.rootRequestId, depth: metadata?.depth,
+        browserCompartmentActivated: result?.browserCompartmentActivated === true,
+        browserCompartmentToolName: result?.browserCompartmentToolName || '',
+    });
+}
+
+function subAgentDelegationAllowed(toolConfiguration = {}) {
+    const parsedVersion = Number.parseInt(toolConfiguration.subAgentDelegationPolicyVersion, 10);
+    // Builds that first introduced the switch normalized a missing value to false
+    // and could persist that generated default into existing workflows. Treat any
+    // unversioned value as legacy/default ON. From policy version 1 onward, an
+    // explicit false is a deliberate user choice and remains authoritative.
+    if (!Number.isInteger(parsedVersion) || parsedVersion < SUBAGENT_DELEGATION_POLICY_VERSION) return true;
+    return toolConfiguration.allowSubAgentsToSpawnSubAgents !== false;
+}
+
+function subAgentSpawnAllowed(toolConfiguration = {}) {
+    if (toolConfiguration.subAgentsEnabled !== true) return false;
+    const depth = normalizeSubAgentDepth(toolConfiguration.subAgentDepth);
+    const maximumDepth = normalizeSubAgentMaxDepth(toolConfiguration.subAgentMaxDepth);
+    if (maximumDepth > 0 && depth >= maximumDepth) return false;
+    return depth === 0 || subAgentDelegationAllowed(toolConfiguration);
+}
+
+function createSubAgentResult(text, metadata = {}) {
+    return Object.freeze({
+        [SUBAGENT_RESULT_MARKER]: true,
+        text: String(text || ''),
+        childId: String(metadata.childId || ''),
+        parentId: String(metadata.parentId || ''),
+        rootRequestId: String(metadata.rootRequestId || ''),
+        depth: normalizeSubAgentDepth(metadata.depth),
+        browserCompartmentActivated: metadata.browserCompartmentActivated === true,
+        browserCompartmentToolName: String(metadata.browserCompartmentToolName || ''),
+    });
+}
+
+function isSubAgentResult(value) {
+    return Boolean(value && typeof value === 'object' && value[SUBAGENT_RESULT_MARKER] === true);
+}
+
+function assertSubAgentResultRoute(result, expectedParentId) {
+    if (!isSubAgentResult(result)) return result;
+    const expected = String(expectedParentId || '');
+    const actual = String(result.parentId || '');
+    if (actual === expected) return result;
+    const error = new Error(`Sub-agent result routing mismatch: child ${String(result.childId || 'unknown')} returned to ${actual || 'root'}, but the calling agent is ${expected || 'root'}.`);
+    error.code = 'SUBAGENT_RESULT_PARENT_MISMATCH';
+    throw error;
+}
+
+function createSubAgentToolProvider(runSubAgent) {
+    const execute = typeof runSubAgent === 'function'
+        ? runSubAgent
+        : async () => { throw new Error('Sub-agent execution is unavailable in this runtime context.'); };
+    return {
+        id: 'subagent',
+        name: 'Darkstar Sub-agents',
+        tools: [{
+            definition: SPAWN_SUBAGENT_DEFINITION,
+            execute: async (args, context, options) => execute(args, context, options),
+        }],
+    };
+}
+
+module.exports = {
+    DEFAULT_SUBAGENT_MAX_DEPTH,
+    SUBAGENT_DELEGATION_POLICY_VERSION,
+    SPAWN_SUBAGENT_DEFINITION,
+    SPAWN_SUBAGENT_TOOL_NAME,
+    SUBAGENT_RESULT_MARKER,
+    assertSubAgentResultRoute,
+    completeSubAgentHandoff,
+    createSubAgentResult,
+    createSubAgentReturnEvent,
+    createSubAgentToolProvider,
+    isSubAgentResult,
+    normalizeSubAgentDepth,
+    normalizeSubAgentMaxDepth,
+    stripSubAgentEnvelope,
+    subAgentDelegationAllowed,
+    subAgentSpawnAllowed,
+};
+// <DARKSTAR_SOURCE_END path="backend/agent/builtin/subagent-tool.js">
+});
 // MODULE :: backend/agent/module-tool-loader.js
 __darkstarDefineModule("backend/agent/module-tool-loader.js", function darkstarModule(module, exports, require, __filename, __dirname) {
 // <DARKSTAR_SOURCE_BEGIN path="backend/agent/module-tool-loader.js">
@@ -16581,6 +17192,7 @@ const { SkillService } = require('./skill-service');
 const { ModuleToolLoader } = require('./module-tool-loader');
 const { createFileToolProvider } = require('./builtin/file-tools');
 const { createTerminalToolProvider } = require('./builtin/terminal-tools');
+const { assertSubAgentResultRoute, createSubAgentToolProvider, isSubAgentResult, normalizeSubAgentDepth, subAgentSpawnAllowed } = require('./builtin/subagent-tool');
 const { hasApplicationInterfaceTargets, registerApplicationInterfaceHarness, stripLegacyApplicationInterfaceProviders } = require('./application-interface-harness');
 const { filterEnabledTools } = require('./python-provider');
 const { parseArguments, validateToolArguments } = require('./tool-schema');
@@ -16665,7 +17277,7 @@ class ToolService {
         definitions.push(runtimeDefinition); handlers.set(name, { definition: runtimeDefinition, permission, ...handler });
         return true;
     }
-    async buildRuntime(toolConfiguration = {}, skillConfiguration = {}) {
+    async buildRuntime(toolConfiguration = {}, skillConfiguration = {}, orchestrationOptions = {}) {
         const visionEnabled = toolConfiguration.visionEnabled === true, diffusion = normalizeDiffusionConfiguration(toolConfiguration.diffusion), diffusionEnabled = Boolean(diffusion), negativePromptEnabled = toolConfiguration.negativePromptEnabled === true, imageCountOverride = normalizeGenerateImageCountOverride(toolConfiguration.imageCountOverride);
         const imageEdit = toolConfiguration.imageEdit && typeof toolConfiguration.imageEdit === 'object' ? structuredClone(toolConfiguration.imageEdit) : null;
         const workspaceId = String(toolConfiguration.workspaceId || 'default');
@@ -16683,6 +17295,19 @@ class ToolService {
         const handlers = new Map();
         const providerSummaries = [];
         const providerKeys = new Set();
+        const subAgentDepth = normalizeSubAgentDepth(toolConfiguration.subAgentDepth);
+        const subAgentActive = subAgentSpawnAllowed(toolConfiguration);
+        if (subAgentActive) {
+            const subAgentProvider = createSubAgentToolProvider(orchestrationOptions.runSubAgent);
+            const subAgentReference = { kind: 'builtin', id: 'subagent' };
+            for (const entry of subAgentProvider.tools) {
+                this._registerHandler(definitions, handlers, entry.definition, {
+                    execute: entry.execute,
+                    provider: { id: subAgentProvider.id, name: subAgentProvider.name, tools: [entry.definition] },
+                    reference: subAgentReference,
+                }, visionEnabled, diffusionEnabled, diffusion, negativePromptEnabled, imageCountOverride, imageEdit);
+            }
+        }
         const applicationInterfaceActive = registerApplicationInterfaceHarness(this.uipService, uipScopeId, (definition, execute, reference) => {
             this._registerHandler(definitions, handlers, definition, { execute, provider: null, reference }, visionEnabled, diffusionEnabled, diffusion, negativePromptEnabled, imageCountOverride, imageEdit);
         });
@@ -16745,8 +17370,9 @@ class ToolService {
             skillsRoot: configuredSkillsRoot ? path.resolve(String(configuredSkillsRoot)) : null,
             catalog: skillRuntime.catalog,
             maxRounds: normalizeMaxRounds(toolConfiguration.maxRounds),
-            toolChoice: requestedToolChoice === 'none' && (skillRuntime.definitions.length || applicationInterfaceActive) ? 'auto' : requestedToolChoice,
+            toolChoice: requestedToolChoice === 'none' && (skillRuntime.definitions.length || applicationInterfaceActive || subAgentActive) ? 'auto' : requestedToolChoice,
             applicationInterfaceActive,
+            subAgentActive, subAgentDepth,
         };
     }
     describeCall(call) {
@@ -16806,7 +17432,9 @@ class ToolService {
             interactionId: String(options.interactionId || ''), imageRegistry: options.imageRegistry,
         });
         let contextMessages = [], presentedImageIds = [], displayResult = result;
-        if (result && result.__darkstarMultimodal === true) {
+        if (isSubAgentResult(result)) {
+            assertSubAgentResultRoute(result, options.interactionId); displayResult = String(result.text || '');
+        } else if (result && result.__darkstarMultimodal === true) {
             const images = registerToolImages(options.imageRegistry, call, Array.isArray(result.images) ? result.images : [], options.taskId);
             const imageParts = images.map((image) => {
                 const mimeType = image.mimeType;
@@ -24557,6 +25185,7 @@ function registerAppIpc(options = {}) {
     const getWindow = typeof options.getWindow === 'function' ? options.getWindow : () => null;
     const baseDir = path.resolve(options.baseDir || path.join(__dirname, '..', '..'));
     const projectBaseDir = path.resolve(options.projectBaseDir || baseDir);
+    const projectsRoot = path.resolve(options.projectsRoot || path.join(projectBaseDir, 'Darkstar-Projects'));
     const workspace = options.workspace || new WorkspaceRegistry();
     const chatSessionStore = options.chatSessionStore || null;
     if (!ipcMain?.handle) throw new Error('ipcMain is required.');
@@ -24646,7 +25275,6 @@ function registerAppIpc(options = {}) {
     }, (error) => ({ success: false, error: errorMessage(error), entries: [] }));
 
     registerHandledIpc(ipcMain, CHANNELS.WORKSPACE_LIST_PROJECTS, async () => {
-        const projectsRoot = path.join(projectBaseDir, 'projects');
         await fs.promises.mkdir(projectsRoot, { recursive: true });
         let entries = await fs.promises.readdir(projectsRoot, { withFileTypes: true });
         let directories = entries.filter((entry) => entry.isDirectory());
@@ -24673,7 +25301,6 @@ function registerAppIpc(options = {}) {
         const workspaceId = normalizeWorkspaceId(payload && payload.workspaceId);
         const requestedName = String(payload && payload.name || 'New Project').trim() || 'New Project';
         const safeBaseName = requestedName.replace(/[<>:"\/\\|?*\u0000-\u001F]/gu, '').replace(/[. ]+$/u, '').trim() || 'New Project';
-        const projectsRoot = path.join(projectBaseDir, 'projects');
         await fs.promises.mkdir(projectsRoot, { recursive: true });
         const defaultMatch = /^New Project(?: (\d+))?$/u.exec(safeBaseName);
         const defaultOrdinal = defaultMatch ? Math.max(1, Number(defaultMatch[1]) || 1) : 0;
@@ -24715,7 +25342,6 @@ function registerAppIpc(options = {}) {
         const root = workspace.forSession ? workspace.describeRoot(workspaceId) : workspace.describeRoot();
         const requestedRootPath = String(payload && payload.rootPath || '').trim();
         const rootPath = root && root.path ? path.resolve(String(root.path)) : (requestedRootPath ? path.resolve(requestedRootPath) : '');
-        const projectsRoot = path.resolve(projectBaseDir, 'projects');
         const canonicalProjectsRoot = await fs.promises.realpath(projectsRoot).catch((error) => error && error.code === 'ENOENT' ? projectsRoot : Promise.reject(error));
         const canonicalRootPath = rootPath
             ? await fs.promises.realpath(rootPath).catch((error) => error && error.code === 'ENOENT' ? rootPath : Promise.reject(error))
@@ -28048,30 +28674,18 @@ function verifyBundledWorkflowModelDefaults(snapshot, label) {
 }
 
 function verifyBundledWorkflows() {
-    const directory = path.join(root, 'workflows');
-    if (!sourceFs.existsSync(directory)) {
-        fail('Bundled workflow directory is missing: workflows/');
+    const filePath = path.join(root, 'backend', 'assets', 'default-workflow.dswf');
+    if (!sourceFs.existsSync(filePath) || !sourceFs.statSync(filePath).isFile()) {
+        fail('Bundled default workflow is missing: backend/assets/default-workflow.dswf');
         return;
     }
-    const workflowFiles = sourceFs.readdirSync(directory, { withFileTypes: true })
-        .filter((entry) => entry.isFile() && /\.(?:dswf|json)$/iu.test(entry.name))
-        .map((entry) => path.join(directory, entry.name))
-        .sort();
-    if (!workflowFiles.length) {
-        fail('No bundled workflow snapshot was found under workflows/.');
-        return;
-    }
-    for (const filePath of workflowFiles) {
-        const file = relative(filePath);
-        try {
-            const snapshot = filePath.toLowerCase().endsWith('.dswf')
-                ? decodeWorkflowSnapshot(sourceFs.readFileSync(filePath))
-                : JSON.parse(sourceFs.readFileSync(filePath, 'utf8'));
-            inspectRecursively(snapshot, file);
-            verifyBundledWorkflowModelDefaults(snapshot, file);
-        } catch (error) {
-            fail(`${file} could not be decoded: ${error && error.message ? error.message : error}`);
-        }
+    const file = relative(filePath);
+    try {
+        const snapshot = decodeWorkflowSnapshot(sourceFs.readFileSync(filePath));
+        inspectRecursively(snapshot, file);
+        verifyBundledWorkflowModelDefaults(snapshot, file);
+    } catch (error) {
+        fail(`${file} could not be decoded: ${error && error.message ? error.message : error}`);
     }
 }
 
@@ -28703,45 +29317,40 @@ function verifyRendererAssets() {
 }
 
 function verifyBundledWorkflowProviders() {
-    const workflowsDirectory = path.join(root, 'workflows');
-    if (!sourceFs.existsSync(workflowsDirectory)) return;
+    const workflowPath = path.join(root, 'backend', 'assets', 'default-workflow.dswf');
+    if (!sourceFs.existsSync(workflowPath)) return;
     const { decodeWorkflowSnapshot } = require(path.join(root, 'backend', 'workflow', 'workflow-snapshot-codec.js'));
     const agentAssetsRoot = path.resolve(root, 'agent_assets');
-
-    for (const entry of sourceFs.readdirSync(workflowsDirectory, { withFileTypes: true })) {
-        if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== '.dswf') continue;
-        const workflowPath = path.join(workflowsDirectory, entry.name);
-        let snapshot;
-        try {
-            snapshot = decodeWorkflowSnapshot(sourceFs.readFileSync(workflowPath));
-        } catch (error) {
-            fail(`Invalid bundled workflow ${relative(workflowPath)}: ${error.message}`);
-            continue;
-        }
-        const editor = snapshot.editor && typeof snapshot.editor === 'object' ? snapshot.editor : snapshot;
-        const toolNodes = Array.isArray(editor.nodes) ? editor.nodes.filter((node) => node?.type === 'tools') : [];
-        for (const node of toolNodes) {
-            const providers = Array.isArray(node?.params?.providers) ? node.params.providers : [];
-            for (const provider of providers) {
-                if (String(provider?.kind || 'python').toLowerCase() !== 'python') continue;
-                const providerPath = String(provider?.path || '').trim().replace(/\\/gu, '/');
-                if (!providerPath) {
-                    fail(`${relative(workflowPath)} contains a Python provider without a path.`);
-                    continue;
-                }
-                const absolutePath = path.resolve(root, providerPath);
-                const relativeToAssets = path.relative(agentAssetsRoot, absolutePath);
-                if (relativeToAssets.startsWith('..') || path.isAbsolute(relativeToAssets)) {
-                    fail(`${relative(workflowPath)} references a Python provider outside agent_assets/: ${providerPath}`);
-                    continue;
-                }
-                if (!sourceFs.existsSync(absolutePath) || !sourceFs.statSync(absolutePath).isFile()) {
-                    fail(`${relative(workflowPath)} references a missing Python provider: ${providerPath}`);
-                }
-                const toolCount = Number(provider?.toolCount);
-                if (!Number.isInteger(toolCount) || toolCount < 1) {
-                    fail(`${relative(workflowPath)} has an invalid toolCount for ${providerPath}: ${provider?.toolCount}`);
-                }
+    let snapshot;
+    try {
+        snapshot = decodeWorkflowSnapshot(sourceFs.readFileSync(workflowPath));
+    } catch (error) {
+        fail(`Invalid bundled workflow ${relative(workflowPath)}: ${error.message}`);
+        return;
+    }
+    const editor = snapshot.editor && typeof snapshot.editor === 'object' ? snapshot.editor : snapshot;
+    const toolNodes = Array.isArray(editor.nodes) ? editor.nodes.filter((node) => node?.type === 'tools') : [];
+    for (const node of toolNodes) {
+        const providers = Array.isArray(node?.params?.providers) ? node.params.providers : [];
+        for (const provider of providers) {
+            if (String(provider?.kind || 'python').toLowerCase() !== 'python') continue;
+            const providerPath = String(provider?.path || '').trim().replace(/\\/gu, '/');
+            if (!providerPath) {
+                fail(`${relative(workflowPath)} contains a Python provider without a path.`);
+                continue;
+            }
+            const absolutePath = path.resolve(root, providerPath);
+            const relativeToAssets = path.relative(agentAssetsRoot, absolutePath);
+            if (relativeToAssets.startsWith('..') || path.isAbsolute(relativeToAssets)) {
+                fail(`${relative(workflowPath)} references a Python provider outside agent_assets/: ${providerPath}`);
+                continue;
+            }
+            if (!sourceFs.existsSync(absolutePath) || !sourceFs.statSync(absolutePath).isFile()) {
+                fail(`${relative(workflowPath)} references a missing Python provider: ${providerPath}`);
+            }
+            const toolCount = Number(provider?.toolCount);
+            if (!Number.isInteger(toolCount) || toolCount < 1) {
+                fail(`${relative(workflowPath)} has an invalid toolCount for ${providerPath}: ${provider?.toolCount}`);
             }
         }
     }

@@ -18,6 +18,9 @@
 # Darkstar user data created inside a source checkout.
 /models/
 /projects/
+/Darkstar-Projects/
+/workflows/
+/Workflows/
 /venv/
 /.venv/
 /env/
@@ -185,5 +188,3 @@ $RECYCLE.BIN/
 /.darkstar-build/
 /binary/
 
-# Portable single-EXE release output
-/portable-release/

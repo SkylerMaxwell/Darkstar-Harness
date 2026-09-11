@@ -315,11 +315,24 @@
         </div>
 
         <main class="main-content">
-            <div class="chat-container" id="chatContainer">
-                <div class="chat-spacer"></div>
-                <div class="welcome-screen" id="welcomeScreen">
-                    <h1 class="welcome-title">Darkstar<span class="title-glow">Darkstar</span></h1>
-                    <p class="welcome-subtitle"></p>
+            <div class="agent-pane-viewport" id="agentPaneViewport">
+                <div class="agent-pane-track" id="agentPaneTrack">
+                    <section class="agent-pane agent-pane-main" id="mainAgentPane" aria-label="Main agent">
+                        <header class="agent-pane-header main-agent-pane-header" id="mainAgentPaneHeader" hidden>
+                            <div class="agent-pane-identity">
+                                <span class="agent-pane-badge">MAIN AGENT</span>
+                                <span class="agent-pane-title">Orchestrator</span>
+                            </div>
+                            <span class="agent-pane-status">Running</span>
+                        </header>
+                        <div class="chat-container" id="chatContainer">
+                            <div class="chat-spacer"></div>
+                            <div class="welcome-screen" id="welcomeScreen">
+                                <h1 class="welcome-title">Darkstar<span class="title-glow">Darkstar</span></h1>
+                                <p class="welcome-subtitle"></p>
+                            </div>
+                        </div>
+                    </section>
                 </div>
             </div>
 

@@ -509,6 +509,106 @@ button, input, textarea, select, a, .sidebar, .chat-container, .input-area {
 .main-content.sidebar-collapsed,
 .app-container:has(.workspace-sidebar.collapsed) .main-content { margin-left: 28px; }
 
+.agent-pane-viewport {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.10) transparent;
+}
+.agent-pane-viewport::-webkit-scrollbar { width: 8px; height: 8px; }
+.agent-pane-viewport::-webkit-scrollbar-track { background: transparent; }
+.agent-pane-viewport::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.10); border-radius: 4px; }
+.agent-pane-viewport::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.20); }
+.agent-pane-track {
+    display: flex;
+    flex: 1 0 100%;
+    min-width: 100%;
+    height: 100%;
+    min-height: 0;
+}
+.agent-pane {
+    position: relative;
+    display: flex;
+    flex: 1 0 100%;
+    min-width: 100%;
+    min-height: 0;
+    flex-direction: column;
+    background: var(--bg-primary);
+    transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.agent-pane-track.has-subagents > .agent-pane {
+    flex: 0 0 50%;
+    min-width: 50%;
+}
+.agent-pane[hidden] { display: none; }
+.agent-pane + .agent-pane { border-left: 1px solid var(--glass-border); }
+.agent-pane-header {
+    display: flex;
+    flex: 0 0 38px;
+    height: 38px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--glass-border);
+    background: color-mix(in srgb, var(--bg-secondary) 74%, transparent);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    user-select: none;
+}
+.agent-pane-header[hidden] { display: none; }
+.agent-pane-identity { display: flex; min-width: 0; align-items: center; gap: 10px; }
+.agent-pane-badge {
+    flex: 0 0 auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: 0.10em;
+    color: var(--text-muted);
+}
+.agent-pane-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 500;
+}
+.agent-pane-status {
+    position: relative;
+    flex: 0 0 auto;
+    padding-left: 12px;
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.04em;
+}
+.agent-pane-status::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 50%;
+    width: 5px;
+    height: 5px;
+    margin-top: -2.5px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.75;
+}
+.subagent-pane.is-running .agent-pane-status::before { animation: subagentStatusPulse 1.4s ease-in-out infinite; }
+@keyframes subagentStatusPulse { 0%, 100% { opacity: 0.34; transform: scale(0.88); } 50% { opacity: 1; transform: scale(1.18); } }
+.subagent-pane[data-subagent-state='error'] .agent-pane-status { color: #ef7d7d; }
+.subagent-pane.is-closing { opacity: 0; transform: translateX(10px); pointer-events: none; }
+.subagent-chat-container { width: 100%; padding: 24px; }
+.subagent-chat-container :is(.message-actions) { display: none !important; }
+
 .chat-container { display: flex; flex-direction: column; flex: 1; overflow-y: auto; padding: 32px; min-height: 0; }
 .chat-container .welcome-screen { display: flex; align-items: center; justify-content: center; height: 100%; }
 .chat-spacer { flex: 1; min-height: 1px; }

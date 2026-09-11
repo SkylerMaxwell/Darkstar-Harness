@@ -23,16 +23,12 @@
   "build": {
     "appId": "com.darkstar.chat",
     "productName": "Darkstar Harness",
-    "win": {
-      "target": "portable"
-    },
     "files": [
       "backend/",
       "!backend/Dev/**",
       "!backend/vendor/electron/**",
       "custom_nodes/",
       "agent_assets/",
-      "workflows/",
       "README.md",
       "LICENSE.md"
     ],

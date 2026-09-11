@@ -2497,6 +2497,7 @@ function unregisterGenerationSession(session) {
                     if (payload.type === 'tool-context' && contextMessages.length) {
                         fullToolContext = fullToolContext.concat(contextMessages);
                     }
+                    var subAgentEvent = /^subagent-/u.test(String(payload.type || ''));
                     if (
                         !payload.activity
                         && !payload.preparation
@@ -2505,8 +2506,9 @@ function unregisterGenerationSession(session) {
                         && payload.type !== 'response-image'
                         && payload.type !== 'browser-compartment-activated'
                         && payload.type !== 'tool-call-fresh-retry'
+                        && !subAgentEvent
                     ) return;
-                    activeReasoningId = closeActiveReasoning(agentTimeline, activeReasoningId);
+                    if (!subAgentEvent) activeReasoningId = closeActiveReasoning(agentTimeline, activeReasoningId);
                     if (payload.type === 'tool-call-fresh-retry') discardFreshRetryPreparation(agentTimeline, payload);
                     if (payload.preparation) applyPreparationEventToTimeline(agentTimeline, payload);
                     if (payload.activity) {
@@ -5415,6 +5417,14 @@ function unregisterGenerationSession(session) {
     }
 
     var ORCHESTRATOR_UI_WIDTH = 720;
+    var SUBAGENT_DELEGATION_POLICY_VERSION = 1;
+    var DEFAULT_SUBAGENT_MAX_DEPTH = 8;
+
+    function normalizeSubAgentMaxDepth(value) {
+        var parsed = Number.parseInt(value, 10);
+        if (parsed === 0) return 0;
+        return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_SUBAGENT_MAX_DEPTH;
+    }
 
     function contextContainsImages(messages) {
         return Array.isArray(messages) && messages.some(function(message) {
@@ -5436,11 +5446,24 @@ function unregisterGenerationSession(session) {
         node.params.dynamicVramEnabled = controlParams.dynamicVramEnabled;
         node.params.negativePromptEnabled = controlParams.negativePromptEnabled;
         node.params.imageCountOverride = controlPolicy.normalizeImageCountOverride(node.params.imageCountOverride);
+        node.params.subAgentMaxDepth = normalizeSubAgentMaxDepth(node.params.subAgentMaxDepth);
+        var storedDelegationPolicyVersion = Number.parseInt(node.params.subAgentDelegationPolicyVersion, 10);
+        if (!Number.isInteger(storedDelegationPolicyVersion) || storedDelegationPolicyVersion < SUBAGENT_DELEGATION_POLICY_VERSION) {
+            // One-time compatibility migration. The first switch implementation
+            // could materialize its generated default false into saved workflows,
+            // so an unversioned false cannot be distinguished from a user choice.
+            // Upgrade it to the current default ON; subsequent explicit OFF values
+            // carry the policy version and remain authoritative.
+            node.params.allowSubAgentsToSpawnSubAgents = true;
+            node.params.subAgentDelegationPolicyVersion = SUBAGENT_DELEGATION_POLICY_VERSION;
+        } else {
+            node.params.allowSubAgentsToSpawnSubAgents = node.params.allowSubAgentsToSpawnSubAgents !== false;
+        }
         return node.params;
     }
 
     function freshOrchestrationParams() {
-        return Object.assign({}, contextBuilder.normalizeParams(null), controlPolicy.normalizeParams(null), { imageCountOverride: controlPolicy.minImageCountOverride });
+        return Object.assign({}, contextBuilder.normalizeParams(null), controlPolicy.normalizeParams(null), { imageCountOverride: controlPolicy.minImageCountOverride, subAgentMaxDepth: DEFAULT_SUBAGENT_MAX_DEPTH, allowSubAgentsToSpawnSubAgents: true, subAgentDelegationPolicyVersion: SUBAGENT_DELEGATION_POLICY_VERSION });
     }
 
     var definition = {
@@ -5484,7 +5507,7 @@ function unregisterGenerationSession(session) {
             definition.normalizeNode(node);
             return '<div class="orchestrator-settings">' +
                 controls.group('Conversation context', 'System instructions and history included with each request.', contextBuilder.buildControls(node)) +
-                controls.group('Runtime behavior', 'Conversation lifecycle, memory pressure, and image-generation behavior.', controlPolicy.buildControls(node) + controls.slider('Image count (0 = Model)', node.params.imageCountOverride, controlPolicy.minImageCountOverride, controlPolicy.maxImageCountOverride, 1, 0, node.id, 'imageCountOverride')) +
+                controls.group('Runtime behavior', 'Conversation lifecycle, memory pressure, image-generation behavior, and delegated-agent policy.', controlPolicy.buildControls(node) + controls.slider('Image count (0 = Model)', node.params.imageCountOverride, controlPolicy.minImageCountOverride, controlPolicy.maxImageCountOverride, 1, 0, node.id, 'imageCountOverride') + controls.numberInput('Maximum sub-agent depth (0 = Unlimited)', node.params.subAgentMaxDepth, node.id, 'subAgentMaxDepth', { min: 0, step: 1 }) + controls.toggle('Allow sub-agents to spawn sub-agents', node.params.allowSubAgentsToSpawnSubAgents === true, node.id, 'allowSubAgentsToSpawnSubAgents', { onLabel: 'ON', offLabel: 'OFF', description: 'When enabled, temporary sub-agents may delegate work to their own temporary sub-agents.' })) +
                 '<div class="sampler-control-status">' + controls.status(node, 'Ready to orchestrate') + '</div>' +
                 '</div>';
         },
@@ -5550,7 +5573,11 @@ function unregisterGenerationSession(session) {
                 negativePromptEnabled: p.negativePromptEnabled === true,
                 imageCountOverride: controlPolicy.normalizeImageCountOverride(p.imageCountOverride),
                 imageEdit: preparedContext.imageEdit && typeof preparedContext.imageEdit === 'object' ? JSON.parse(JSON.stringify(preparedContext.imageEdit)) : null,
-                executionDisabled: browserContinuationBoundary
+                executionDisabled: browserContinuationBoundary,
+                subAgentsEnabled: true,
+                subAgentMaxDepth: normalizeSubAgentMaxDepth(p.subAgentMaxDepth),
+                allowSubAgentsToSpawnSubAgents: p.allowSubAgentsToSpawnSubAgents === true,
+                subAgentDelegationPolicyVersion: SUBAGENT_DELEGATION_POLICY_VERSION
             });
             if (!chatRuntime || typeof chatRuntime.streamChat !== 'function') throw new Error('Darkstar chat runtime is unavailable.');
             var chatRequest = {
@@ -11544,7 +11571,7 @@ function createNewProject() {
     syncProjectComposerGate();
     if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
     // Every project owns a Darkstar-managed workspace immediately. The backend
-    // creates ./projects/<project>/New Directory atomically and binds it here.
+    // creates <managed Darkstar-Projects>/<project>/New Directory atomically and binds it here.
     if (typeof provisionProjectWorkspace === 'function') {
         Darkstar.async.runBestEffort(function() { return provisionProjectWorkspace(projectId); }, 'PROJECTS');
     }
@@ -15341,6 +15368,7 @@ var chatTraceExpansionEnabled = false; function renderChat() {
         }
         if (fragment !== container) container.appendChild(fragment);
     } if (typeof restoreActiveGenerationUi === 'function') restoreActiveGenerationUi(tab);
+    if (Darkstar.subagents && typeof Darkstar.subagents.syncForTab === 'function') Darkstar.subagents.syncForTab(tab.id);
     if (typeof syncRenderedMessageActionVisibility === 'function') syncRenderedMessageActionVisibility(); syncChatTraceExpansionButton();
     if (typeof scheduleHeldTokenInspectionRefresh === 'function') scheduleHeldTokenInspectionRefresh();
 }
@@ -16278,6 +16306,434 @@ function setMessageAgentTimelineState(messageElement, state) {
     updateMessageAgentTimeline(messageElement, timeline);
 }
 // <DARKSTAR_SOURCE_END path="backend/renderer/chat.js">
+
+    // RENDERER MODULE :: backend/renderer/subagents.js
+    // <DARKSTAR_SOURCE_BEGIN path="backend/renderer/subagents.js">
+(function initializeSubAgentPanes(root) {
+    'use strict';
+
+    var Darkstar = root.Darkstar = root.Darkstar || {};
+    var records = new Map();
+    var horizontalScrollByTab = new Map();
+    var horizontalDetachedByTab = new Map();
+    var visibleTabId = null;
+    var horizontalViewportBound = null;
+    var horizontalScrollPointerActive = false;
+    var horizontalScrollIntentUntil = 0;
+    var previousHorizontalScrollLeft = 0;
+    var closeDelayMs = 520;
+    var nestedReturnFallbackCloseMs = 1800;
+    var errorCloseDelayMs = 900;
+
+    function viewport() { return document.getElementById('agentPaneViewport'); }
+    function track() { return document.getElementById('agentPaneTrack'); }
+    function mainHeader() { return document.getElementById('mainAgentPaneHeader'); }
+    function tabKey(value) {
+        if (value === undefined || value === null || value === '') return '';
+        return String(value);
+    }
+    function currentTabKey() {
+        if (visibleTabId !== null) return visibleTabId;
+        return typeof activeTabId === 'undefined' ? '' : tabKey(activeTabId);
+    }
+    function isAtRight(element) {
+        return Number(element.scrollWidth || 0) - Number(element.scrollLeft || 0) - Number(element.clientWidth || 0) < 30;
+    }
+    function setHorizontalDetached(tabId, detached) {
+        var key = tabKey(tabId);
+        if (!key) return;
+        horizontalDetachedByTab.set(key, detached === true);
+    }
+    function horizontalDetached(tabId) {
+        return horizontalDetachedByTab.get(tabKey(tabId)) === true;
+    }
+    function markHorizontalScrollIntent(durationMs) {
+        var duration = Number(durationMs);
+        if (!Number.isFinite(duration) || duration < 0) duration = 600;
+        horizontalScrollIntentUntil = Date.now() + duration;
+    }
+    function horizontalScrollIntentActive() {
+        return horizontalScrollPointerActive || Date.now() <= horizontalScrollIntentUntil;
+    }
+    function followRight(tabId, smooth) {
+        var key = tabKey(tabId);
+        var paneViewport = viewport();
+        if (!paneViewport || !key || currentTabKey() !== key || horizontalDetached(key)) return;
+        if (typeof paneViewport.scrollTo === 'function') paneViewport.scrollTo({ left: 2147483647, behavior: smooth === true ? 'smooth' : 'auto' });
+        else paneViewport.scrollLeft = 2147483647;
+    }
+    function bindHorizontalAutoscroll(paneViewport) {
+        if (!paneViewport || horizontalViewportBound === paneViewport || typeof paneViewport.addEventListener !== 'function') return;
+        horizontalViewportBound = paneViewport;
+        previousHorizontalScrollLeft = Number(paneViewport.scrollLeft) || 0;
+        paneViewport.addEventListener('pointerdown', function() { horizontalScrollPointerActive = true; markHorizontalScrollIntent(1200); }, { passive: true });
+        if (root && typeof root.addEventListener === 'function') root.addEventListener('pointerup', function() {
+            if (!horizontalScrollPointerActive) return;
+            horizontalScrollPointerActive = false;
+            markHorizontalScrollIntent(250);
+        }, { passive: true });
+        paneViewport.addEventListener('wheel', function(event) {
+            if (Math.abs(Number(event.deltaX) || 0) > 0 || event.shiftKey === true) markHorizontalScrollIntent(600);
+        }, { passive: true });
+        paneViewport.addEventListener('scroll', function() {
+            var current = Number(this.scrollLeft) || 0;
+            var key = currentTabKey();
+            if (isAtRight(this)) setHorizontalDetached(key, false);
+            else if (horizontalScrollIntentActive() && current < previousHorizontalScrollLeft - 1) setHorizontalDetached(key, true);
+            previousHorizontalScrollLeft = current;
+            if (key) horizontalScrollByTab.set(key, Math.max(0, current));
+        }, { passive: true });
+    }
+
+    function escapeLabel(value, fallback) {
+        var text = String(value || '').replace(/\s+/gu, ' ').trim();
+        return text || fallback || '';
+    }
+
+    function syncLayout(tabId) {
+        var activeKey = tabKey(tabId === undefined ? currentTabKey() : tabId);
+        var visibleCount = 0;
+        records.forEach(function(record) {
+            var visible = Boolean(activeKey && record.ownerTabId === activeKey);
+            if (record.pane) record.pane.hidden = !visible;
+            if (visible) visibleCount += 1;
+        });
+        var paneTrack = track();
+        var active = visibleCount > 0;
+        if (paneTrack) paneTrack.classList.toggle('has-subagents', active);
+        var header = mainHeader();
+        if (header) header.hidden = !active;
+        return visibleCount;
+    }
+
+    function syncForTab(tabId) {
+        var nextKey = tabKey(tabId);
+        var paneViewport = viewport();
+        bindHorizontalAutoscroll(paneViewport);
+        if (paneViewport && visibleTabId !== null && visibleTabId !== nextKey) horizontalScrollByTab.set(visibleTabId, Math.max(0, Number(paneViewport.scrollLeft) || 0));
+        visibleTabId = nextKey;
+        var visibleCount = syncLayout(nextKey);
+        if (!paneViewport) return;
+        var saved = horizontalScrollByTab.get(nextKey);
+        paneViewport.scrollLeft = Number.isFinite(Number(saved)) ? Math.max(0, Number(saved)) : 0;
+        previousHorizontalScrollLeft = Number(paneViewport.scrollLeft) || 0;
+        if (!horizontalDetached(nextKey) && visibleCount) followRight(nextKey, false);
+    }
+
+    function finalizeStreamingTimeline(record, status) {
+        record.timeline.forEach(function(segment) {
+            if (!segment || segment.state !== 'streaming') return;
+            segment.state = 'complete';
+            if (segment.status === 'running' || segment.status === 'preparing') segment.status = status || 'complete';
+        });
+    }
+
+    function updateTimeline(record) {
+        if (!record || !record.assistant || typeof updateMessageAgentTimeline !== 'function') return;
+        updateMessageAgentTimeline(record.assistant, record.timeline);
+    }
+
+    function answerElement(record) {
+        return record && record.assistant && record.assistant.querySelector
+            ? record.assistant.querySelector('.message-answer')
+            : null;
+    }
+
+    function renderAnswer(record, text, error) {
+        var answer = answerElement(record);
+        if (!answer) return;
+        var value = String(text || '');
+        if (error) {
+            answer.innerHTML = '<div class="message-error-banner">' + formatMessage(String(error)) + '</div>';
+            return;
+        }
+        answer.innerHTML = value ? formatMessage(value) : '<div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>';
+    }
+
+    function setStatus(record, label, state) {
+        if (!record) return;
+        if (record.status) record.status.textContent = label;
+        if (record.pane) {
+            record.pane.dataset.subagentState = state || '';
+            record.pane.classList.toggle('is-running', state === 'running');
+        }
+    }
+
+    function removeRecord(id, immediate) {
+        var record = records.get(String(id || ''));
+        if (!record) return;
+        records.delete(record.id);
+        if (record.closeTimer) clearTimeout(record.closeTimer);
+        function removePane() {
+            if (record.pane && record.pane.parentNode) record.pane.parentNode.removeChild(record.pane);
+            syncLayout();
+        }
+        if (immediate || !record.pane) {
+            removePane();
+            return;
+        }
+        record.pane.classList.add('is-closing');
+        setTimeout(removePane, 180);
+        syncLayout();
+    }
+
+    function scheduleClose(record, delay) {
+        if (!record) return;
+        if (record.closeTimer) clearTimeout(record.closeTimer);
+        record.closeTimer = setTimeout(function() { removeRecord(record.id, false); }, Math.max(0, Number(delay) || 0));
+    }
+
+    function releaseReturnedChildren(parentId) {
+        var target = String(parentId || '');
+        if (!target) return;
+        records.forEach(function(child) {
+            if (!child || child.parentId !== target || child.awaitingParentResume !== true) return;
+            child.awaitingParentResume = false;
+            scheduleClose(child, closeDelayMs);
+        });
+    }
+
+    function markReturnToImmediateParent(payload) {
+        var target = String(payload && payload.returnTo && payload.returnTo.id || '');
+        if (!target) return false;
+        var parent = records.get(target);
+        if (!parent) return false;
+        if (parent.closeTimer) {
+            clearTimeout(parent.closeTimer);
+            parent.closeTimer = null;
+        }
+        setStatus(parent, 'Child returned · resuming', 'running');
+        return true;
+    }
+
+    function createPane(metadata, owner) {
+        var id = String(metadata && metadata.id || '');
+        if (!id || records.has(id)) return records.get(id) || null;
+        var paneTrack = track();
+        if (!paneTrack) return null;
+
+        var pane = document.createElement('section');
+        pane.className = 'agent-pane subagent-pane is-running';
+        pane.dataset.subagentId = id;
+        pane.dataset.subagentState = 'running';
+        pane.setAttribute('aria-label', 'Sub-agent');
+
+        var header = document.createElement('header');
+        header.className = 'agent-pane-header subagent-pane-header';
+        var identity = document.createElement('div');
+        identity.className = 'agent-pane-identity';
+        var badge = document.createElement('span');
+        badge.className = 'agent-pane-badge';
+        badge.textContent = 'SUB-AGENT' + (Number(metadata.depth) > 1 ? ' · D' + String(Number(metadata.depth)) : '');
+        var title = document.createElement('span');
+        title.className = 'agent-pane-title';
+        title.textContent = escapeLabel(metadata.scope, escapeLabel(metadata.task, 'Delegated task'));
+        title.title = escapeLabel(metadata.scope, escapeLabel(metadata.task, 'Delegated task'));
+        identity.appendChild(badge);
+        identity.appendChild(title);
+        var status = document.createElement('span');
+        status.className = 'agent-pane-status';
+        status.textContent = 'Running';
+        header.appendChild(identity);
+        header.appendChild(status);
+
+        var chat = document.createElement('div');
+        chat.className = 'chat-container subagent-chat-container';
+        pane.appendChild(header);
+        pane.appendChild(chat);
+        paneTrack.appendChild(pane);
+
+        var task = escapeLabel(metadata.task, 'Delegated task');
+        if (typeof addMessage === 'function') addMessage({ role: 'user', content: task, messageIndex: -1, renderTarget: chat, deferEffects: true });
+        var assistant = typeof addMessage === 'function'
+            ? addMessage({ role: 'assistant', content: '', isTyping: true, messageIndex: -1, renderTarget: chat, deferEffects: true })
+            : null;
+        if (assistant) assistant.classList.add('subagent-transient-message');
+
+        var record = {
+            id: id,
+            parentId: String(metadata && metadata.parentId || ''),
+            depth: Math.max(1, Number(metadata && metadata.depth) || 1),
+            ownerRequestId: String(owner && owner.requestId || metadata.rootRequestId || ''),
+            ownerTabId: tabKey(owner && owner.tabId !== undefined && owner.tabId !== null ? owner.tabId : metadata.tabId),
+            awaitingParentResume: false,
+            pane: pane,
+            chat: chat,
+            assistant: assistant,
+            status: status,
+            timeline: [],
+            working: [],
+            timelineSequence: 0,
+            responseText: '',
+            currentRound: 0,
+            closeTimer: null,
+        };
+        records.set(id, record);
+        syncLayout();
+        if (record.ownerTabId === currentTabKey() && !horizontalDetached(record.ownerTabId)) {
+            var schedule = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : function(callback) { return setTimeout(callback, 0); };
+            schedule(function() { followRight(record.ownerTabId, true); });
+        }
+        return record;
+    }
+
+    function reasoningSegment(record, round) {
+        var id = record.id + '-reasoning-' + String(round || 1);
+        var segment = record.timeline.find(function(item) { return item && item.id === id; });
+        if (!segment) {
+            segment = { id: id, type: 'reasoning', content: '', state: 'streaming', status: 'running', round: round || 1 };
+            record.timeline.push(segment);
+        }
+        return segment;
+    }
+
+    function handleChunk(record, payload) {
+        releaseReturnedChildren(record.id);
+        setStatus(record, 'Running', 'running');
+        var chunk = payload && payload.chunk && typeof payload.chunk === 'object' ? payload.chunk : {};
+        var round = Math.max(1, Number(chunk.agentRound) || record.currentRound || 1);
+        if (payload.type === 'subagent-round-start' || chunk.roundStart === true) {
+            finalizeStreamingTimeline(record, 'complete');
+            record.currentRound = round;
+            record.responseText = '';
+            renderAnswer(record, '');
+            updateTimeline(record);
+            return;
+        }
+        record.currentRound = round;
+        if (typeof chunk.reasoning === 'string' && chunk.reasoning) {
+            reasoningSegment(record, round).content += chunk.reasoning;
+            updateTimeline(record);
+        }
+        if (typeof chunk.content === 'string' && chunk.content) {
+            record.responseText += chunk.content;
+            renderAnswer(record, record.responseText);
+        }
+        if (record.chat) record.chat.scrollTop = record.chat.scrollHeight;
+    }
+
+    function handleNestedToolEvent(record, nested) {
+        if (!nested || typeof nested !== 'object') return;
+        if ((nested.type === 'complete' || nested.type === 'error') && nested.activity && String(nested.activity.name || '') === 'spawn_subagent') {
+            releaseReturnedChildren(record.id);
+            setStatus(record, 'Running', 'running');
+        }
+        var service = Darkstar.chatRuntime;
+        if (!service) return;
+        finalizeStreamingTimeline(record, 'complete');
+        if (nested.preparation && typeof service.applyPreparationEventToTimeline === 'function') {
+            service.applyPreparationEventToTimeline(record.timeline, nested);
+        }
+        if (nested.activity) {
+            if (typeof service.upsertWorkingActivity === 'function') service.upsertWorkingActivity(record.working, nested.activity);
+            if (typeof service.applyToolEventToTimeline === 'function') service.applyToolEventToTimeline(record.timeline, nested);
+        }
+        if (nested.type === 'tool-call-fresh-retry' && typeof service.discardFreshRetryPreparation === 'function') {
+            service.discardFreshRetryPreparation(record.timeline, nested);
+        }
+        if (nested.type === 'context-image' && typeof service.ensureImageTimelineSegment === 'function') {
+            var ensured = service.ensureImageTimelineSegment(record.timeline, nested, record.timelineSequence);
+            record.timelineSequence = ensured && Number.isFinite(Number(ensured.sequence)) ? Number(ensured.sequence) : record.timelineSequence;
+        }
+        updateTimeline(record);
+    }
+
+    function handleToolEvent(payload, owner) {
+        if (!payload || !/^subagent-/u.test(String(payload.type || ''))) return false;
+        if (payload.type === 'subagent-return') return markReturnToImmediateParent(payload) || true;
+        var metadata = payload.subAgent && typeof payload.subAgent === 'object' ? payload.subAgent : {};
+        var id = String(metadata.id || '');
+        if (!id) return false;
+        var record = records.get(id);
+        if (payload.type === 'subagent-start') {
+            createPane(metadata, owner);
+            return true;
+        }
+        if (!record) record = createPane(metadata, owner);
+        if (!record) return false;
+
+        if (payload.type === 'subagent-round-start' || payload.type === 'subagent-chunk') {
+            handleChunk(record, payload);
+            return true;
+        }
+        if (payload.type === 'subagent-tool-event') {
+            handleNestedToolEvent(record, payload.event);
+            return true;
+        }
+        if (payload.type === 'subagent-complete') {
+            releaseReturnedChildren(record.id);
+            finalizeStreamingTimeline(record, 'complete');
+            record.responseText = String(payload.output || record.responseText || '');
+            renderAnswer(record, record.responseText);
+            updateTimeline(record);
+            if (record.parentId && records.has(record.parentId)) {
+                record.awaitingParentResume = true;
+                setStatus(record, 'Returned to parent', 'complete');
+                scheduleClose(record, nestedReturnFallbackCloseMs);
+            } else {
+                setStatus(record, 'Done', 'complete');
+                scheduleClose(record, closeDelayMs);
+            }
+            return true;
+        }
+        if (payload.type === 'subagent-error') {
+            releaseReturnedChildren(record.id);
+            finalizeStreamingTimeline(record, 'error');
+            updateTimeline(record);
+            renderAnswer(record, '', payload.error || 'Sub-agent failed.');
+            if (record.parentId && records.has(record.parentId)) {
+                record.awaitingParentResume = true;
+                setStatus(record, 'Failed · returned to parent', 'error');
+                scheduleClose(record, nestedReturnFallbackCloseMs);
+            } else {
+                setStatus(record, 'Failed', 'error');
+                scheduleClose(record, errorCloseDelayMs);
+            }
+            return true;
+        }
+        return true;
+    }
+
+    function closeForRequest(requestId) {
+        var target = String(requestId || '');
+        Array.from(records.values()).forEach(function(record) {
+            if (!target || record.ownerRequestId === target) removeRecord(record.id, true);
+        });
+        syncLayout();
+    }
+
+    function closeForTab(tabId) {
+        var target = tabKey(tabId);
+        Array.from(records.values()).forEach(function(record) {
+            if (target && record.ownerTabId === target) removeRecord(record.id, true);
+        });
+        if (target) { horizontalScrollByTab.delete(target); horizontalDetachedByTab.delete(target); }
+        syncLayout();
+    }
+
+    function closeAll() {
+        horizontalScrollByTab.clear();
+        horizontalDetachedByTab.clear();
+        visibleTabId = null;
+        closeForRequest('');
+    }
+
+    Darkstar.subagents = Object.freeze({
+        handleToolEvent: handleToolEvent,
+        syncForTab: syncForTab,
+        closeForRequest: closeForRequest,
+        closeForTab: closeForTab,
+        closeAll: closeAll,
+        activeCount: function(tabId) {
+            if (tabId === undefined || tabId === null) return records.size;
+            var target = tabKey(tabId);
+            var count = 0;
+            records.forEach(function(record) { if (record.ownerTabId === target) count += 1; });
+            return count;
+        },
+    });
+})(globalThis);
+// <DARKSTAR_SOURCE_END path="backend/renderer/subagents.js">
     // --------------------------------------------------------------------------
     // [9800] COMPOSER + UI STATE :: tokens, controls, queue, tabs, server, params and images
     // --------------------------------------------------------------------------
@@ -18083,6 +18539,7 @@ function closeTab(tabId) {
     if (typeof scheduleChatSessionSave === 'function') scheduleChatSessionSave(0);
     if (typeof discardQueuedGenerationForTab === 'function') discardQueuedGenerationForTab(tabId);
     if (typeof discardScheduledMessagesForTab === 'function') discardScheduledMessagesForTab(tabId);
+    if (Darkstar.subagents && typeof Darkstar.subagents.closeForTab === 'function') Darkstar.subagents.closeForTab(tabId);
     playUiSound('tabClose');
     // Animate the tab closing
     const tabBar = document.getElementById('tabBar');
@@ -19058,6 +19515,7 @@ function cancelGenerationSession(session, reason, options) {
     session.cancelReason = String(reason || 'cancelled');
     if (typeof darkstarDiagnosticEvent === 'function') darkstarDiagnosticEvent('generation:session', 'cancelled', { requestId: session.requestId || null, sessionId: Number(session.id) || null, tabId: Number(session.tabId), reason: session.cancelReason, phase: session.phase || null });
     if (typeof session.closeRendering === 'function') session.closeRendering();
+    if (Darkstar.subagents && typeof Darkstar.subagents.closeForRequest === 'function') Darkstar.subagents.closeForRequest(session.requestId);
     if (!session.controller.signal.aborted) {
         try { session.controller.abort(session.cancelReason); } catch (_) { session.controller.abort(); }
     }
@@ -20003,6 +20461,9 @@ async function sendMessage(regenerateFromIndex, options) {
         },
         onToolEvent: function(payload, working, timeline, toolContext) {
             if (!generationSessionIsCurrent(session)) return;
+            if (Darkstar.subagents && typeof Darkstar.subagents.handleToolEvent === 'function') {
+                Darkstar.subagents.handleToolEvent(payload, { requestId: session.requestId, tabId: session.tabId });
+            }
             var wasToolPhase = session.phase === 'tool', imagePhase = payload && payload.imageGeneration && typeof payload.imageGeneration === 'object' ? String(payload.imageGeneration.phase || '') : '';
             var imagePhaseChanged = Boolean(imagePhase && imagePhase !== session.imageGenerationPhase); if (imagePhase) session.imageGenerationPhase = imagePhase;
             if (payload && payload.type === 'browser-compartment-activated') session.browserCompartmentActivated = true; if (payload && payload.type === 'start' && payload.activity && typeof globalThis.openBrowserWorkspaceForTool === 'function') Darkstar.async.runBestEffort(function() { return globalThis.openBrowserWorkspaceForTool(payload.activity.name, session.tabId); }, 'BROWSER_WORKSPACE');
@@ -20012,6 +20473,7 @@ async function sendMessage(regenerateFromIndex, options) {
                 session.phase = 'tool'; session.lastModelOutputKind = 'tool';
             }
             if (Array.isArray(timeline)) session.agentTimeline = generationTimelineWithCompactionPrelude(session, timeline);
+            scheduleReasoningBoundarySave(session.agentTimeline);
             if (session.tabId === activeTabId && ((!wasToolPhase && session.phase === 'tool') || imagePhaseChanged)) generationUi.queueTimelineBoundary(session.agentTimeline);
             if (toolEventIsPersistenceBoundary(payload) && typeof scheduleChatSessionSave === 'function') {
                 scheduleChatSessionSave(0);
@@ -20276,6 +20738,7 @@ async function sendMessage(regenerateFromIndex, options) {
     }
     if (!generationSessionIsRegistered(session)) return;
     traceGenerationUnregistering(session, tab);
+    if (Darkstar.subagents && typeof Darkstar.subagents.closeForRequest === 'function') Darkstar.subagents.closeForRequest(session.requestId);
     if (typeof unregisterGenerationSession === 'function') unregisterGenerationSession(session);
     else {
         activeGenerationSession = null;

@@ -7,7 +7,7 @@ Core monolith:     backend/Darkstar_Core.js
 Renderer monolith: backend/Darkstar_Renderer.js
 Test monolith:     backend/Dev/Darkstar_Tests.js (development-only)
 
-Derived snapshot: Core 29,104 lines / 140 logical modules; Renderer 23,579 lines / 72 logical modules.
+Derived snapshot: Core 29,481 lines / 142 logical modules; Renderer 24,125 lines / 73 logical modules.
 These totals are informational only; the exact navigation ranges below are mechanically derived from source markers.
 
 TASK ROUTING
@@ -61,48 +61,48 @@ CORE CATEGORY MAP
 -----------------
 1000  lines 138-140  FOUNDATION :: Core data, persistence, protocol, preferences, workflow and workspace
 1100  lines 141-565  STORAGE CORE :: chat codec, filesystem paths, atomic persistence
-1200  lines 566-1,984  PREFERENCES :: session stores, protected payloads, theme/dialog state
-1300  lines 1,985-2,144  PROTOCOL :: IPC channels and trusted document URLs
-1400  lines 2,145-2,450  WORKFLOW STORAGE :: files, sanitation and snapshot codec
-1500  lines 2,451-2,910  WORKSPACE :: project-scoped filesystem containment
-2000  lines 2,911-2,913  APPLICATION :: Electron application composition, shell and security boundaries
-2100  lines 2,914-3,476  APPLICATION FOUNDATION :: branding and diagnostics
-2200  lines 3,477-3,704  WINDOW + LAYOUT :: BrowserWindow security and project paths
-2300  lines 3,705-4,334  APPLICATION COMPOSITION :: main lifecycle, runtime icon and services
-2400  lines 4,335-4,768  ELECTRON SHELL ROLES :: main dispatch and sandboxed preload bridge
-3000  lines 4,769-4,771  RUNTIME :: llama.cpp, model lifecycle, generation transport, token/context runtime and vision
-3100  lines 4,772-5,252  LLAMA RUNTIME FACADE :: stable orchestration surface
-3200  lines 5,253-6,924  GENERATION CORE :: agent loop, completion and request normalization
-3300  lines 6,925-9,093  MODEL CORE :: GGUF metadata, GPUs, lifecycle and inventory
-3400  lines 9,094-9,660  CONTEXT + MTP :: MTP capability, native context usage and normalization
-3500  lines 9,661-11,788  SERVER + STREAM INFRASTRUCTURE :: parallelism, processes and server lifecycle
-3600  lines 11,789-12,969  MODEL-FACING PROTOCOL :: skills, streams, tokens and tool-call parsing
-3700  lines 12,970-13,097  VISION :: projector discovery and validation
-4000  lines 13,098-13,100  AGENT :: Agent harness, tools, skills, Python providers and tool execution
-4100  lines 13,101-14,580  AGENT HARNESS + BUILTINS :: Application Interface, files, terminals and UI tools
-4200  lines 14,581-15,398  PYTHON TOOL HOSTING :: environment, providers, inspection and process host
-4300  lines 15,399-16,159  SKILLS :: parsing, discovery and support
-4400  lines 16,160-17,079  TOOL CORE :: runtime, schema and ToolService ownership
-5000  lines 17,080-17,082  BROWSER :: embedded/offline browser and online browser host/control
-5100  lines 17,083-18,141  BROWSER CONTROL :: model-facing control and hybrid ownership
-5200  lines 18,142-19,870  OFFLINE BROWSER :: network-denied local browser service
-5300  lines 19,871-21,185  ONLINE BROWSER :: client, control and host
-5400  lines 21,186-21,738  BROWSER POLICY + TABS :: egress policy and per-chat identity
-6000  lines 21,739-21,741  APPLICATION INTERFACE :: Application discovery, Chromium, UIA and memory interfaces
-6100  lines 21,742-22,735  CHROMIUM INTERFACE :: CDP, accessibility and Chromium control
-6200  lines 22,736-23,453  DISCOVERY + MEMORY :: capability-ranked targets and process memory
-6300  lines 23,454-24,542  WINDOWS UI AUTOMATION :: UIA service and native bridges
-7000  lines 24,543-24,545  IPC :: Trusted Electron IPC registration and channel adapters
-7100  lines 24,546-25,060  IPC CORE :: error normalization, agent and application adapters
-7200  lines 25,061-25,535  CHAT + LLAMA IPC :: sessions and generation/runtime channels
-7300  lines 25,536-25,815  CAPABILITY IPC :: browser, plugins, UI and Application Interface
-7400  lines 25,816-25,891  IPC TRUST BOUNDARY :: trusted sender validation
-8000  lines 25,892-25,894  PLUGINS :: Custom-node discovery, bundled API model plugin and template
-8100  lines 25,895-26,120  PLUGIN MANAGER :: discovery and trusted dispatch
-8200  lines 26,121-27,030  BUNDLED API MODEL PLUGIN :: backend adapters and streaming
-8500  lines 27,031-27,033  DEVELOPMENT :: Launcher, build, source verification and audits
-8510  lines 27,034-29,059  BUILD + VERIFICATION TOOLING :: packaging, audits, launch and source checks
-13000  lines 29,060-29,104  CORE ENTRYPOINT DISPATCH :: Node CLI, Electron main and sandboxed preload
+1200  lines 566-1,985  PREFERENCES :: session stores, protected payloads, theme/dialog state
+1300  lines 1,986-2,145  PROTOCOL :: IPC channels and trusted document URLs
+1400  lines 2,146-2,453  WORKFLOW STORAGE :: files, sanitation and snapshot codec
+1500  lines 2,454-2,913  WORKSPACE :: project-scoped filesystem containment
+2000  lines 2,914-2,916  APPLICATION :: Electron application composition, shell and security boundaries
+2100  lines 2,917-3,479  APPLICATION FOUNDATION :: branding and diagnostics
+2200  lines 3,480-3,980  WINDOW + LAYOUT :: BrowserWindow security and project paths
+2300  lines 3,981-4,501  APPLICATION COMPOSITION :: main lifecycle, runtime icon and services
+2400  lines 4,502-4,842  ELECTRON SHELL ROLES :: main dispatch and sandboxed preload bridge
+3000  lines 4,843-4,845  RUNTIME :: llama.cpp, model lifecycle, generation transport, token/context runtime and vision
+3100  lines 4,846-5,327  LLAMA RUNTIME FACADE :: stable orchestration surface
+3200  lines 5,328-7,160  GENERATION CORE :: agent loop, completion and request normalization
+3300  lines 7,161-9,329  MODEL CORE :: GGUF metadata, GPUs, lifecycle and inventory
+3400  lines 9,330-9,896  CONTEXT + MTP :: MTP capability, native context usage and normalization
+3500  lines 9,897-12,024  SERVER + STREAM INFRASTRUCTURE :: parallelism, processes and server lifecycle
+3600  lines 12,025-13,205  MODEL-FACING PROTOCOL :: skills, streams, tokens and tool-call parsing
+3700  lines 13,206-13,333  VISION :: projector discovery and validation
+4000  lines 13,334-13,336  AGENT :: Agent harness, tools, skills, Python providers and tool execution
+4100  lines 13,337-14,969  AGENT HARNESS + BUILTINS :: Application Interface, files, terminals and UI tools
+4200  lines 14,970-15,787  PYTHON TOOL HOSTING :: environment, providers, inspection and process host
+4300  lines 15,788-16,548  SKILLS :: parsing, discovery and support
+4400  lines 16,549-17,485  TOOL CORE :: runtime, schema and ToolService ownership
+5000  lines 17,486-17,488  BROWSER :: embedded/offline browser and online browser host/control
+5100  lines 17,489-18,547  BROWSER CONTROL :: model-facing control and hybrid ownership
+5200  lines 18,548-20,276  OFFLINE BROWSER :: network-denied local browser service
+5300  lines 20,277-21,591  ONLINE BROWSER :: client, control and host
+5400  lines 21,592-22,144  BROWSER POLICY + TABS :: egress policy and per-chat identity
+6000  lines 22,145-22,147  APPLICATION INTERFACE :: Application discovery, Chromium, UIA and memory interfaces
+6100  lines 22,148-23,141  CHROMIUM INTERFACE :: CDP, accessibility and Chromium control
+6200  lines 23,142-23,859  DISCOVERY + MEMORY :: capability-ranked targets and process memory
+6300  lines 23,860-24,948  WINDOWS UI AUTOMATION :: UIA service and native bridges
+7000  lines 24,949-24,951  IPC :: Trusted Electron IPC registration and channel adapters
+7100  lines 24,952-25,464  IPC CORE :: error normalization, agent and application adapters
+7200  lines 25,465-25,939  CHAT + LLAMA IPC :: sessions and generation/runtime channels
+7300  lines 25,940-26,219  CAPABILITY IPC :: browser, plugins, UI and Application Interface
+7400  lines 26,220-26,295  IPC TRUST BOUNDARY :: trusted sender validation
+8000  lines 26,296-26,298  PLUGINS :: Custom-node discovery, bundled API model plugin and template
+8100  lines 26,299-26,524  PLUGIN MANAGER :: discovery and trusted dispatch
+8200  lines 26,525-27,434  BUNDLED API MODEL PLUGIN :: backend adapters and streaming
+8500  lines 27,435-27,437  DEVELOPMENT :: Launcher, build, source verification and audits
+8510  lines 27,438-29,439  BUILD + VERIFICATION TOOLING :: packaging, audits, launch and source checks
+13000  lines 29,440-29,481  CORE ENTRYPOINT DISPATCH :: Node CLI, Electron main and sandboxed preload
 
 CORE DETAILED LOGICAL MODULE MAP
 --------------------------------
@@ -113,187 +113,191 @@ CORE DETAILED LOGICAL MODULE MAP
   lines 386-515  backend/persistence/binary-envelope.js
   lines 519-563  backend/project/project-storage.js
 [1200] PREFERENCES :: session stores, protected payloads, theme/dialog state
-  lines 570-1,233  backend/preferences/chat-session-store.js
-  lines 1,237-1,336  backend/preferences/dialog-location-store.js
-  lines 1,340-1,442  backend/preferences/local-model-history-store.js
-  lines 1,446-1,549  backend/preferences/protected-payload.js
-  lines 1,553-1,646  backend/preferences/window-theme.js
-  lines 1,650-1,982  backend/preferences/workflow-session-store.js
+  lines 570-1,234  backend/preferences/chat-session-store.js
+  lines 1,238-1,337  backend/preferences/dialog-location-store.js
+  lines 1,341-1,443  backend/preferences/local-model-history-store.js
+  lines 1,447-1,550  backend/preferences/protected-payload.js
+  lines 1,554-1,647  backend/preferences/window-theme.js
+  lines 1,651-1,983  backend/preferences/workflow-session-store.js
 [1300] PROTOCOL :: IPC channels and trusted document URLs
-  lines 1,989-2,123  backend/protocol/channels.js
-  lines 2,127-2,142  backend/protocol/document-url.js
+  lines 1,990-2,124  backend/protocol/channels.js
+  lines 2,128-2,143  backend/protocol/document-url.js
 [1400] WORKFLOW STORAGE :: files, sanitation and snapshot codec
-  lines 2,149-2,276  backend/workflow/workflow-files.js
-  lines 2,280-2,359  backend/workflow/workflow-sanitizer.js
-  lines 2,363-2,448  backend/workflow/workflow-snapshot-codec.js
+  lines 2,150-2,279  backend/workflow/workflow-files.js
+  lines 2,283-2,362  backend/workflow/workflow-sanitizer.js
+  lines 2,366-2,451  backend/workflow/workflow-snapshot-codec.js
 [1500] WORKSPACE :: project-scoped filesystem containment
-  lines 2,455-2,908  backend/workspace/workspace-service.js
+  lines 2,458-2,911  backend/workspace/workspace-service.js
 [2100] APPLICATION FOUNDATION :: branding and diagnostics
-  lines 2,918-2,996  backend/app/brand-migration.js
-  lines 3,000-3,373  backend/app/crash-diagnostics.js
-  lines 3,377-3,474  backend/app/diagnostics-path.js
+  lines 2,921-2,999  backend/app/brand-migration.js
+  lines 3,003-3,376  backend/app/crash-diagnostics.js
+  lines 3,380-3,477  backend/app/diagnostics-path.js
 [2200] WINDOW + LAYOUT :: BrowserWindow security and project paths
-  lines 3,481-3,654  backend/app/main-window.js
-  lines 3,658-3,702  backend/app/project-layout.js
+  lines 3,484-3,657  backend/app/main-window.js
+  lines 3,661-3,705  backend/app/project-layout.js
+  lines 3,709-3,845  backend/app/managed-project-storage.js
+  lines 3,849-3,978  backend/app/managed-workflow-storage.js
 [2300] APPLICATION COMPOSITION :: main lifecycle, runtime icon and services
-  lines 3,709-4,129  backend/app/run-main-app.js
-  lines 4,133-4,228  backend/app/runtime-icon.js
-  lines 4,232-4,332  backend/app/services.js
+  lines 3,985-4,296  backend/app/run-main-app.js
+  lines 4,300-4,395  backend/app/runtime-icon.js
+  lines 4,399-4,499  backend/app/services.js
 [2400] ELECTRON SHELL ROLES :: main dispatch and sandboxed preload bridge
-  lines 4,339-4,408  backend/shell/main.js
-  lines 4,505-4,766  backend/shell/preload.js
+  lines 4,506-4,575  backend/shell/main.js
+  lines 4,579-4,840  backend/shell/preload.js
 [3100] LLAMA RUNTIME FACADE :: stable orchestration surface
-  lines 4,776-4,805  backend/runtime/runtime-status.js
-  lines 4,809-4,846  backend/runtime/model-selection-service.js
-  lines 4,850-5,250  backend/llama-runtime.js
+  lines 4,850-4,879  backend/runtime/runtime-status.js
+  lines 4,883-4,920  backend/runtime/model-selection-service.js
+  lines 4,924-5,325  backend/llama-runtime.js
 [3200] GENERATION CORE :: agent loop, completion and request normalization
-  lines 5,257-6,217  backend/runtime/agent-loop.js
-  lines 6,221-6,268  backend/runtime/server-stream.js
-  lines 6,272-6,417  backend/runtime/generation-diagnostics.js
-  lines 6,421-6,709  backend/runtime/chat-completion.js
-  lines 6,713-6,902  backend/runtime/chat-request.js
-  lines 6,906-6,922  backend/runtime/constants.js
+  lines 5,332-6,453  backend/runtime/agent-loop.js
+  lines 6,457-6,504  backend/runtime/server-stream.js
+  lines 6,508-6,653  backend/runtime/generation-diagnostics.js
+  lines 6,657-6,945  backend/runtime/chat-completion.js
+  lines 6,949-7,138  backend/runtime/chat-request.js
+  lines 7,142-7,158  backend/runtime/constants.js
 [3300] MODEL CORE :: GGUF metadata, GPUs, lifecycle and inventory
-  lines 6,929-7,360  backend/runtime/gguf-metadata.js
-  lines 7,364-7,584  backend/runtime/gpu-devices.js
-  lines 7,588-8,023  backend/runtime/model-lifecycle.js
-  lines 8,027-8,347  backend/runtime/external-work-lifecycle.js
-  lines 8,351-8,435  backend/runtime/model-idle-unload.js
-  lines 8,439-8,656  backend/runtime/model-filesystem.js
-  lines 8,660-8,910  backend/runtime/models.js
-  lines 8,914-9,091  backend/runtime/model-directory-monitor.js
+  lines 7,165-7,596  backend/runtime/gguf-metadata.js
+  lines 7,600-7,820  backend/runtime/gpu-devices.js
+  lines 7,824-8,259  backend/runtime/model-lifecycle.js
+  lines 8,263-8,583  backend/runtime/external-work-lifecycle.js
+  lines 8,587-8,671  backend/runtime/model-idle-unload.js
+  lines 8,675-8,892  backend/runtime/model-filesystem.js
+  lines 8,896-9,146  backend/runtime/models.js
+  lines 9,150-9,327  backend/runtime/model-directory-monitor.js
 [3400] CONTEXT + MTP :: MTP capability, native context usage and normalization
-  lines 9,098-9,426  backend/runtime/mtp.js
-  lines 9,431-9,624  backend/runtime/native-context-usage.js
-  lines 9,628-9,658  backend/runtime/normalize.js
+  lines 9,334-9,662  backend/runtime/mtp.js
+  lines 9,667-9,860  backend/runtime/native-context-usage.js
+  lines 9,864-9,894  backend/runtime/normalize.js
 [3500] SERVER + STREAM INFRASTRUCTURE :: parallelism, processes and server lifecycle
-  lines 9,665-9,924  backend/runtime/parallel-streams.js
-  lines 9,928-10,124  backend/runtime/png-rgba.js
-  lines 10,129-10,966  backend/runtime/diffusion-runtime.js
-  lines 10,970-11,104  backend/runtime/process-utils.js
-  lines 11,108-11,428  backend/runtime/server-config.js
-  lines 11,432-11,507  backend/runtime/server-io.js
-  lines 11,511-11,572  backend/runtime/backend-selection.js
-  lines 11,576-11,786  backend/runtime/server-process.js
+  lines 9,901-10,160  backend/runtime/parallel-streams.js
+  lines 10,164-10,360  backend/runtime/png-rgba.js
+  lines 10,365-11,202  backend/runtime/diffusion-runtime.js
+  lines 11,206-11,340  backend/runtime/process-utils.js
+  lines 11,344-11,664  backend/runtime/server-config.js
+  lines 11,668-11,743  backend/runtime/server-io.js
+  lines 11,747-11,808  backend/runtime/backend-selection.js
+  lines 11,812-12,022  backend/runtime/server-process.js
 [3600] MODEL-FACING PROTOCOL :: skills, streams, tokens and tool-call parsing
-  lines 11,793-11,865  backend/runtime/skill-catalog.js
-  lines 11,869-12,119  backend/runtime/streaming.js
-  lines 12,123-12,373  backend/runtime/tokens.js
-  lines 12,377-12,531  backend/runtime/tool-call-state.js
-  lines 12,535-12,708  backend/runtime/tool-call-stream.js
-  lines 12,712-12,839  backend/runtime/tool-preparation-tracker.js
-  lines 12,843-12,967  backend/runtime/tool-schema-compat.js
+  lines 12,029-12,101  backend/runtime/skill-catalog.js
+  lines 12,105-12,355  backend/runtime/streaming.js
+  lines 12,359-12,609  backend/runtime/tokens.js
+  lines 12,613-12,767  backend/runtime/tool-call-state.js
+  lines 12,771-12,944  backend/runtime/tool-call-stream.js
+  lines 12,948-13,075  backend/runtime/tool-preparation-tracker.js
+  lines 13,079-13,203  backend/runtime/tool-schema-compat.js
 [3700] VISION :: projector discovery and validation
-  lines 12,974-13,095  backend/vision/projector-service.js
+  lines 13,210-13,331  backend/vision/projector-service.js
 [4100] AGENT HARNESS + BUILTINS :: Application Interface, files, terminals and UI tools
-  lines 13,105-13,232  backend/agent/permission-policy.js
-  lines 13,236-13,430  backend/agent/filesystem-access-policy.js
-  lines 13,434-13,677  backend/agent/attention-request-service.js
-  lines 13,681-13,782  backend/agent/attention-actions.js
-  lines 13,786-13,826  backend/agent/application-interface-harness.js
-  lines 13,830-13,868  backend/agent/asset-paths.js
-  lines 13,872-14,045  backend/agent/builtin/file-tools.js
-  lines 14,049-14,264  backend/agent/builtin/terminal-tools.js
-  lines 14,268-14,321  backend/agent/builtin/uip-memory-tool.js
-  lines 14,325-14,503  backend/agent/builtin/uip-tools.js
-  lines 14,507-14,578  backend/agent/module-tool-loader.js
+  lines 13,341-13,468  backend/agent/permission-policy.js
+  lines 13,472-13,666  backend/agent/filesystem-access-policy.js
+  lines 13,670-13,913  backend/agent/attention-request-service.js
+  lines 13,917-14,018  backend/agent/attention-actions.js
+  lines 14,022-14,062  backend/agent/application-interface-harness.js
+  lines 14,066-14,104  backend/agent/asset-paths.js
+  lines 14,108-14,281  backend/agent/builtin/file-tools.js
+  lines 14,285-14,500  backend/agent/builtin/terminal-tools.js
+  lines 14,504-14,557  backend/agent/builtin/uip-memory-tool.js
+  lines 14,561-14,739  backend/agent/builtin/uip-tools.js
+  lines 14,743-14,892  backend/agent/builtin/subagent-tool.js
+  lines 14,896-14,967  backend/agent/module-tool-loader.js
 [4200] PYTHON TOOL HOSTING :: environment, providers, inspection and process host
-  lines 14,585-14,640  backend/agent/python-command.js
-  lines 14,644-14,896  backend/agent/python-environment.js
-  lines 14,900-14,994  backend/agent/python-provider-registry.js
-  lines 14,998-15,049  backend/agent/python-provider.js
-  lines 15,053-15,259  backend/agent/python-tool-host.js
-  lines 15,263-15,359  backend/agent/python-tool-inspector.js
-  lines 15,363-15,396  backend/agent/safe-environment.js
+  lines 14,974-15,029  backend/agent/python-command.js
+  lines 15,033-15,285  backend/agent/python-environment.js
+  lines 15,289-15,383  backend/agent/python-provider-registry.js
+  lines 15,387-15,438  backend/agent/python-provider.js
+  lines 15,442-15,648  backend/agent/python-tool-host.js
+  lines 15,652-15,748  backend/agent/python-tool-inspector.js
+  lines 15,752-15,785  backend/agent/safe-environment.js
 [4300] SKILLS :: parsing, discovery and support
-  lines 15,403-15,766  backend/agent/skill-parser.js
-  lines 15,770-15,993  backend/agent/skill-service.js
-  lines 15,997-16,157  backend/agent/skill-support.js
+  lines 15,792-16,155  backend/agent/skill-parser.js
+  lines 16,159-16,382  backend/agent/skill-service.js
+  lines 16,386-16,546  backend/agent/skill-support.js
 [4400] TOOL CORE :: runtime, schema and ToolService ownership
-  lines 16,164-16,265  backend/agent/image-generation-action.js
-  lines 16,269-16,304  backend/agent/presentation-image-action.js
-  lines 16,308-16,537  backend/agent/tool-runtime.js
-  lines 16,541-16,676  backend/agent/tool-schema.js
-  lines 16,680-16,794  backend/agent/tool-capabilities.js
-  lines 16,798-17,077  backend/agent/tool-service.js
+  lines 16,553-16,654  backend/agent/image-generation-action.js
+  lines 16,658-16,693  backend/agent/presentation-image-action.js
+  lines 16,697-16,926  backend/agent/tool-runtime.js
+  lines 16,930-17,065  backend/agent/tool-schema.js
+  lines 17,069-17,183  backend/agent/tool-capabilities.js
+  lines 17,187-17,483  backend/agent/tool-service.js
 [5100] BROWSER CONTROL :: model-facing control and hybrid ownership
-  lines 17,087-17,246  backend/browser/browser-input-actions.js
-  lines 17,250-17,817  backend/browser/browser-agent-control.js
-  lines 17,821-18,139  backend/browser/hybrid-browser-service.js
+  lines 17,493-17,652  backend/browser/browser-input-actions.js
+  lines 17,656-18,223  backend/browser/browser-agent-control.js
+  lines 18,227-18,545  backend/browser/hybrid-browser-service.js
 [5200] OFFLINE BROWSER :: network-denied local browser service
-  lines 18,146-19,868  backend/browser/offline-browser-service.js
+  lines 18,552-20,274  backend/browser/offline-browser-service.js
 [5300] ONLINE BROWSER :: client, control and host
-  lines 19,875-20,107  backend/browser/online-browser-client.js
-  lines 20,111-20,399  backend/browser/online-browser-control.js
-  lines 20,403-21,183  backend/browser/online-browser-host.js
+  lines 20,281-20,513  backend/browser/online-browser-client.js
+  lines 20,517-20,805  backend/browser/online-browser-control.js
+  lines 20,809-21,589  backend/browser/online-browser-host.js
 [5400] BROWSER POLICY + TABS :: egress policy and per-chat identity
-  lines 21,190-21,493  backend/browser/online-network-policy.js
-  lines 21,497-21,736  backend/browser/tabbed-browser-service.js
+  lines 21,596-21,899  backend/browser/online-network-policy.js
+  lines 21,903-22,142  backend/browser/tabbed-browser-service.js
 [6100] CHROMIUM INTERFACE :: CDP, accessibility and Chromium control
-  lines 21,746-21,843  backend/uip/cdp-client.js
-  lines 21,847-21,889  backend/uip/reference-tracker.js
-  lines 21,893-22,339  backend/uip/chromium-accessibility.js
-  lines 22,343-22,733  backend/uip/chromium-interface.js
+  lines 22,152-22,249  backend/uip/cdp-client.js
+  lines 22,253-22,295  backend/uip/reference-tracker.js
+  lines 22,299-22,745  backend/uip/chromium-accessibility.js
+  lines 22,749-23,139  backend/uip/chromium-interface.js
 [6200] DISCOVERY + MEMORY :: capability-ranked targets and process memory
-  lines 22,740-22,852  backend/uip/discovery.js
-  lines 22,856-23,016  backend/uip/memory-codec.js
-  lines 23,020-23,378  backend/uip/memory-interface.js
-  lines 23,382-23,451  backend/uip/target-detection.js
+  lines 23,146-23,258  backend/uip/discovery.js
+  lines 23,262-23,422  backend/uip/memory-codec.js
+  lines 23,426-23,784  backend/uip/memory-interface.js
+  lines 23,788-23,857  backend/uip/target-detection.js
 [6300] WINDOWS UI AUTOMATION :: UIA service and native bridges
-  lines 23,458-23,724  backend/uip/uia-interface.js
-  lines 23,728-24,114  backend/uip/uip-service.js
-  lines 24,118-24,205  backend/uip/window-capture.js
-  lines 24,209-24,231  backend/uip/windows-capture-bridge.js
-  lines 24,235-24,297  backend/uip/windows-bridge.js
-  lines 24,301-24,325  backend/uip/windows-memory-bridge.js
-  lines 24,329-24,427  backend/uip/persistent-json-process.js
-  lines 24,431-24,504  backend/uip/windows-powershell.js
-  lines 24,508-24,540  backend/uip/windows-uia-bridge.js
+  lines 23,864-24,130  backend/uip/uia-interface.js
+  lines 24,134-24,520  backend/uip/uip-service.js
+  lines 24,524-24,611  backend/uip/window-capture.js
+  lines 24,615-24,637  backend/uip/windows-capture-bridge.js
+  lines 24,641-24,703  backend/uip/windows-bridge.js
+  lines 24,707-24,731  backend/uip/windows-memory-bridge.js
+  lines 24,735-24,833  backend/uip/persistent-json-process.js
+  lines 24,837-24,910  backend/uip/windows-powershell.js
+  lines 24,914-24,946  backend/uip/windows-uia-bridge.js
 [7100] IPC CORE :: error normalization, agent and application adapters
-  lines 24,550-24,573  backend/ipc/error-response.js
-  lines 24,577-24,694  backend/ipc/register-agent-ipc.js
-  lines 24,698-25,058  backend/ipc/register-app-ipc.js
+  lines 24,956-24,979  backend/ipc/error-response.js
+  lines 24,983-25,100  backend/ipc/register-agent-ipc.js
+  lines 25,104-25,462  backend/ipc/register-app-ipc.js
 [7200] CHAT + LLAMA IPC :: sessions and generation/runtime channels
-  lines 25,065-25,114  backend/ipc/register-chat-session-ipc.js
-  lines 25,118-25,533  backend/ipc/register-llama-ipc.js
+  lines 25,469-25,518  backend/ipc/register-chat-session-ipc.js
+  lines 25,522-25,937  backend/ipc/register-llama-ipc.js
 [7300] CAPABILITY IPC :: browser, plugins, UI and Application Interface
-  lines 25,540-25,611  backend/ipc/register-offline-browser-ipc.js
-  lines 25,615-25,644  backend/ipc/register-plugin-ipc.js
-  lines 25,648-25,771  backend/ipc/register-ui-ipc.js
-  lines 25,775-25,813  backend/ipc/register-uip-ipc.js
+  lines 25,944-26,015  backend/ipc/register-offline-browser-ipc.js
+  lines 26,019-26,048  backend/ipc/register-plugin-ipc.js
+  lines 26,052-26,175  backend/ipc/register-ui-ipc.js
+  lines 26,179-26,217  backend/ipc/register-uip-ipc.js
 [7400] IPC TRUST BOUNDARY :: trusted sender validation
-  lines 25,820-25,889  backend/ipc/trusted-ipc.js
+  lines 26,224-26,293  backend/ipc/trusted-ipc.js
 [8100] PLUGIN MANAGER :: discovery and trusted dispatch
-  lines 25,899-26,118  backend/plugins/plugin-manager.js
+  lines 26,303-26,522  backend/plugins/plugin-manager.js
 [8200] BUNDLED API MODEL PLUGIN :: backend adapters and streaming
-  lines 26,125-27,028  custom_nodes/api-model/backend.js
+  lines 26,529-27,432  custom_nodes/api-model/backend.js
 [8510] BUILD + VERIFICATION TOOLING :: packaging, audits, launch and source checks
-  lines 27,038-27,160  backend/scripts/build-offline.js
-  lines 27,164-27,626  backend/scripts/code-quality-audit.js
-  lines 27,630-27,662  backend/scripts/generate-build-manifest.js
-  lines 27,666-27,886  backend/release/runtime-license-audit.js
-  lines 27,890-27,904  backend/scripts/runtime-license-audit.js
-  lines 27,908-28,137  backend/scripts/offline-audit.js
-  lines 28,141-28,311  backend/scripts/privacy-audit.js
-  lines 28,315-28,513  backend/scripts/source-analysis.js
-  lines 28,517-28,718  backend/scripts/start-darkstar.js
-  lines 28,722-28,754  backend/scripts/vendor-electron-local.js
-  lines 28,758-29,057  backend/scripts/verify-source.js
+  lines 27,442-27,564  backend/scripts/build-offline.js
+  lines 27,568-28,030  backend/scripts/code-quality-audit.js
+  lines 28,034-28,066  backend/scripts/generate-build-manifest.js
+  lines 28,070-28,290  backend/release/runtime-license-audit.js
+  lines 28,294-28,308  backend/scripts/runtime-license-audit.js
+  lines 28,312-28,539  backend/scripts/offline-audit.js
+  lines 28,543-28,701  backend/scripts/privacy-audit.js
+  lines 28,705-28,903  backend/scripts/source-analysis.js
+  lines 28,907-29,108  backend/scripts/start-darkstar.js
+  lines 29,112-29,144  backend/scripts/vendor-electron-local.js
+  lines 29,148-29,437  backend/scripts/verify-source.js
 
 RENDERER CATEGORY MAP
 ---------------------
 9000  lines 22-26  RENDERER EXECUTION :: sandboxed UI modules in canonical former script order
 9100  lines 27-1,753  RENDERER FOUNDATION :: state, utilities, markup, generation UI, modal and preferences
-9200  lines 1,754-2,686  NODE PLATFORM :: SDK, controls and backend-service bridge
-9300  lines 2,687-5,782  BUILT-IN NODES :: server, local sampler, model, context/control compatibility services, Loader and orchestrator
-9400  lines 5,783-7,912  NODE EDITOR :: state, layout, rendering, interactions and controls
-9500  lines 7,913-10,546  WORKFLOW + GRAPH EXECUTION :: persistence, validation and runtime graph
-9600  lines 10,547-12,787  CANONICAL CHAT STATE :: atomic tools, context contract, projects and workspace
-9700  lines 12,788-16,281  CHAT SURFACES :: Application Interface, sessions, browser, messages and timeline
-9800  lines 16,282-18,554  COMPOSER + UI STATE :: tokens, controls, queue, tabs, server, params and images
-9900  lines 18,555-20,565  GENERATION ENTRY :: system commands, adversary context and Send/Stop lifecycle
-10000  lines 20,566-23,091  COMPACTION + EDITING + VIEW LIFECYCLE :: compaction, commands, edit, effects and init
-11000  lines 23,092-23,720  BUNDLED CUSTOM-NODE RENDERERS :: lazy, discovery-driven execution
+9200  lines 1,754-2,688  NODE PLATFORM :: SDK, controls and backend-service bridge
+9300  lines 2,689-5,809  BUILT-IN NODES :: server, local sampler, model, context/control compatibility services, Loader and orchestrator
+9400  lines 5,810-7,939  NODE EDITOR :: state, layout, rendering, interactions and controls
+9500  lines 7,940-10,573  WORKFLOW + GRAPH EXECUTION :: persistence, validation and runtime graph
+9600  lines 10,574-12,814  CANONICAL CHAT STATE :: atomic tools, context contract, projects and workspace
+9700  lines 12,815-16,679  CHAT SURFACES :: Application Interface, sessions, browser, messages and timeline
+9800  lines 16,680-18,953  COMPOSER + UI STATE :: tokens, controls, queue, tabs, server, params and images
+9900  lines 18,954-20,970  GENERATION ENTRY :: system commands, adversary context and Send/Stop lifecycle
+10000  lines 20,971-23,496  COMPACTION + EDITING + VIEW LIFECYCLE :: compaction, commands, edit, effects and init
+11000  lines 23,497-24,125  BUNDLED CUSTOM-NODE RENDERERS :: lazy, discovery-driven execution
+
 RENDERER DETAILED LOGICAL MODULE MAP
 ------------------------------------
 [9100] RENDERER FOUNDATION :: state, utilities, markup, generation UI, modal and preferences
@@ -312,70 +316,71 @@ RENDERER DETAILED LOGICAL MODULE MAP
 [9200] NODE PLATFORM :: SDK, controls and backend-service bridge
   lines 1,757-1,854  backend/renderer/nodes/sdk.js
   lines 1,856-2,018  backend/renderer/nodes/control-renderers.js
-  lines 2,020-2,685  backend/renderer/nodes/services.js
+  lines 2,020-2,687  backend/renderer/nodes/services.js
 [9300] BUILT-IN NODES :: server, local sampler, model, context/control compatibility services, Loader and orchestrator
-  lines 2,690-2,814  backend/renderer/nodes/builtin/common.js
-  lines 2,816-3,714  backend/renderer/nodes/builtin/load-server.js
-  lines 3,716-4,040  backend/renderer/nodes/builtin/local-sampler.js
-  lines 4,042-4,323  backend/renderer/nodes/builtin/load-model.js
-  lines 4,325-4,625  backend/renderer/nodes/builtin/context.js
-  lines 4,627-4,698  backend/renderer/nodes/builtin/load-tool.js
-  lines 4,700-5,211  backend/renderer/nodes/builtin/loader.js
-  lines 5,213-5,373  backend/renderer/nodes/builtin/control.js
-  lines 5,375-5,637  backend/renderer/nodes/builtin/sampler.js
-  lines 5,639-5,735  backend/renderer/nodes/plugin-loader.js
-  lines 5,737-5,781  backend/renderer/node-registry.js
+  lines 2,692-2,816  backend/renderer/nodes/builtin/common.js
+  lines 2,818-3,716  backend/renderer/nodes/builtin/load-server.js
+  lines 3,718-4,042  backend/renderer/nodes/builtin/local-sampler.js
+  lines 4,044-4,325  backend/renderer/nodes/builtin/load-model.js
+  lines 4,327-4,627  backend/renderer/nodes/builtin/context.js
+  lines 4,629-4,700  backend/renderer/nodes/builtin/load-tool.js
+  lines 4,702-5,213  backend/renderer/nodes/builtin/loader.js
+  lines 5,215-5,375  backend/renderer/nodes/builtin/control.js
+  lines 5,377-5,664  backend/renderer/nodes/builtin/sampler.js
+  lines 5,666-5,762  backend/renderer/nodes/plugin-loader.js
+  lines 5,764-5,808  backend/renderer/node-registry.js
 [9400] NODE EDITOR :: state, layout, rendering, interactions and controls
-  lines 5,786-6,072  backend/renderer/nodes/editor/core.js
-  lines 6,074-6,549  backend/renderer/nodes/editor/layout.js
-  lines 6,551-7,017  backend/renderer/nodes/editor/renderer.js
-  lines 7,019-7,397  backend/renderer/nodes/editor/interactions.js
-  lines 7,399-7,911  backend/renderer/nodes/editor/controls.js
+  lines 5,813-6,099  backend/renderer/nodes/editor/core.js
+  lines 6,101-6,576  backend/renderer/nodes/editor/layout.js
+  lines 6,578-7,044  backend/renderer/nodes/editor/renderer.js
+  lines 7,046-7,424  backend/renderer/nodes/editor/interactions.js
+  lines 7,426-7,938  backend/renderer/nodes/editor/controls.js
 [9500] WORKFLOW + GRAPH EXECUTION :: persistence, validation and runtime graph
-  lines 7,916-8,375  backend/renderer/workflow-local-pipeline-migration.js
-  lines 8,377-9,044  backend/renderer/workflow.js
-  lines 9,046-9,820  backend/renderer/workflow-file-modal.js
-  lines 9,822-9,988  backend/renderer/nodes/graph-core.js
-  lines 9,990-10,089  backend/renderer/nodes/graph-runtime.js
-  lines 10,091-10,545  backend/renderer/graph-execution.js
+  lines 7,943-8,402  backend/renderer/workflow-local-pipeline-migration.js
+  lines 8,404-9,071  backend/renderer/workflow.js
+  lines 9,073-9,847  backend/renderer/workflow-file-modal.js
+  lines 9,849-10,015  backend/renderer/nodes/graph-core.js
+  lines 10,017-10,116  backend/renderer/nodes/graph-runtime.js
+  lines 10,118-10,572  backend/renderer/graph-execution.js
 [9600] CANONICAL CHAT STATE :: atomic tools, context contract, projects and workspace
-  lines 10,550-10,707  backend/renderer/tool-atomicity.js
-  lines 10,709-10,804  backend/renderer/kv-cache-contract.js
-  lines 10,806-11,030  backend/renderer/context-contract.js
-  lines 11,032-11,612  backend/renderer/projects.js
-  lines 11,614-12,604  backend/renderer/workspace.js
-  lines 12,606-12,786  backend/renderer/attention.js
+  lines 10,577-10,734  backend/renderer/tool-atomicity.js
+  lines 10,736-10,831  backend/renderer/kv-cache-contract.js
+  lines 10,833-11,057  backend/renderer/context-contract.js
+  lines 11,059-11,639  backend/renderer/projects.js
+  lines 11,641-12,631  backend/renderer/workspace.js
+  lines 12,633-12,813  backend/renderer/attention.js
 [9700] CHAT SURFACES :: Application Interface, sessions, browser, messages and timeline
-  lines 12,791-13,078  backend/renderer/uip.js
-  lines 13,080-13,238  backend/renderer/chat-session-snapshot.js
-  lines 13,240-13,913  backend/renderer/chat-session.js
-  lines 13,915-14,604  backend/renderer/offline-browser.js
-  lines 14,606-14,670  backend/renderer/browser-workspace.js
-  lines 14,672-15,056  backend/renderer/image-lightbox.js
-  lines 15,059-15,152  backend/renderer/message-deletion.js
-  lines 15,154-15,304  backend/renderer/message-actions.js
-  lines 15,306-16,280  backend/renderer/chat.js
+  lines 12,818-13,105  backend/renderer/uip.js
+  lines 13,107-13,265  backend/renderer/chat-session-snapshot.js
+  lines 13,267-13,940  backend/renderer/chat-session.js
+  lines 13,942-14,631  backend/renderer/offline-browser.js
+  lines 14,633-14,697  backend/renderer/browser-workspace.js
+  lines 14,699-15,083  backend/renderer/image-lightbox.js
+  lines 15,086-15,179  backend/renderer/message-deletion.js
+  lines 15,181-15,331  backend/renderer/message-actions.js
+  lines 15,333-16,308  backend/renderer/chat.js
+  lines 16,311-16,736  backend/renderer/subagents.js
 [9800] COMPOSER + UI STATE :: tokens, controls, queue, tabs, server, params and images
-  lines 16,285-16,657  backend/renderer/token-inspector.js
-  lines 16,659-16,837  backend/renderer/ui-state.js
-  lines 16,839-17,189  backend/renderer/queue.js
-  lines 17,191-18,149  backend/renderer/tabs.js
-  lines 18,151-18,409  backend/renderer/server.js
-  lines 18,411-18,436  backend/renderer/params.js
-  lines 18,438-18,553  backend/renderer/image.js
+  lines 16,741-17,113  backend/renderer/token-inspector.js
+  lines 17,115-17,293  backend/renderer/ui-state.js
+  lines 17,295-17,645  backend/renderer/queue.js
+  lines 17,647-18,606  backend/renderer/tabs.js
+  lines 18,608-18,866  backend/renderer/server.js
+  lines 18,868-18,893  backend/renderer/params.js
+  lines 18,895-19,010  backend/renderer/image.js
 [9900] GENERATION ENTRY :: system commands, adversary context and Send/Stop lifecycle
-  lines 18,558-18,789  backend/renderer/system-command-api.js
-  lines 18,791-18,937  backend/renderer/adversary-context.js
-  lines 18,939-20,564  backend/renderer/send.js
+  lines 19,015-19,246  backend/renderer/system-command-api.js
+  lines 19,248-19,394  backend/renderer/adversary-context.js
+  lines 19,396-21,027  backend/renderer/send.js
 [10000] COMPACTION + EDITING + VIEW LIFECYCLE :: compaction, commands, edit, effects and init
-  lines 20,569-20,915  backend/renderer/compaction-activity.js
-  lines 20,917-21,124  backend/renderer/compaction-plan.js
-  lines 21,126-21,815  backend/renderer/commands.js
-  lines 21,817-22,168  backend/renderer/edit.js
-  lines 22,170-22,411  backend/renderer/effects.js
-  lines 22,413-22,689  backend/renderer/views.js
-  lines 22,691-22,873  backend/renderer/event-listeners.js
-  lines 22,875-23,091  backend/renderer/init.js
+  lines 21,032-21,378  backend/renderer/compaction-activity.js
+  lines 21,380-21,587  backend/renderer/compaction-plan.js
+  lines 21,589-22,278  backend/renderer/commands.js
+  lines 22,280-22,631  backend/renderer/edit.js
+  lines 22,633-22,874  backend/renderer/effects.js
+  lines 22,876-23,152  backend/renderer/views.js
+  lines 23,154-23,336  backend/renderer/event-listeners.js
+  lines 23,338-23,554  backend/renderer/init.js
 [11000] BUNDLED CUSTOM-NODE RENDERERS :: lazy, discovery-driven execution
-  lines 23,100-23,658  custom_nodes/api-model/renderer.js
-  lines 23,664-23,706  custom_nodes/_template/renderer.js
+  lines 23,563-24,121  custom_nodes/api-model/renderer.js
+  lines 24,127-24,169  custom_nodes/_template/renderer.js

@@ -789,7 +789,7 @@ test('streamAgent can complete beyond 4096 tokens without Continue when tools ar
                     catalog: '',
                     toolChoice: 'auto',
                     maxRounds: null,
-
+                   
                 };
             },
         },
@@ -1035,7 +1035,7 @@ test('API custom plugin registers exactly the requested loader and sampler witho
     assert.equal(Object.prototype.hasOwnProperty.call(loaderNode.params, 'apiKey'), false);
     assert.equal(Object.prototype.hasOwnProperty.call(loaderNode.runtime, 'apiKey'), true);
 
-    const workflow = fs.readFileSync(path.join(root, 'workflows/darkstar-workflow.dswf'));
+    const workflow = fs.readFileSync(path.join(root, 'backend/assets/default-workflow.dswf'));
     assert.equal(workflow.includes(Buffer.from('com.darkstar.api-model')), false);
     const { decodeWorkflowSnapshot } = require('../../workflow/workflow-snapshot-codec');
     const snapshot = decodeWorkflowSnapshot(workflow);
@@ -2575,7 +2575,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const ROOT = path.resolve(__dirname, '..', '..', '..');
-const WORKFLOW = path.join(ROOT, 'workflows', 'darkstar-workflow.dswf');
+const WORKFLOW = path.join(ROOT, 'backend', 'assets', 'default-workflow.dswf');
 const { inspectPythonProvider } = require('../../agent/python-tool-host');
 const { decodeWorkflowSnapshot } = require('../../workflow/workflow-snapshot-codec');
 
@@ -6592,14 +6592,14 @@ test('Control node has no Image Pruning toggle or persisted pruning parameter', 
 
 
 test('bundled workflow stores local Context and strategic Control settings on Orchestrator', () => {
-    const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(root, 'workflows', 'darkstar-workflow.dswf')));
+    const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(root, 'backend', 'assets', 'default-workflow.dswf')));
     const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : snapshot.editor.nodes;
     assert.equal(nodes.some((node) => node.type === 'context'), false);
     assert.equal(nodes.some((node) => node.type === 'control'), false);
     const orchestrator = nodes.find((node) => node.type === 'sampler');
     const localSampler = nodes.find((node) => node.type === 'localSampler');
     assert.deepEqual(orchestrator.params, {
-        systemPrompt: '', includeHistory: true, nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: false, dynamicVramEnabled: false, negativePromptEnabled: false, imageCountOverride: 0,
+        systemPrompt: '', includeHistory: true, nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: false, dynamicVramEnabled: false, negativePromptEnabled: false, imageCountOverride: 0, subAgentMaxDepth: 8, allowSubAgentsToSpawnSubAgents: true, subAgentDelegationPolicyVersion: 1,
     });
     assert.equal(localSampler.params.stop, '');
     assert.equal(localSampler.params.cachePrompt, true);
@@ -6607,7 +6607,7 @@ test('bundled workflow stores local Context and strategic Control settings on Or
 });
 
 test('canonical default workflow enables Flash Attention on LlamaCPP Server', () => {
-    const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(root, 'workflows', 'darkstar-workflow.dswf')));
+    const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(root, 'backend', 'assets', 'default-workflow.dswf')));
     const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : snapshot.editor.nodes;
     const loadServer = nodes.find((node) => node && node.type === 'loadServer');
     assert.ok(loadServer, 'canonical workflow must contain a LlamaCPP Server node');
@@ -6615,7 +6615,7 @@ test('canonical default workflow enables Flash Attention on LlamaCPP Server', ()
 });
 
 test('canonical default workflow uses portable model and MMProj placeholders without selecting machine-specific files', () => {
-    const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(root, 'workflows', 'darkstar-workflow.dswf')));
+    const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(root, 'backend', 'assets', 'default-workflow.dswf')));
     const nodes = Array.isArray(snapshot.nodes) ? snapshot.nodes : snapshot.editor.nodes;
     const loader = nodes.find((node) => node && node.type === 'modelLoader');
     assert.ok(loader, 'canonical workflow must contain an Invoke Language Model node');
@@ -9026,6 +9026,7 @@ const features = [
     ['tab close refuses running generation', 'backend/renderer/tabs.js', ['generationSessionForTab(tabId)']],
 
     ['message rendering', 'backend/renderer/chat.js', ['function addMessage(messageOptions)', 'message-agent-timeline', 'message-answer']],
+    ['temporary sub-agent panes', 'backend/renderer/subagents.js', ['function handleToolEvent(payload, owner)', 'paneTrack.appendChild(pane)', "payload.type === 'subagent-complete'", 'function closeForRequest(requestId)']],
     ['message deletion', 'backend/renderer/message-deletion.js', ['function deleteChatMessage(messageIndex, messageId, targetTabId)', 'tab.history.splice(location.index, 1)', "retireGenerationBeforeConversationMutation(tab, 'message-deleted'", 'saveChatSessionNow({ force: true })']],
     ['user message edit affordance', 'backend/renderer/message-actions.js', ['role === \'user\'', 'data-ui-action="edit-message"']],
     ['reasoning timeline rendering', 'backend/renderer/chat.js', ['function renderReasoningSegment(block, segment)', 'thinking-content']],
@@ -9229,6 +9230,7 @@ const features = [
     ['tool schema validation', 'backend/agent/tool-schema.js', ['normalizeDefinition', 'validateToolArguments']],
     ['model vision tool capability projection', 'backend/agent/tool-capabilities.js', ['projectVisionDefinition', 'projectDiffusionDefinition', 'runtimeProviderTools', 'VISION_ONLY_ACTIONS']],
     ['tool service execution', 'backend/agent/tool-service.js', ['class ToolService', 'validateToolArguments']],
+    ['Core-owned sub-agent tool contract', 'backend/agent/builtin/subagent-tool.js', ['SPAWN_SUBAGENT_TOOL_NAME', 'subAgentSpawnAllowed', "'x-darkstar-filesystem': 'none'", "'x-darkstar-permission': 'read'"]],
     ['sequential image generation action', 'backend/agent/image-generation-action.js', ['resolveGenerateImageAction', 'aggregateImageSequence', 'sequenceProgressHandler', 'MAX_GENERATE_IMAGE_COUNT']],
     ['response image presentation action', 'backend/agent/presentation-image-action.js', ['resolveShowImageAction', 'registerToolImages', 'SHOW_IMAGE_ACTION', 'PRESENT_IMAGE_MARKER']],
     ['tool-call timeout', 'backend/agent/tool-runtime.js', ['timeoutToolCallTimeoutMs']],
@@ -9292,6 +9294,8 @@ const features = [
     ['Electron shell entrypoint', 'backend/shell/main.js', ['projectRootFromShell(__dirname)', "require('../app/run-main-app')", "require('../browser/online-browser-host')"]],
     ['sandboxed renderer preload bridge', 'backend/shell/preload.js', ['contextBridge.exposeInMainWorld', 'CHANNELS', 'customNodeApi', 'PLUGINS_EVENT', 'darkstar']],
     ['project shell and asset path ownership', 'backend/app/project-layout.js', ['projectRootFromShell', 'shellDirectory', 'shellFile', 'assetFile']],
+    ['managed project storage root and legacy migration', 'backend/app/managed-project-storage.js', ['MANAGED_PROJECTS_DIRECTORY', 'resolveManagedProjectsRoot', 'migrateLegacyManagedProjects']],
+    ['managed workflow storage root, legacy import and default seeding', 'backend/app/managed-workflow-storage.js', ['MANAGED_WORKFLOWS_DIRECTORY', 'resolveManagedWorkflowsRoot', 'initializeManagedWorkflows']],
     ['crash diagnostics', 'backend/app/crash-diagnostics.js', ['CrashDiagnostics']],
     ['power protection and Windows app identity', 'backend/app/run-main-app.js', ['createPowerProtection', 'configureWindowsAppIdentity']],
     ['runtime Windows icon generation', 'backend/app/runtime-icon.js', ['generateRuntimeIcon', 'encodeIco', 'WINDOWS_ICON_SIZES']],
@@ -9315,6 +9319,7 @@ const features = [
     ['model directory monitoring', 'backend/runtime/model-directory-monitor.js', ['class ModelDirectoryMonitor', 'inventorySignature']],
     ['runtime number/boolean normalization', 'backend/runtime/normalize.js', ['normalizeInteger', 'normalizeFloat', 'normalizeBoolean']],
     ['tool activity records', 'backend/runtime/agent-loop.js', ['createToolActivity']],
+    ['sub-agent orchestration and direct handoff', 'backend/runtime/agent-loop.js', ['function buildSubAgentRequest(parentRequest, args, metadata)', 'const runSubAgent = async (args = {}) =>', "type: 'subagent-complete'", 'delete parentBaseBody._darkstar_cache_reuse_proven']],
     ['runtime process execution/termination', 'backend/runtime/process-utils.js', ['DEFAULT_MAX_CAPTURE_BYTES', 'runProcessCapture', 'killProcessTree']],
     ['runtime free-port allocation', 'backend/runtime/server-io.js', ['getFreePort']],
     ['llama tool-schema compatibility', 'backend/runtime/tool-schema-compat.js', ['toolDefinitionsForLlama', 'grammarSafeToolDefinition', 'compactSchemaContract']],
@@ -9807,6 +9812,7 @@ test('renderer loads every current feature module in the dependency-sensitive or
         'backend/renderer/message-deletion.js',
         'backend/renderer/message-actions.js',
         'backend/renderer/chat.js',
+        'backend/renderer/subagents.js',
         'backend/renderer/token-inspector.js',
         'backend/renderer/ui-state.js',
         'backend/renderer/queue.js',
@@ -9857,7 +9863,7 @@ test('current keyboard-accessible feature shortcuts remain bound', () => {
 test('all major feature surfaces remain represented by dedicated renderer modules', () => {
     const required = [
         'backend/renderer/preferences.js', 'backend/renderer/workflow.js', 'backend/renderer/projects.js', 'backend/renderer/workspace.js', 'backend/renderer/uip.js', 'backend/renderer/chat-session.js',
-        'backend/renderer/offline-browser.js', 'backend/renderer/browser-workspace.js', 'backend/renderer/image-lightbox.js', 'backend/renderer/message-deletion.js', 'backend/renderer/message-actions.js', 'backend/renderer/message-markup.js', 'backend/renderer/chat.js', 'backend/renderer/token-inspector.js', 'backend/renderer/queue.js', 'backend/renderer/tabs.js', 'backend/renderer/server.js',
+        'backend/renderer/offline-browser.js', 'backend/renderer/browser-workspace.js', 'backend/renderer/image-lightbox.js', 'backend/renderer/message-deletion.js', 'backend/renderer/message-actions.js', 'backend/renderer/message-markup.js', 'backend/renderer/chat.js', 'backend/renderer/subagents.js', 'backend/renderer/token-inspector.js', 'backend/renderer/queue.js', 'backend/renderer/tabs.js', 'backend/renderer/server.js',
         'backend/renderer/image.js', 'backend/renderer/system-command-api.js', 'backend/renderer/adversary-context.js', 'backend/renderer/send.js', 'backend/renderer/compaction-activity.js', 'backend/renderer/commands.js', 'backend/renderer/edit.js', 'backend/renderer/views.js', 'backend/renderer/nodes/editor/core.js', 'backend/renderer/graph-execution.js', 'backend/renderer/tool-atomicity.js', 'backend/renderer/context-contract.js',
     ];
     for (const file of required) assert.ok(fs.existsSync(path.join(root, file)), `${file} must remain part of the tested feature surface`);
@@ -12662,35 +12668,21 @@ test('image enlargement is the canonical inpainting editor with cursor-anchored 
     assert.match(styles, /\.image-lightbox-stage\s*\{[\s\S]*?display:\s*flex;[\s\S]*?align-items:\s*safe center;[\s\S]*?justify-content:\s*safe center;[\s\S]*?overflow:\s*auto;/u);
 });
 
-test('portable single-exe builder keeps persistent data outside the temporary Electron payload and bundles runtime dependencies', () => {
+test('obsolete portable single-exe builder is not shipped while the generic portable data-root override remains supported', () => {
     const core = read('backend/app/run-main-app.js');
-    const appIpc = read('backend/ipc/register-app-ipc.js');
-    const builderPath = path.join(root, 'backend', 'scripts', 'build-portable-single-exe.ps1');
-    const wrapperPath = path.join(root, 'Build_Portable_EXE.bat');
-    assert.equal(fs.existsSync(builderPath), true);
-    assert.equal(fs.existsSync(wrapperPath), true);
-    const builder = fs.readFileSync(builderPath, 'utf8');
-    assert.match(core, /DARKSTAR_PORTABLE_DATA_ROOT[\s\S]*?const dataRoot = path\.resolve\(configuredDataRoot \|\| baseDir\)/u);
-    assert.match(core, /runtimeOptions:\s*\{ modelsDir: path\.join\(dataRoot, 'models'\) \}/u);
-    assert.match(core, /new ChatSessionStore\(\{[\s\S]*?baseDir:\s*dataRoot/u);
-    assert.match(core, /registerAppIpc\(\{[^\n]*projectBaseDir:\s*dataRoot/u);
-    assert.match(appIpc, /const projectBaseDir = path\.resolve\(options\.projectBaseDir \|\| baseDir\)/u);
-    assert.match(appIpc, /path\.(?:join|resolve)\(projectBaseDir, 'projects'\)/u);
-    assert.match(builder, /bootstrap-llamacpp\.ps1/u);
-    assert.match(builder, /electron-builder[\s\S]*?target = 'portable'/u);
-    assert.match(builder, /PORTABLE_EXECUTABLE_DIR[\s\S]*?DARKSTAR_PORTABLE_DATA_ROOT/u);
-    assert.match(builder, /must be run from a writable folder/u, 'portable startup must fail closed instead of persisting into Electron temporary extraction');
-    assert.match(builder, /python-portable/u);
-    assert.match(builder, /SourceVenv[\s\S]*?existing Darkstar venv/u);
-    assert.match(builder, /Snapshotting the existing Darkstar venv exactly as currently used/u);
-    assert.doesNotMatch(builder, /-m\s+pip\s+install|portable-python-requirements\.txt/u,
-        'portable builder must not reinstall Python packages');
-    assert.match(builder, /backend\\vendor\\node/u);
-    assert.match(builder, /Darkstar-Portable\.exe/u);
-    assert.match(builder, /Write-Utf8NoBom[\s\S]*?GeneratedPackagePath[\s\S]*?JSON\.parse/u,
-        'portable builder must emit BOM-free strict JSON and preflight it before electron-builder');
-    assert.doesNotMatch(builder, /GeneratedPackagePath[^\n]*Set-Content[^\n]*Encoding UTF8/u,
-        'Windows PowerShell 5.1 UTF-8 BOM output must never be used for generated package.json');
+    const packageJson = JSON.parse(read('backend/shell/package.json'));
+    const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+    for (const relativePath of [
+        'Build_Portable_EXE.bat',
+        'backend/scripts/build-portable-single-exe.ps1',
+        'backend/portable-python-requirements.txt',
+    ]) {
+        assert.equal(fs.existsSync(path.join(root, relativePath)), false, `${relativePath} must not be shipped`);
+    }
+    assert.equal(packageJson.build?.win?.target, undefined, 'package metadata must not advertise the removed electron-builder portable target');
+    assert.doesNotMatch(readme, /Build_Portable_EXE|build-portable-single-exe|Portable Single-EXE|portable-release\\Darkstar-Portable\.exe/u);
+    assert.match(core, /DARKSTAR_PORTABLE_DATA_ROOT[\s\S]*?const dataRoot = path\.resolve\(configuredDataRoot \|\| baseDir\)/u,
+        'the generic explicit portable-data override remains runtime storage infrastructure, independent of the removed builder');
 });
 
 test('startup applies collapsed-sidebar geometry before the first tab render', () => {
@@ -15316,7 +15308,7 @@ test('filesystem reconciliation preserves restored external projects that are no
         tabs = [{ id: 70, projectId: 7, title: 'Existing chat', history: [{ role: 'user', content: 'keep me' }], tokens: 0, scheduled: [], userScrolledUp: false }];
         activeProjectId = 7; activeTabId = 70; nextProjectId = 8; nextTabId = 71;
         workspaceStateForProject(7).root = { path: 'D:/External Workspace', name: 'External Workspace' };
-        darkstar = { workspace: { listProjects: async function() { return { success: true, rootPath: 'C:/Darkstar/projects', projects: [{ name: 'Managed', path: 'C:/Darkstar/projects/Managed' }] }; } } };
+        darkstar = { workspace: { listProjects: async function() { return { success: true, rootPath: 'C:/Darkstar/Darkstar-Projects', projects: [{ name: 'Managed', path: 'C:/Darkstar/Darkstar-Projects/Managed' }] }; } } };
         renderProjects = function() {}; renderTabs = function() {}; renderChat = function() {};
         updateTokenCounter = function() {}; renderQueue = function() {}; syncProjectComposerGate = function() {};
         scheduleChatSessionSave = function() {}; generationSessionForTab = function() { return null; };
@@ -15813,9 +15805,9 @@ test('managed project naming reconciles malformed legacy suffixes to the canonic
             { id: 1, projectId: 1, title: 'Chat 1', history: [], tokens: 0, scheduled: [], userScrolledUp: false },
             { id: 3, projectId: 3, title: 'Chat 1', history: [], tokens: 0, scheduled: [], userScrolledUp: false }
         ];
-        workspaceStateForProject(0).root = { path: 'C:/Darkstar/projects/New Project', name: 'New Project' };
-        workspaceStateForProject(1).root = { path: 'C:/Darkstar/projects/New Project 2', name: 'New Project 2' };
-        workspaceStateForProject(3).root = { path: 'C:/Darkstar/projects/New Project 4 4', name: 'New Project 4 4' };
+        workspaceStateForProject(0).root = { path: 'C:/Darkstar/Darkstar-Projects/New Project', name: 'New Project' };
+        workspaceStateForProject(1).root = { path: 'C:/Darkstar/Darkstar-Projects/New Project 2', name: 'New Project 2' };
+        workspaceStateForProject(3).root = { path: 'C:/Darkstar/Darkstar-Projects/New Project 4 4', name: 'New Project 4 4' };
         globalThis.__renameCalls = [];
         darkstar = { workspace: {
             renameEntry: async function(workspaceId, relativePath, newName) {
@@ -15823,7 +15815,7 @@ test('managed project naming reconciles malformed legacy suffixes to the canonic
                 return {
                     success: true,
                     entry: { isRoot: true, path: '', name: newName, kind: 'directory' },
-                    root: { path: 'C:/Darkstar/projects/' + newName, name: newName }
+                    root: { path: 'C:/Darkstar/Darkstar-Projects/' + newName, name: newName }
                 };
             },
             listDirectory: async function() { return { success: true, entries: [] }; }
@@ -15849,7 +15841,7 @@ test('project provisioning always adopts the real managed directory name returne
             createProject: async function() {
                 return {
                     success: true,
-                    root: { path: 'C:/Darkstar/projects/New Project 5', name: 'New Project 5' },
+                    root: { path: 'C:/Darkstar/Darkstar-Projects/New Project 5', name: 'New Project 5' },
                     entries: [{ name: 'New Directory', kind: 'directory', path: 'New Directory', relativePath: 'New Directory' }]
                 };
             }
@@ -17335,7 +17327,7 @@ function actionableRendererFiles() {
 
 test('completeness: every renderer JavaScript module has an explicit feature regression contract', () => {
     const files = jsFiles('backend/renderer');
-    assert.equal(files.length, 70, 'renderer source inventory changed; add regression coverage for the new/removed module');
+    assert.equal(files.length, 71, 'renderer source inventory changed; add regression coverage for the new/removed module');
     for (const file of files) {
         assert.ok(featureInventory.includes(`'${file}'`), `${file} has no explicit feature regression contract`);
     }
@@ -17343,7 +17335,7 @@ test('completeness: every renderer JavaScript module has an explicit feature reg
 
 test('completeness: every first-party backend JavaScript module has an explicit feature regression contract', () => {
     const files = jsFiles('backend', (file) => !file.includes('/python_vendor/') && !file.startsWith('backend/renderer/') && !file.startsWith('backend/scripts/') && !file.startsWith('backend/vendor/') && !file.startsWith('backend/Dev/'));
-    assert.equal(files.length, 128, 'backend source inventory changed; add regression coverage for the new/removed module');
+    assert.equal(files.length, 130, 'backend source inventory changed; add regression coverage for the new/removed module');
     for (const file of files) {
         assert.ok(featureInventory.includes(`'${file}'`), `${file} has no explicit feature regression contract`);
     }
@@ -17965,8 +17957,12 @@ test('Orchestrator owns local Context and strategic controls while consuming Lan
         ['skills', 'Skills', 'SKILLS', false],
         ['tools', 'Tools', 'TOOLS', false],
     ]);
-    assert.deepEqual(Object.keys(orchestrator.params).sort(), ['autoCompact', 'dynamicVramEnabled', 'imageCountOverride', 'includeHistory', 'modelIdleUnloadEnabled', 'nameConversations', 'negativePromptEnabled', 'systemPrompt']);
+    assert.deepEqual(Object.keys(orchestrator.params).sort(), ['allowSubAgentsToSpawnSubAgents', 'autoCompact', 'dynamicVramEnabled', 'imageCountOverride', 'includeHistory', 'modelIdleUnloadEnabled', 'nameConversations', 'negativePromptEnabled', 'subAgentDelegationPolicyVersion', 'subAgentMaxDepth', 'systemPrompt']);
     assert.equal(orchestrator.params.imageCountOverride, 0);
+    assert.equal(orchestrator.params.subAgentMaxDepth, 8);
+    assert.match(source('backend/renderer/nodes/builtin/sampler.js'), /numberInput\('Maximum sub-agent depth \(0 = Unlimited\)'/u, 'Orchestrator UI must expose the configurable maximum depth');
+    assert.equal(orchestrator.params.allowSubAgentsToSpawnSubAgents, true);
+    assert.equal(orchestrator.params.subAgentDelegationPolicyVersion, 1);
     orchestrator.params.systemPrompt = 'System policy';
     orchestrator.params.nameConversations = false;
     assert.equal(orchestrator.params.dynamicVramEnabled, false);
@@ -17992,12 +17988,58 @@ test('Orchestrator owns local Context and strategic controls while consuming Lan
     assert.deepEqual(request.stop, ['END', 'DONE']);
     assert.equal(request.cachePrompt, false);
     assert.equal(request.ignoreEos, true);
+    assert.equal(request.tools.subAgentsEnabled, true);
+    assert.equal(request.tools.subAgentMaxDepth, 8);
+    assert.equal(request.tools.allowSubAgentsToSpawnSubAgents, true);
+    assert.equal(request.tools.subAgentDelegationPolicyVersion, 1);
     assert.equal(Object.hasOwn(request, 'maxTokens'), false);
     assert.equal(Object.hasOwn(orchestrator.params, 'stop'), false);
     assert.equal(Object.hasOwn(orchestrator.params, 'cachePrompt'), false);
     assert.equal(Object.hasOwn(orchestrator.params, 'ignoreEos'), false);
     assert.equal(result.stopDetails.stopType, 'limit');
     assert.equal(result.stopDetails.tokensPredicted, 45000);
+});
+
+test('Orchestrator migrates the unversioned legacy false default to ON exactly once, while a current explicit OFF remains authoritative', async () => {
+    const { definitions, getChatRequest } = pipelineHarness();
+    const samplerDefinition = definitions.get('localSampler');
+    const samplerNode = samplerDefinition.factory('local-sampler-off', 0, 0);
+    const samplerParameters = samplerDefinition.execute({ gguf: { id: 'model.gguf', multimodal: false, reasoning: null } }, samplerNode, {}).samplerParameters;
+    const orchestratorDefinition = definitions.get('sampler');
+
+    const legacyOrchestrator = orchestratorDefinition.factory('orchestrator-legacy-off', 0, 0);
+    legacyOrchestrator.params.allowSubAgentsToSpawnSubAgents = false;
+    delete legacyOrchestrator.params.subAgentDelegationPolicyVersion;
+    orchestratorDefinition.normalizeNode(legacyOrchestrator);
+    assert.equal(legacyOrchestrator.params.allowSubAgentsToSpawnSubAgents, true, 'old generated false values must migrate to the current ON default');
+    assert.equal(legacyOrchestrator.params.subAgentDelegationPolicyVersion, 1);
+
+    const orchestrator = orchestratorDefinition.factory('orchestrator-off', 0, 0);
+    orchestrator.params.subAgentMaxDepth = 13;
+    orchestrator.params.allowSubAgentsToSpawnSubAgents = false;
+    await orchestratorDefinition.execute({ samplerParameters }, orchestrator, { parallelSlots: 1, history: [{ role: 'user', content: 'Do not recurse.' }] });
+    assert.equal(getChatRequest().tools.subAgentMaxDepth, 13);
+    assert.equal(getChatRequest().tools.allowSubAgentsToSpawnSubAgents, false);
+    assert.equal(getChatRequest().tools.subAgentDelegationPolicyVersion, 1);
+});
+
+test('Orchestrator maximum sub-agent depth normalizes invalid legacy values and supports unlimited', async () => {
+    const { definitions, getChatRequest } = pipelineHarness();
+    const samplerDefinition = definitions.get('localSampler');
+    const samplerNode = samplerDefinition.factory('local-sampler-depth', 0, 0);
+    const samplerParameters = samplerDefinition.execute({ gguf: { id: 'model.gguf', multimodal: false, reasoning: null } }, samplerNode, {}).samplerParameters;
+    const orchestratorDefinition = definitions.get('sampler');
+
+    const legacy = orchestratorDefinition.factory('orchestrator-depth-legacy', 0, 0);
+    legacy.params.subAgentMaxDepth = 'not-a-number';
+    orchestratorDefinition.normalizeNode(legacy);
+    assert.equal(legacy.params.subAgentMaxDepth, 8, 'invalid or missing saved values must normalize to the historical depth of 8');
+
+    const unlimited = orchestratorDefinition.factory('orchestrator-depth-unlimited', 0, 0);
+    unlimited.params.subAgentMaxDepth = 0;
+    await orchestratorDefinition.execute({ samplerParameters }, unlimited, { parallelSlots: 1, history: [{ role: 'user', content: 'Allow unlimited nesting.' }] });
+    assert.equal(unlimited.params.subAgentMaxDepth, 0);
+    assert.equal(getChatRequest().tools.subAgentMaxDepth, 0, 'zero must reach Core unchanged as the unlimited sentinel');
 });
 
 test('cold-start context contract is re-checked by Orchestrator after GGUF is authoritative', async () => {
@@ -18015,7 +18057,7 @@ test('cold-start context contract is re-checked by Orchestrator after GGUF is au
 
 test('bundled local workflow persists the six-node ownership and merged Loader socket contract', () => {
     const { decodeWorkflowSnapshot } = require('../../workflow/workflow-snapshot-codec');
-    const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(ROOT, 'workflows', 'darkstar-workflow.dswf')));
+    const snapshot = decodeWorkflowSnapshot(fs.readFileSync(path.join(ROOT, 'backend', 'assets', 'default-workflow.dswf')));
     const editor = snapshot.editor && typeof snapshot.editor === 'object' ? snapshot.editor : snapshot;
     const server = editor.nodes.find((node) => node.type === 'loadServer');
     const modelLoader = editor.nodes.find((node) => node.type === 'modelLoader');
@@ -18043,7 +18085,7 @@ test('bundled local workflow persists the six-node ownership and merged Loader s
     assert.equal(server.params.contextPercent, 100);
     assert.equal(Object.hasOwn(server.params, 'reasoning'), false);
     assert.deepEqual(orchestrator.params, {
-        systemPrompt: '', includeHistory: true, nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: false, dynamicVramEnabled: false, negativePromptEnabled: false, imageCountOverride: 0,
+        systemPrompt: '', includeHistory: true, nameConversations: true, autoCompact: false, modelIdleUnloadEnabled: false, dynamicVramEnabled: false, negativePromptEnabled: false, imageCountOverride: 0, subAgentMaxDepth: 8, allowSubAgentsToSpawnSubAgents: true, subAgentDelegationPolicyVersion: 1,
     });
     for (const key of ['contextSize', 'reasoning', 'stop', 'cachePrompt', 'ignoreEos']) assert.equal(Object.hasOwn(orchestrator.params, key), false);
     for (const key of ['seed', 'temperature', 'topK', 'topP', 'minP', 'typicalP', 'repeatPenalty', 'repeatLastN', 'presencePenalty', 'frequencyPenalty', 'dryMultiplier', 'dryBase', 'dryAllowedLength', 'dryPenaltyLastN', 'mirostat', 'mirostatTau', 'mirostatEta', 'samplers', 'stop', 'cachePrompt', 'ignoreEos']) {
@@ -21721,7 +21763,7 @@ test('manual workflow Save and Load stay inside the supplied workflows directory
     );
     await assert.rejects(
         saveWorkflow({ payload: { snapshot, fileName: '../escape' }, defaultDirectory: directory }),
-        /inside workflows/u,
+        /inside Workflows/u,
     );
 
     const saveResult = await saveWorkflow({
@@ -21962,7 +22004,7 @@ function ipcHarness() {
     };
 }
 
-test('new project IPC creates a managed root under ./projects with an initial directory and collision-safe name', async (t) => {
+test('new project IPC creates a managed root under Darkstar-Projects with an initial directory and collision-safe name', async (t) => {
     const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-managed-project-'));
     t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
     const workspace = new WorkspaceRegistry();
@@ -21982,20 +22024,20 @@ test('new project IPC creates a managed root under ./projects with an initial di
     assert.equal(typeof create, 'function');
     const first = await create(null, { workspaceId: 'project-0', name: 'New Project' });
     assert.equal(first.success, true);
-    assert.equal(first.root.path, fs.realpathSync(path.join(baseDir, 'projects', 'New Project')));
-    assert.equal(fs.statSync(path.join(baseDir, 'projects', 'New Project', 'New Directory')).isDirectory(), true);
+    assert.equal(first.root.path, fs.realpathSync(path.join(baseDir, 'Darkstar-Projects', 'New Project')));
+    assert.equal(fs.statSync(path.join(baseDir, 'Darkstar-Projects', 'New Project', 'New Directory')).isDirectory(), true);
     assert.equal(first.entries.some((entry) => entry.name === 'New Directory' && entry.kind === 'directory'), true);
 
     const second = await create(null, { workspaceId: 'project-1', name: 'New Project' });
     assert.equal(second.success, true);
     assert.equal(second.root.name, 'New Project 2');
-    assert.equal(fs.statSync(path.join(baseDir, 'projects', 'New Project 2', 'New Directory')).isDirectory(), true);
+    assert.equal(fs.statSync(path.join(baseDir, 'Darkstar-Projects', 'New Project 2', 'New Directory')).isDirectory(), true);
 
-    fs.mkdirSync(path.join(baseDir, 'projects', 'New Project 4'));
+    fs.mkdirSync(path.join(baseDir, 'Darkstar-Projects', 'New Project 4'));
     const numberedCollision = await create(null, { workspaceId: 'project-4', name: 'New Project 4' });
     assert.equal(numberedCollision.success, true);
     assert.equal(numberedCollision.root.name, 'New Project 5', 'an already-numbered default name must advance its ordinal instead of becoming New Project 4 2');
-    assert.equal(fs.existsSync(path.join(baseDir, 'projects', 'New Project 4 2')), false);
+    assert.equal(fs.existsSync(path.join(baseDir, 'Darkstar-Projects', 'New Project 4 2')), false);
 });
 
 test('project deletion IPC permanently removes managed roots but never deletes attached external folders', async (t) => {
@@ -25133,6 +25175,968 @@ test('DM Sampler custom package renames the existing localSampler presentation t
 });
 });
 
+
+// ============================================================================
+// TEST MODULE: backend/Dev/tests/subagent-system-regression.test.js
+// ============================================================================
+TEST_FACTORIES.set("backend/Dev/tests/subagent-system-regression.test.js", function(module, exports, require, __filename, __dirname) {
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+const vm = require('node:vm');
+const { ToolService } = require('../../agent/tool-service');
+const {
+    DEFAULT_SUBAGENT_MAX_DEPTH,
+    SUBAGENT_DELEGATION_POLICY_VERSION,
+    SPAWN_SUBAGENT_TOOL_NAME,
+    createSubAgentResult,
+    normalizeSubAgentMaxDepth,
+    subAgentSpawnAllowed,
+} = require('../../agent/builtin/subagent-tool');
+const { buildSubAgentRequest, streamAgent, untrustedBrowserToolName } = require('../../runtime/agent-loop');
+
+const ROOT = path.resolve(__dirname, '..', '..', '..');
+
+function testToolService() {
+    return new ToolService({
+        baseDir: ROOT,
+        skillService: {
+            async buildRuntime() {
+                return { definitions: [], handlers: new Map(), skills: [], catalog: '' };
+            },
+        },
+        moduleLoader: { clear() {} },
+        pythonRegistry: {
+            inspections: new Map(),
+            hosts: new Map(),
+            pythonEnvironment: null,
+            async shutdown() {},
+        },
+    });
+}
+
+function completion(text, toolCalls = []) {
+    return {
+        text,
+        reasoning: '',
+        toolCalls,
+        usage: null,
+        finishReason: toolCalls.length ? 'tool_calls' : 'stop',
+        stopDetails: null,
+        contextUsage: null,
+    };
+}
+
+test('spawn_subagent is a Core-owned lowest-risk non-filesystem tool and nested exposure follows the Orchestrator switch', async () => {
+    assert.equal(SPAWN_SUBAGENT_TOOL_NAME, 'spawn_subagent');
+    assert.equal(SUBAGENT_DELEGATION_POLICY_VERSION, 1);
+    assert.equal(subAgentSpawnAllowed({ subAgentsEnabled: true, subAgentDepth: 0, allowSubAgentsToSpawnSubAgents: false }), true);
+    assert.equal(subAgentSpawnAllowed({ subAgentsEnabled: true, subAgentDepth: 1, allowSubAgentsToSpawnSubAgents: false }), true, 'unversioned false can be the legacy generated default and must migrate ON');
+    assert.equal(subAgentSpawnAllowed({ subAgentsEnabled: true, subAgentDepth: 1, allowSubAgentsToSpawnSubAgents: false, subAgentDelegationPolicyVersion: 1 }), false);
+    assert.equal(subAgentSpawnAllowed({ subAgentsEnabled: true, subAgentDepth: 1, allowSubAgentsToSpawnSubAgents: true, subAgentDelegationPolicyVersion: 1 }), true);
+    assert.equal(subAgentSpawnAllowed({ subAgentsEnabled: true, subAgentDepth: 1 }), true, 'legacy/missing nested-delegation setting must default ON');
+    assert.equal(DEFAULT_SUBAGENT_MAX_DEPTH, 8);
+    assert.equal(normalizeSubAgentMaxDepth(undefined), 8);
+    assert.equal(normalizeSubAgentMaxDepth(0), 0, 'zero must mean unlimited rather than falling back to the default');
+    assert.equal(normalizeSubAgentMaxDepth(12), 12);
+    assert.equal(subAgentSpawnAllowed({ subAgentsEnabled: true, subAgentDepth: 8, subAgentMaxDepth: 8, allowSubAgentsToSpawnSubAgents: true, subAgentDelegationPolicyVersion: 1 }), false);
+    assert.equal(subAgentSpawnAllowed({ subAgentsEnabled: true, subAgentDepth: 8, subAgentMaxDepth: 12, allowSubAgentsToSpawnSubAgents: true, subAgentDelegationPolicyVersion: 1 }), true);
+    assert.equal(subAgentSpawnAllowed({ subAgentsEnabled: true, subAgentDepth: 8000, subAgentMaxDepth: 0, allowSubAgentsToSpawnSubAgents: true, subAgentDelegationPolicyVersion: 1 }), true, 'unlimited must have no hidden Core depth ceiling');
+
+    const service = testToolService();
+    const rootRuntime = await service.buildRuntime({ subAgentsEnabled: true, toolChoice: 'none', subAgentDepth: 0 }, { skills: [] }, { runSubAgent: async () => 'ok' });
+    assert.deepEqual(rootRuntime.definitions.map((definition) => definition.function.name), ['spawn_subagent']);
+    assert.equal(rootRuntime.toolChoice, 'auto', 'native delegation remains callable without requiring a Tools Loader connection');
+    const definition = rootRuntime.definitions[0].function;
+    assert.equal(definition['x-darkstar-filesystem'], 'none');
+    assert.equal(definition['x-darkstar-permission'], undefined, 'permission metadata must stay hidden from the model-facing schema');
+    assert.equal(rootRuntime.handlers.get('spawn_subagent').permission, 'read');
+    assert.deepEqual(definition.parameters.required, ['task']);
+    assert.ok(definition.parameters.properties.scope);
+    assert.ok(definition.parameters.properties.system_instructions);
+
+    const blockedChild = await service.buildRuntime({ subAgentsEnabled: true, toolChoice: 'auto', subAgentDepth: 1, allowSubAgentsToSpawnSubAgents: false, subAgentDelegationPolicyVersion: 1 }, { skills: [] });
+    assert.equal(blockedChild.definitions.some((item) => item.function.name === 'spawn_subagent'), false);
+    const allowedChild = await service.buildRuntime({ subAgentsEnabled: true, toolChoice: 'auto', subAgentDepth: 1, allowSubAgentsToSpawnSubAgents: true, subAgentDelegationPolicyVersion: 1 }, { skills: [] });
+    assert.equal(allowedChild.definitions.some((item) => item.function.name === 'spawn_subagent'), true);
+    const legacyChild = await service.buildRuntime({ subAgentsEnabled: true, toolChoice: 'auto', subAgentDepth: 1 }, { skills: [] });
+    assert.equal(legacyChild.definitions.some((item) => item.function.name === 'spawn_subagent'), true, 'child runtimes created from workflows predating the switch must retain recursive delegation');
+    const configuredDepthChild = await service.buildRuntime({ subAgentsEnabled: true, toolChoice: 'auto', subAgentDepth: 8, subAgentMaxDepth: 12, allowSubAgentsToSpawnSubAgents: true, subAgentDelegationPolicyVersion: 1 }, { skills: [] });
+    assert.equal(configuredDepthChild.definitions.some((item) => item.function.name === 'spawn_subagent'), true, 'a configured maximum above the current depth must keep recursive spawning available');
+    const configuredDepthLimit = await service.buildRuntime({ subAgentsEnabled: true, toolChoice: 'auto', subAgentDepth: 12, subAgentMaxDepth: 12, allowSubAgentsToSpawnSubAgents: true, subAgentDelegationPolicyVersion: 1 }, { skills: [] });
+    assert.equal(configuredDepthLimit.definitions.some((item) => item.function.name === 'spawn_subagent'), false, 'the configured maximum must remove spawn_subagent exactly at that depth');
+    const unlimitedDepthChild = await service.buildRuntime({ subAgentsEnabled: true, toolChoice: 'auto', subAgentDepth: 9000, subAgentMaxDepth: 0, allowSubAgentsToSpawnSubAgents: true, subAgentDelegationPolicyVersion: 1 }, { skills: [] });
+    assert.equal(unlimitedDepthChild.definitions.some((item) => item.function.name === 'spawn_subagent'), true, 'unlimited must keep spawn_subagent available without a hidden fallback ceiling');
+});
+
+test('sub-agent request keeps the parent capability/scope envelope but receives an independent scoped conversation', () => {
+    const parent = {
+        model: 'model.gguf',
+        messages: [
+            { role: 'system', content: 'Parent system policy.' },
+            { role: 'user', content: 'Unrelated parent conversation text.' },
+        ],
+        cacheIdentity: 'project:7:tab:9',
+        cacheReuseProven: true,
+        tools: {
+            providers: [{ kind: 'python', path: 'agent_assets/tools/list_dir.py' }],
+            toolChoice: 'auto',
+            maxRounds: 6,
+            workspaceId: 'project-7',
+            projectId: 7,
+            tabId: 9,
+            browserId: '9',
+        },
+        skills: { skills: [{ path: 'skill.md' }] },
+        control: { reasoning: 'auto' },
+    };
+    const metadata = { id: 'subagent-test', parentId: '', rootRequestId: 'root-request', depth: 1 };
+    const child = buildSubAgentRequest(parent, {
+        task: 'Inspect only the delegated component.',
+        scope: 'Limit work to parser behavior.',
+        system_instructions: 'Return exact evidence.',
+    }, metadata);
+
+    assert.deepEqual(child.tools.providers, parent.tools.providers);
+    assert.deepEqual(child.skills, parent.skills);
+    assert.equal(child.tools.workspaceId, 'project-7');
+    assert.equal(child.tools.projectId, 7);
+    assert.equal(child.tools.tabId, 9);
+    assert.equal(child.tools.subAgentDepth, 1);
+    assert.equal(child.tools.subAgentId, 'subagent-test');
+    assert.equal(child.tools.subAgentMaxDepth, 8, 'legacy parents without the setting must inherit the backward-compatible default');
+    assert.equal(child.tools.allowSubAgentsToSpawnSubAgents, true, 'missing legacy policy must be canonicalized to enabled for descendants');
+    assert.equal(child.tools.subAgentDelegationPolicyVersion, 1);
+    const customDepthChild = buildSubAgentRequest({ ...parent, tools: { ...parent.tools, subAgentMaxDepth: 24 } }, { task: 'Custom depth.' }, metadata);
+    assert.equal(customDepthChild.tools.subAgentMaxDepth, 24, 'the configured maximum must propagate unchanged into descendants');
+    const unlimitedChild = buildSubAgentRequest({ ...parent, tools: { ...parent.tools, subAgentMaxDepth: 0 } }, { task: 'Unlimited depth.' }, metadata);
+    assert.equal(unlimitedChild.tools.subAgentMaxDepth, 0, 'unlimited must propagate unchanged into descendants');
+    const legacyFalseChild = buildSubAgentRequest({ ...parent, tools: { ...parent.tools, allowSubAgentsToSpawnSubAgents: false } }, { task: 'Legacy false.' }, metadata);
+    assert.equal(legacyFalseChild.tools.allowSubAgentsToSpawnSubAgents, true, 'unversioned false must migrate to ON instead of stripping delegation from the child');
+    const explicitlyBlockedChild = buildSubAgentRequest({ ...parent, tools: { ...parent.tools, allowSubAgentsToSpawnSubAgents: false, subAgentDelegationPolicyVersion: 1 } }, { task: 'No recursion.' }, metadata);
+    assert.equal(explicitlyBlockedChild.tools.allowSubAgentsToSpawnSubAgents, false, 'a versioned explicit Orchestrator OFF setting must remain authoritative');
+    assert.equal(child.cacheIdentity, 'project:7:tab:9:subagent:subagent-test');
+    assert.equal(child.cacheReuseProven, false);
+    assert.equal(child.messages.length, 2);
+    assert.equal(child.messages[1].role, 'user');
+    assert.equal(child.messages[1].content, 'Inspect only the delegated component.');
+    assert.match(child.messages[0].content, /Parent system policy\./u);
+    assert.match(child.messages[0].content, /Limit work to parser behavior\./u);
+    assert.match(child.messages[0].content, /Return exact evidence\./u);
+    assert.match(child.messages[0].content, /The spawn_subagent tool is available in this run\./u);
+    assert.doesNotMatch(child.messages[0].content, /Unrelated parent conversation text/u);
+    assert.match(explicitlyBlockedChild.messages[0].content, /The spawn_subagent tool is not available in this run\./u);
+    const depthLimitedChild = buildSubAgentRequest({ ...parent, tools: { ...parent.tools, subAgentMaxDepth: 2, allowSubAgentsToSpawnSubAgents: true, subAgentDelegationPolicyVersion: 1 } }, { task: 'At limit.' }, { ...metadata, depth: 2 });
+    assert.equal(depthLimitedChild.tools.subAgentMaxDepth, 2);
+    assert.match(depthLimitedChild.messages[0].content, /The spawn_subagent tool is not available in this run\./u, 'child system envelope must agree with the configured maximum');
+    const unlimitedDeepChild = buildSubAgentRequest({ ...parent, tools: { ...parent.tools, subAgentMaxDepth: 0, allowSubAgentsToSpawnSubAgents: true, subAgentDelegationPolicyVersion: 1 } }, { task: 'Deep unlimited.' }, { ...metadata, depth: 9000 });
+    assert.match(unlimitedDeepChild.messages[0].content, /The spawn_subagent tool is available in this run\./u, 'unlimited depth must remain model-visible at arbitrarily deep descendants');
+
+    const grandchild = buildSubAgentRequest(child, { task: 'Nested task.', scope: 'Nested scope only.' }, {
+        id: 'subagent-grandchild', parentId: 'subagent-test', rootRequestId: 'root-request', depth: 2,
+    });
+    assert.equal((grandchild.messages[0].content.match(/<darkstar_subagent>/gu) || []).length, 1, 'nested prompts must contain only the current delegation envelope');
+    assert.match(grandchild.messages[0].content, /Parent system policy\./u, 'root system policy must still be inherited');
+    assert.match(grandchild.messages[0].content, /Sub-agent depth: 2\./u);
+    assert.doesNotMatch(grandchild.messages[0].content, /Sub-agent depth: 1\./u, 'parent agent identity must not leak into the child system envelope');
+    assert.doesNotMatch(grandchild.messages[0].content, /Limit work to parser behavior\./u, 'a parent-specific delegated scope must not masquerade as the nested child scope');
+    assert.match(grandchild.messages[0].content, /Nested scope only\./u);
+});
+
+test('spawn_subagent runs synchronously through the normal agent loop, returns only child output to the parent tool result, and invalidates parent KV reuse proof', async () => {
+    const service = testToolService();
+    const events = [];
+    const seenBodies = [];
+    const runtime = {
+        toolService: service,
+        normalizeChatRequest(request) {
+            return {
+                messages: structuredClone(request.messages || []),
+                cache_prompt: request.cachePrompt !== false,
+                ...(request.cacheReuseProven === true ? { _darkstar_cache_reuse_proven: true } : {}),
+            };
+        },
+        async performChatCompletion(body, signal, handlers) {
+            assert.equal(signal.aborted, false);
+            seenBodies.push(structuredClone(body));
+            const system = (body.messages || []).filter((message) => message.role === 'system').map((message) => String(message.content || '')).join('\n');
+            const child = system.includes('<darkstar_subagent>');
+            if (child) {
+                handlers.onChunk?.({ content: 'child result', reasoning: '' });
+                return completion('child result');
+            }
+            const toolResult = (body.messages || []).find((message) => message.role === 'tool' && message.name === 'spawn_subagent');
+            if (toolResult) {
+                assert.equal(toolResult.content, 'child result');
+                handlers.onChunk?.({ content: 'main final', reasoning: '' });
+                return completion('main final');
+            }
+            return completion('', [{
+                id: 'spawn-call-1',
+                type: 'function',
+                function: {
+                    name: 'spawn_subagent',
+                    arguments: JSON.stringify({ task: 'Do the delegated check.', scope: 'Only inspect the target.' }),
+                },
+            }]);
+        },
+    };
+
+    const result = await streamAgent(runtime, {
+        model: 'model.gguf',
+        messages: [{ role: 'system', content: 'Root policy.' }, { role: 'user', content: 'Parent task.' }],
+        cachePrompt: true,
+        cacheIdentity: 'project:2:tab:3',
+        cacheReuseProven: true,
+        tools: {
+            subAgentsEnabled: true,
+            allowSubAgentsToSpawnSubAgents: false,
+            subAgentDelegationPolicyVersion: 1,
+            toolChoice: 'auto',
+            maxRounds: 4,
+            workspaceId: 'project-2',
+            projectId: 2,
+            tabId: 3,
+            browserId: '3',
+        },
+        skills: { skills: [] },
+        vision: { enabled: false, projectorPath: null },
+    }, new AbortController(), {
+        onToolEvent(payload) { events.push(structuredClone(payload)); },
+    }, 'root-request');
+
+    assert.equal(result.text, 'main final');
+    const parentToolResult = result.toolMessages.find((message) => message.role === 'tool' && message.name === 'spawn_subagent');
+    assert.ok(parentToolResult);
+    assert.equal(parentToolResult.content, 'child result');
+    assert.ok(events.some((event) => event.type === 'subagent-start'));
+    assert.ok(events.some((event) => event.type === 'subagent-chunk' && event.chunk.content === 'child result'));
+    assert.ok(events.some((event) => event.type === 'subagent-complete' && event.output === 'child result'));
+
+    const childBody = seenBodies.find((body) => (body.messages || []).some((message) => String(message.content || '').includes('<darkstar_subagent>')));
+    assert.ok(childBody, 'child completion must use an isolated delegated conversation');
+    assert.equal(Array.isArray(childBody.tools), false, 'nested spawn tool must not be exposed when the Orchestrator switch is OFF');
+    const finalParentBody = seenBodies.at(-1);
+    assert.equal(Object.hasOwn(finalParentBody, '_darkstar_cache_reuse_proven'), false,
+        'parent must reconcile its KV state after the child used the same physical llama slot');
+});
+
+
+test('nested sub-agent delegation recurses across multiple generations when the Orchestrator switch allows it', async () => {
+    const service = testToolService();
+    const events = [];
+    const runtime = {
+        toolService: service,
+        normalizeChatRequest(request) {
+            return { messages: structuredClone(request.messages || []), cache_prompt: true };
+        },
+        async performChatCompletion(body) {
+            const messages = body.messages || [];
+            const system = messages.filter((message) => message.role === 'system').map((message) => String(message.content || '')).join('\n');
+            const toolResult = messages.find((message) => message.role === 'tool' && message.name === 'spawn_subagent');
+            const advertisedTools = Array.isArray(body.tools) ? body.tools.map((definition) => String(definition?.function?.name || '')) : [];
+            if (/Sub-agent depth: 3\./u.test(system)) {
+                assert.ok(advertisedTools.includes('spawn_subagent'), 'depth-3 agent must still be advertised the recursive spawn tool before the depth limit');
+                return completion('great-grandchild result');
+            }
+            if (/Sub-agent depth: 2\./u.test(system)) {
+                assert.ok(advertisedTools.includes('spawn_subagent'), 'grandchild request must advertise spawn_subagent in the actual model tool schema');
+                if (toolResult) return completion(`grandchild received: ${toolResult.content}`);
+                return completion('', [{
+                    id: 'nested-spawn-depth-3', type: 'function',
+                    function: { name: 'spawn_subagent', arguments: JSON.stringify({ task: 'Great-grandchild task.' }) },
+                }]);
+            }
+            if (/Sub-agent depth: 1\./u.test(system)) {
+                assert.ok(advertisedTools.includes('spawn_subagent'), 'child request must advertise spawn_subagent in the actual model tool schema');
+                if (toolResult) return completion(`child received: ${toolResult.content}`);
+                return completion('', [{
+                    id: 'nested-spawn-depth-2', type: 'function',
+                    function: { name: 'spawn_subagent', arguments: JSON.stringify({ task: 'Grandchild task.' }) },
+                }]);
+            }
+            if (toolResult) return completion(`root received: ${toolResult.content}`);
+            return completion('', [{
+                id: 'root-spawn', type: 'function',
+                function: { name: 'spawn_subagent', arguments: JSON.stringify({ task: 'Child task.' }) },
+            }]);
+        },
+    };
+
+    const result = await streamAgent(runtime, {
+        model: 'model.gguf',
+        messages: [{ role: 'system', content: 'Root policy.' }, { role: 'user', content: 'Delegate recursively.' }],
+        cacheIdentity: 'project:4:tab:6',
+        tools: {
+            subAgentsEnabled: true,
+            // Reproduce workflows saved by the first switch implementation: the
+            // generated default false was persisted without a policy version.
+            allowSubAgentsToSpawnSubAgents: false,
+            toolChoice: 'auto',
+            maxRounds: 5,
+            workspaceId: 'project-4',
+            projectId: 4,
+            tabId: 6,
+            browserId: '6',
+        },
+        skills: { skills: [] },
+        vision: { enabled: false, projectorPath: null },
+    }, new AbortController(), {
+        onToolEvent(payload) { events.push(structuredClone(payload)); },
+    }, 'nested-root');
+
+    assert.equal(result.text, 'root received: child received: grandchild received: great-grandchild result');
+    const starts = events.filter((event) => event.type === 'subagent-start');
+    assert.deepEqual(starts.map((event) => event.subAgent.depth), [1, 2, 3]);
+    assert.equal(starts[1].subAgent.parentId, starts[0].subAgent.id);
+    assert.equal(starts[2].subAgent.parentId, starts[1].subAgent.id);
+    assert.ok(events.some((event) => event.type === 'subagent-complete' && event.subAgent.depth === 3 && event.output === 'great-grandchild result'));
+    assert.ok(events.some((event) => event.type === 'subagent-complete' && event.subAgent.depth === 2 && event.output === 'grandchild received: great-grandchild result'));
+    assert.ok(events.some((event) => event.type === 'subagent-complete' && event.subAgent.depth === 1 && event.output === 'child received: grandchild received: great-grandchild result'));
+});
+
+
+test('nested sub-agent results are route-checked against the immediate calling agent', async () => {
+    const service = testToolService();
+    const runtime = await service.buildRuntime({
+        subAgentsEnabled: true,
+        subAgentDepth: 6,
+        subAgentId: 'agent-6',
+        allowSubAgentsToSpawnSubAgents: true,
+        subAgentDelegationPolicyVersion: 1,
+        toolChoice: 'auto',
+    }, { skills: [] }, {
+        runSubAgent: async () => createSubAgentResult('agent-7 result', {
+            childId: 'agent-7',
+            parentId: 'agent-1',
+            rootRequestId: 'root',
+            depth: 7,
+        }),
+    });
+    const call = {
+        id: 'spawn-agent-7',
+        type: 'function',
+        function: { name: 'spawn_subagent', arguments: JSON.stringify({ task: 'Depth seven task.' }) },
+    };
+    await assert.rejects(
+        () => service.execute(runtime, call, { signal: new AbortController().signal, interactionId: 'agent-6' }),
+        (error) => error && error.code === 'SUBAGENT_RESULT_PARENT_MISMATCH' && /agent-6/u.test(error.message) && /agent-1/u.test(error.message),
+        'a child result addressed to any ancestor other than the immediate caller must be rejected',
+    );
+});
+
+test('seven-level nested delegation unwinds strictly one immediate parent at a time', async () => {
+    const service = testToolService();
+    const events = [];
+    const receivedByDepth = [];
+    const maxDepth = 7;
+    const runtime = {
+        toolService: service,
+        normalizeChatRequest(request) {
+            return { messages: structuredClone(request.messages || []), cache_prompt: true };
+        },
+        async performChatCompletion(body) {
+            const messages = body.messages || [];
+            const system = messages.filter((message) => message.role === 'system').map((message) => String(message.content || '')).join('\n');
+            const depthMatch = system.match(/Sub-agent depth: (\d+)\./u);
+            const depth = depthMatch ? Number(depthMatch[1]) : 0;
+            assert.equal((system.match(/<darkstar_subagent>/gu) || []).length, depth > 0 ? 1 : 0, 'each nested request must contain only its own current sub-agent envelope');
+            const toolResult = messages.find((message) => message.role === 'tool' && message.name === 'spawn_subagent');
+            if (depth === maxDepth) return completion(`D${depth}`);
+            if (toolResult) {
+                receivedByDepth.push({ depth, content: toolResult.content });
+                return completion(`D${depth}<-${toolResult.content}`);
+            }
+            return completion('', [{
+                id: `spawn-depth-${depth + 1}`,
+                type: 'function',
+                function: { name: 'spawn_subagent', arguments: JSON.stringify({ task: `Depth ${depth + 1} task.` }) },
+            }]);
+        },
+    };
+
+    const result = await streamAgent(runtime, {
+        model: 'model.gguf',
+        messages: [{ role: 'system', content: 'Root policy.' }, { role: 'user', content: 'Delegate seven levels.' }],
+        cacheIdentity: 'project:9:tab:11',
+        tools: {
+            subAgentsEnabled: true,
+            allowSubAgentsToSpawnSubAgents: true,
+            subAgentDelegationPolicyVersion: 1,
+            toolChoice: 'auto',
+            maxRounds: 12,
+            workspaceId: 'project-9',
+            projectId: 9,
+            tabId: 11,
+            browserId: '11',
+        },
+        skills: { skills: [] },
+        vision: { enabled: false, projectorPath: null },
+    }, new AbortController(), {
+        onToolEvent(payload) { events.push(structuredClone(payload)); },
+    }, 'seven-level-root');
+
+    assert.equal(result.text, 'D0<-D1<-D2<-D3<-D4<-D5<-D6<-D7');
+    assert.deepEqual(receivedByDepth.map((entry) => entry.depth), [6, 5, 4, 3, 2, 1, 0]);
+    for (const entry of receivedByDepth) {
+        const expectedChildChain = Array.from({ length: maxDepth - entry.depth }, (_, index) => `D${entry.depth + 1 + index}`).join('<-');
+        assert.equal(entry.content, expectedChildChain, `depth ${entry.depth} must receive only depth ${entry.depth + 1}'s fully resolved result`);
+    }
+    const starts = events.filter((event) => event.type === 'subagent-start');
+    assert.deepEqual(starts.map((event) => event.subAgent.depth), [1, 2, 3, 4, 5, 6, 7]);
+    for (let index = 1; index < starts.length; index += 1) {
+        assert.equal(starts[index].subAgent.parentId, starts[index - 1].subAgent.id, `depth ${index + 1} must belong to depth ${index}`);
+    }
+    const completions = events.filter((event) => event.type === 'subagent-complete');
+    assert.deepEqual(completions.map((event) => event.subAgent.depth), [7, 6, 5, 4, 3, 2, 1], 'completion must unwind from the leaf toward the root');
+    const returns = events.filter((event) => event.type === 'subagent-return');
+    assert.deepEqual(returns.map((event) => event.subAgent.depth), [7, 6, 5, 4, 3, 2], 'every nested child must emit an explicit immediate-parent return event');
+    for (const event of returns) assert.equal(event.returnTo.id, event.subAgent.parentId);
+});
+
+test('online-browser taint from a sub-agent remains inside Darkstar security compartment while the parent receives plain child text', async () => {
+    const service = testToolService();
+    const runtime = await service.buildRuntime({
+        subAgentsEnabled: true,
+        subAgentDepth: 0,
+        toolChoice: 'auto',
+        workspaceId: 'project-5',
+        projectId: 5,
+        tabId: 8,
+        browserId: '8',
+    }, { skills: [] }, {
+        runSubAgent: async () => createSubAgentResult('child browser finding', {
+            childId: 'online-child', parentId: 'root-online', rootRequestId: 'root-online', depth: 1,
+            browserCompartmentActivated: true,
+            browserCompartmentToolName: 'browser_control',
+        }),
+    });
+    const call = {
+        id: 'spawn-online-child',
+        type: 'function',
+        function: { name: 'spawn_subagent', arguments: JSON.stringify({ task: 'Inspect the online page.' }) },
+    };
+    const executed = await service.execute(runtime, call, { signal: new AbortController().signal, interactionId: 'root-online' });
+    assert.equal(executed.result, 'child browser finding', 'internal taint metadata must not leak into the parent model-visible tool result');
+    assert.equal(executed.rawResult.browserCompartmentActivated, true);
+    assert.equal(untrustedBrowserToolName('spawn_subagent', executed.rawResult, {}), 'browser_control',
+        'parent agent must enter the same browser-only compartment after consuming a child result derived from online content');
+    assert.equal(untrustedBrowserToolName('spawn_subagent', createSubAgentResult('offline child'), {}), '',
+        'ordinary child results must not activate an online-browser compartment');
+});
+
+test('sub-agent message panes keep two fixed hemispheres and horizontally follow newly spawned agents until the user detaches', () => {
+    const html = fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'index.html'), 'utf8');
+    const css = fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'styles.css'), 'utf8');
+    const renderer = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'subagents.js'), 'utf8');
+    const chat = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'chat.js'), 'utf8');
+    const send = fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'send.js'), 'utf8');
+
+    assert.match(html, /id="agentPaneViewport"[\s\S]*?id="agentPaneTrack"[\s\S]*?id="mainAgentPane"[\s\S]*?id="chatContainer"/u);
+    assert.match(css, /\.agent-pane-viewport \{[\s\S]*?overflow-x: auto;[\s\S]*?overflow-y: hidden;/u);
+    assert.match(css, /\.agent-pane \{[\s\S]*?flex: 1 0 100%;[\s\S]*?min-width: 100%;/u);
+    assert.match(css, /\.agent-pane-track\.has-subagents > \.agent-pane \{[\s\S]*?flex: 0 0 50%;[\s\S]*?min-width: 50%;/u);
+    assert.match(css, /\.agent-pane\[hidden\] \{ display: none; \}/u);
+    assert.match(renderer, /horizontalDetachedByTab/u);
+    assert.match(renderer, /function isAtRight\(element\)/u);
+    assert.match(renderer, /function followRight\(tabId, smooth\)/u);
+    assert.match(renderer, /scrollTo\(\{ left: 2147483647, behavior: smooth === true \? 'smooth' : 'auto' \}\)/u);
+    assert.match(renderer, /horizontalScrollIntentActive\(\)[\s\S]*?current < previousHorizontalScrollLeft - 1[\s\S]*?setHorizontalDetached\(key, true\)/u);
+    assert.match(renderer, /isAtRight\(this\)[\s\S]*?setHorizontalDetached\(key, false\)/u);
+    assert.match(renderer, /record\.ownerTabId === currentTabKey\(\)[\s\S]*?followRight\(record\.ownerTabId, true\)/u);
+    assert.match(renderer, /ownerTabId: tabKey\(owner && owner\.tabId/u);
+    assert.match(renderer, /function syncForTab\(tabId\)/u);
+    assert.match(chat, /Darkstar\.subagents\.syncForTab\(tab\.id\)/u, 'every chat render must reconcile pane visibility to the active tab');
+    assert.match(renderer, /payload\.type === 'subagent-return'[\s\S]*?markReturnToImmediateParent\(payload\)/u);
+    assert.match(send, /Darkstar\.subagents\.handleToolEvent\(payload, \{ requestId: session\.requestId, tabId: session\.tabId \}\)/u);
+    assert.match(send, /Darkstar\.subagents\.closeForRequest\(session\.requestId\)/u);
+});
+
+test('sub-agent panes are isolated per tab and restore only the owning tab layout', () => {
+    function makeClassList() {
+        const values = new Set();
+        return {
+            add(name) { values.add(name); },
+            remove(name) { values.delete(name); },
+            toggle(name, force) {
+                if (force === undefined ? !values.has(name) : force) values.add(name);
+                else values.delete(name);
+                return values.has(name);
+            },
+            contains(name) { return values.has(name); },
+        };
+    }
+    function makeElement() {
+        return {
+            children: [],
+            dataset: {},
+            hidden: false,
+            scrollLeft: 0,
+            scrollTop: 0,
+            scrollHeight: 0,
+            className: '',
+            classList: makeClassList(),
+            appendChild(child) { child.parentNode = this; this.children.push(child); return child; },
+            removeChild(child) { this.children = this.children.filter((item) => item !== child); child.parentNode = null; },
+            setAttribute() {},
+            querySelector() { return null; },
+        };
+    }
+
+    const viewport = makeElement();
+    const track = makeElement();
+    const header = makeElement();
+    const elements = { agentPaneViewport: viewport, agentPaneTrack: track, mainAgentPaneHeader: header };
+    const context = {
+        console, Map, Math, Number, String, Array, Object, Set,
+        activeTabId: 1,
+        clearTimeout() {},
+        setTimeout() { return 1; },
+        document: {
+            getElementById(id) { return elements[id] || null; },
+            createElement() { return makeElement(); },
+        },
+        addMessage() { return null; },
+        Darkstar: {},
+    };
+    context.globalThis = context;
+    vm.createContext(context);
+    vm.runInContext(fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'subagents.js'), 'utf8'), context, { filename: 'subagents.js' });
+
+    const panes = context.Darkstar.subagents;
+    panes.syncForTab(1);
+    panes.handleToolEvent({ type: 'subagent-start', subAgent: { id: 'tab-1-child', task: 'Tab one child.' } }, { requestId: 'req-1', tabId: 1 });
+    const tabOnePane = track.children[0];
+    assert.ok(tabOnePane);
+    assert.equal(tabOnePane.hidden, false);
+    assert.equal(track.classList.contains('has-subagents'), true);
+    assert.equal(header.hidden, false);
+    assert.equal(panes.activeCount(1), 1);
+    assert.equal(panes.activeCount(2), 0);
+
+    viewport.scrollLeft = 84;
+    panes.syncForTab(2);
+    assert.equal(tabOnePane.hidden, true, 'Tab 1 child must disappear completely while Tab 2 is active');
+    assert.equal(track.classList.contains('has-subagents'), false, 'inactive-tab children must not force the main pane to 50%');
+    assert.equal(header.hidden, true);
+    assert.equal(viewport.scrollLeft, 0, 'Tab 1 horizontal position must not leak into a previously unseen Tab 2');
+
+    panes.handleToolEvent({ type: 'subagent-start', subAgent: { id: 'tab-2-child', task: 'Tab two child.' } }, { requestId: 'req-2', tabId: 2 });
+    const tabTwoPane = track.children[1];
+    assert.ok(tabTwoPane);
+    assert.equal(tabOnePane.hidden, true);
+    assert.equal(tabTwoPane.hidden, false);
+    assert.equal(track.classList.contains('has-subagents'), true);
+    assert.equal(panes.activeCount(1), 1);
+    assert.equal(panes.activeCount(2), 1);
+
+    panes.handleToolEvent({ type: 'subagent-start', subAgent: { id: 'tab-1-grandchild', parentId: 'tab-1-child', task: 'Nested Tab one child.', depth: 2 } }, { requestId: 'req-1', tabId: 1 });
+    const tabOneNestedPane = track.children[2];
+    assert.ok(tabOneNestedPane);
+    assert.equal(tabOneNestedPane.hidden, true, 'nested descendants must inherit the root generation tab and remain hidden off-tab');
+    assert.equal(panes.activeCount(1), 2);
+    assert.equal(panes.activeCount(2), 1);
+
+    viewport.scrollLeft = 31;
+    panes.syncForTab(1);
+    assert.equal(tabOnePane.hidden, false);
+    assert.equal(tabOneNestedPane.hidden, false, 'nested descendants must reappear only with their owning tab');
+    assert.equal(tabTwoPane.hidden, true, 'Tab 2 child must not appear after returning to Tab 1');
+
+    panes.handleToolEvent({ type: 'subagent-complete', subAgent: { id: 'tab-1-grandchild', parentId: 'tab-1-child', depth: 2 }, output: 'nested result' }, { requestId: 'req-1', tabId: 1 });
+    const nestedStatus = tabOneNestedPane.children[0].children[1];
+    const parentStatus = tabOnePane.children[0].children[1];
+    assert.equal(nestedStatus.textContent, 'Returned to parent', 'a nested child must visibly remain in returned state until its immediate parent receives the tool result');
+    panes.handleToolEvent({ type: 'subagent-return', subAgent: { id: 'tab-1-grandchild', parentId: 'tab-1-child', depth: 2 }, returnTo: { id: 'tab-1-child', depth: 1 } }, { requestId: 'req-1', tabId: 1 });
+    assert.equal(parentStatus.textContent, 'Child returned · resuming', 'the immediate parent pane must visibly own the return before any ancestor does');
+    panes.handleToolEvent({ type: 'subagent-tool-event', subAgent: { id: 'tab-1-child', depth: 1 }, event: { type: 'complete', activity: { name: 'spawn_subagent' } } }, { requestId: 'req-1', tabId: 1 });
+    assert.equal(parentStatus.textContent, 'Running', 'the parent resumes only after its own spawn_subagent tool result completes');
+
+    panes.syncForTab(2);
+    assert.equal(tabOnePane.hidden, true);
+    assert.equal(tabTwoPane.hidden, false);
+
+    panes.closeForTab(1);
+    assert.equal(panes.activeCount(1), 0);
+    assert.equal(panes.activeCount(2), 1);
+    assert.equal(tabTwoPane.hidden, false, 'closing an inactive tab must not disturb the active tab sub-agent');
+});
+
+test('horizontal sub-agent autoscroll follows right, detaches on manual leftward movement, and reattaches only at the right edge', () => {
+    function makeClassList() {
+        const values = new Set();
+        return {
+            add(name) { values.add(name); },
+            remove(name) { values.delete(name); },
+            toggle(name, force) { if (force === undefined ? !values.has(name) : force) values.add(name); else values.delete(name); },
+            contains(name) { return values.has(name); },
+        };
+    }
+    function makeElement() {
+        return {
+            children: [], dataset: {}, hidden: false, scrollLeft: 0, scrollTop: 0, scrollHeight: 0,
+            className: '', classList: makeClassList(), listeners: {},
+            appendChild(child) { child.parentNode = this; this.children.push(child); return child; },
+            removeChild(child) { this.children = this.children.filter((item) => item !== child); child.parentNode = null; },
+            setAttribute() {}, querySelector() { return null; },
+            addEventListener(type, handler) { (this.listeners[type] ||= []).push(handler); },
+            emit(type, event = {}) { for (const handler of this.listeners[type] || []) handler.call(this, event); },
+        };
+    }
+
+    const track = makeElement();
+    const viewport = makeElement();
+    const header = makeElement();
+    viewport.clientWidth = 1000;
+    Object.defineProperty(viewport, 'scrollWidth', {
+        get() {
+            const visibleChildren = track.children.filter((child) => child.hidden !== true).length;
+            return Math.max(this.clientWidth, (1 + visibleChildren) * this.clientWidth / 2);
+        },
+    });
+    const scrollCalls = [];
+    viewport.scrollTo = function(options) {
+        scrollCalls.push({ ...options });
+        this.scrollLeft = Math.max(0, this.scrollWidth - this.clientWidth);
+        this.emit('scroll');
+    };
+
+    const globalListeners = {};
+    const elements = { agentPaneViewport: viewport, agentPaneTrack: track, mainAgentPaneHeader: header };
+    const context = {
+        console, Map, Math, Number, String, Array, Object, Set, Date,
+        activeTabId: 1,
+        clearTimeout() {}, setTimeout() { return 1; }, requestAnimationFrame(fn) { fn(); return 1; },
+        addEventListener(type, handler) { (globalListeners[type] ||= []).push(handler); },
+        document: { getElementById(id) { return elements[id] || null; }, createElement() { return makeElement(); } },
+        addMessage() { return null; }, Darkstar: {},
+    };
+    context.globalThis = context;
+    vm.createContext(context);
+    vm.runInContext(fs.readFileSync(path.join(ROOT, 'backend', 'renderer', 'subagents.js'), 'utf8'), context, { filename: 'subagents.js' });
+
+    const panes = context.Darkstar.subagents;
+    const start = (id, tabId = 1) => panes.handleToolEvent({ type: 'subagent-start', subAgent: { id, task: id } }, { requestId: `req-${tabId}`, tabId });
+    const releasePointer = () => { for (const handler of globalListeners.pointerup || []) handler({}); };
+
+    panes.syncForTab(1);
+    start('d1');
+    start('d2');
+    assert.equal(viewport.scrollLeft, 500, 'second sub-agent must move the viewport to the newly appended right-hand pane');
+    assert.equal(scrollCalls.at(-1).behavior, 'smooth', 'spawn following must use smooth horizontal scrolling');
+
+    const callsBeforeDetach = scrollCalls.length;
+    viewport.emit('pointerdown');
+    viewport.scrollLeft = 200;
+    viewport.emit('scroll');
+    releasePointer();
+    start('d3');
+    assert.equal(viewport.scrollLeft, 200, 'a manually detached viewport must not be dragged to a newly spawned agent');
+    assert.equal(scrollCalls.length, callsBeforeDetach, 'detached follow mode must issue no programmatic right scroll');
+
+    viewport.scrollLeft = viewport.scrollWidth - viewport.clientWidth;
+    viewport.emit('scroll');
+    start('d4');
+    assert.equal(viewport.scrollLeft, 1500, 'reaching the physical right edge must reattach follow mode for the next spawn');
+    assert.equal(scrollCalls.at(-1).behavior, 'smooth');
+
+    viewport.emit('pointerdown');
+    viewport.scrollLeft = 700;
+    viewport.emit('scroll');
+    releasePointer();
+    panes.syncForTab(2);
+    start('tab2-d1', 2);
+    start('tab2-d2', 2);
+    assert.equal(viewport.scrollLeft, 500, 'another tab must retain an independent attached horizontal follow state');
+    panes.syncForTab(1);
+    assert.equal(viewport.scrollLeft, 700, 'returning to a manually detached tab must restore its detached position instead of snapping right');
+});
+});
+
+
+// ============================================================================
+// TEST MODULE: backend/Dev/tests/managed-workflow-storage-regression.test.js
+// ============================================================================
+TEST_FACTORIES.set("backend/Dev/tests/managed-workflow-storage-regression.test.js", function(module, exports, require, __filename, __dirname) {
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+
+const {
+    DEFAULT_WORKFLOW_FILENAME,
+    MANAGED_WORKFLOWS_DIRECTORY,
+    bundledDefaultWorkflowPath,
+    initializeManagedWorkflows,
+    legacyManagedWorkflowRoots,
+    resolveManagedWorkflowsRoot,
+} = require('../../app/managed-workflow-storage');
+
+const ROOT = path.resolve(__dirname, '..', '..', '..');
+
+test('Windows managed workflows resolve under LocalAppData/Darkstar/Workflows', () => {
+    const localAppData = path.join(os.tmpdir(), 'LocalAppData');
+    const resolved = resolveManagedWorkflowsRoot({
+        platform: 'win32',
+        localAppData,
+        userDataDir: path.join(os.tmpdir(), 'Roaming', 'Darkstar'),
+        baseDir: path.join(os.tmpdir(), 'Darkstar-App'),
+    });
+    assert.equal(resolved, path.resolve(localAppData, 'Darkstar', 'Workflows'));
+    assert.equal(MANAGED_WORKFLOWS_DIRECTORY, 'Workflows');
+});
+
+test('portable workflow storage remains beside the portable data root', () => {
+    const portableRoot = path.join(os.tmpdir(), 'Darkstar-Portable');
+    assert.equal(resolveManagedWorkflowsRoot({
+        platform: 'win32',
+        portableDataRoot: portableRoot,
+        localAppData: path.join(os.tmpdir(), 'LocalAppData'),
+    }), path.resolve(portableRoot, 'Workflows'));
+});
+
+test('missing managed workflow storage is created and seeded byte-for-byte from the bundled default', (t) => {
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-workflow-storage-seed-'));
+    t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+    const workflowsRoot = path.join(baseDir, 'LocalAppData', 'Darkstar', 'Workflows');
+    const seedPath = bundledDefaultWorkflowPath(ROOT);
+    const result = initializeManagedWorkflows({ workflowsRoot, seedPath, legacyRoots: [], logger: { log() {}, warn() {} } });
+
+    assert.equal(fs.statSync(workflowsRoot).isDirectory(), true);
+    assert.equal(result.defaultWorkflowPath, path.join(workflowsRoot, DEFAULT_WORKFLOW_FILENAME));
+    assert.deepEqual(fs.readFileSync(result.defaultWorkflowPath), fs.readFileSync(seedPath));
+});
+
+test('seeded managed storage is immediately visible through the workflow file API', async (t) => {
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-workflow-storage-api-'));
+    t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+    const workflowsRoot = path.join(baseDir, 'Workflows');
+    initializeManagedWorkflows({ workflowsRoot, seedPath: bundledDefaultWorkflowPath(ROOT), legacyRoots: [], logger: { log() {}, warn() {} } });
+    const { listWorkflows, loadWorkflow } = require('../../workflow/workflow-files');
+
+    assert.deepEqual(await listWorkflows({ defaultDirectory: workflowsRoot }), [DEFAULT_WORKFLOW_FILENAME]);
+    const loaded = await loadWorkflow({ payload: { fileName: DEFAULT_WORKFLOW_FILENAME }, defaultDirectory: workflowsRoot });
+    assert.equal(loaded.success, true);
+    assert.equal(Array.isArray(loaded.snapshot?.editor?.nodes || loaded.snapshot?.nodes), true);
+});
+
+test('distribution keeps only an immutable workflow seed and no writable root workflows directory', () => {
+    assert.equal(fs.existsSync(path.join(ROOT, 'workflows')), false);
+    assert.equal(fs.statSync(bundledDefaultWorkflowPath(ROOT)).isFile(), true);
+    const packageJson = JSON.parse(fs.readFileSync(path.join(ROOT, 'backend', 'shell', 'package.json'), 'utf8'));
+    assert.equal(packageJson.build.files.includes('workflows/'), false);
+});
+
+test('legacy root workflows are copied into AppData without deleting the old application directory', (t) => {
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-workflow-storage-legacy-'));
+    t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+    const legacyRoot = path.join(baseDir, 'workflows');
+    const workflowsRoot = path.join(baseDir, 'LocalAppData', 'Darkstar', 'Workflows');
+    fs.mkdirSync(legacyRoot, { recursive: true });
+    fs.copyFileSync(bundledDefaultWorkflowPath(ROOT), path.join(legacyRoot, 'darkstar-workflow.dswf'));
+    fs.copyFileSync(bundledDefaultWorkflowPath(ROOT), path.join(legacyRoot, 'my-workflow.dswf'));
+
+    const result = initializeManagedWorkflows({
+        workflowsRoot,
+        seedPath: bundledDefaultWorkflowPath(ROOT),
+        legacyRoots: legacyManagedWorkflowRoots({ baseDir }),
+        logger: { log() {}, warn() {} },
+    });
+
+    assert.equal(result.imported.length, 2);
+    assert.equal(fs.existsSync(path.join(workflowsRoot, 'my-workflow.dswf')), true);
+    assert.equal(fs.existsSync(path.join(legacyRoot, 'my-workflow.dswf')), true, 'legacy application data must remain untouched after import');
+});
+
+test('existing user workflow files are preserved while a missing canonical default is reseeded', (t) => {
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-workflow-storage-existing-'));
+    t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+    const workflowsRoot = path.join(baseDir, 'Workflows');
+    fs.mkdirSync(workflowsRoot, { recursive: true });
+    fs.writeFileSync(path.join(workflowsRoot, 'custom.dswf'), 'do-not-touch');
+
+    initializeManagedWorkflows({ workflowsRoot, seedPath: bundledDefaultWorkflowPath(ROOT), legacyRoots: [], logger: { log() {}, warn() {} } });
+
+    assert.equal(fs.readFileSync(path.join(workflowsRoot, 'custom.dswf'), 'utf8'), 'do-not-touch');
+    assert.deepEqual(fs.readFileSync(path.join(workflowsRoot, DEFAULT_WORKFLOW_FILENAME)), fs.readFileSync(bundledDefaultWorkflowPath(ROOT)));
+});
+
+test('legacy name collisions never overwrite an existing AppData workflow', (t) => {
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-workflow-storage-collision-'));
+    t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+    const legacyRoot = path.join(baseDir, 'workflows');
+    const workflowsRoot = path.join(baseDir, 'Workflows');
+    fs.mkdirSync(legacyRoot, { recursive: true });
+    fs.mkdirSync(workflowsRoot, { recursive: true });
+    fs.writeFileSync(path.join(legacyRoot, 'same.dswf'), 'legacy');
+    fs.writeFileSync(path.join(workflowsRoot, 'same.dswf'), 'canonical');
+
+    const result = initializeManagedWorkflows({ workflowsRoot, seedPath: bundledDefaultWorkflowPath(ROOT), legacyRoots: [legacyRoot], logger: { log() {}, warn() {} } });
+    assert.equal(fs.readFileSync(path.join(workflowsRoot, 'same.dswf'), 'utf8'), 'canonical');
+    assert.equal(result.collisions.length, 1);
+});
+
+test('application wiring passes only the managed Workflows root to workflow IPC', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'backend', 'app', 'run-main-app.js'), 'utf8');
+    assert.match(source, /const workflowsRoot = resolveManagedWorkflowsRoot\(/u);
+    assert.match(source, /initializeManagedWorkflows\(\{ workflowsRoot, legacyRoots: legacyWorkflowRoots, seedPath: defaultWorkflowSeedPath/u);
+    assert.match(source, /workflowDirectory: workflowsRoot/u);
+    assert.doesNotMatch(source, /workflowDirectory:\s*path\.join\(baseDir,\s*['"]workflows['"]\)/u);
+});
+});
+
+// ============================================================================
+// TEST MODULE: backend/Dev/tests/managed-project-storage-regression.test.js
+// ============================================================================
+TEST_FACTORIES.set("backend/Dev/tests/managed-project-storage-regression.test.js", function(module, exports, require, __filename, __dirname) {
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+
+const {
+    MANAGED_PROJECTS_DIRECTORY,
+    legacyManagedProjectsRoots,
+    migrateLegacyManagedProjects,
+    resolveManagedProjectsRoot,
+} = require('../../app/managed-project-storage');
+const { ChatSessionStore } = require('../../preferences/chat-session-store');
+
+test('Windows managed projects resolve under LocalAppData/Darkstar/Darkstar-Projects', () => {
+    const localAppData = path.join(os.tmpdir(), 'LocalAppData');
+    const roamingUserData = path.join(os.tmpdir(), 'Roaming', 'Darkstar');
+    const resolved = resolveManagedProjectsRoot({
+        platform: 'win32',
+        localAppData,
+        userDataDir: roamingUserData,
+        baseDir: path.join(os.tmpdir(), 'Darkstar-App'),
+    });
+    assert.equal(resolved, path.resolve(localAppData, 'Darkstar', 'Darkstar-Projects'));
+    assert.equal(MANAGED_PROJECTS_DIRECTORY, 'Darkstar-Projects');
+});
+
+test('portable data roots retain portability while using the Darkstar-Projects directory name', () => {
+    const portableRoot = path.join(os.tmpdir(), 'Darkstar-Portable');
+    assert.equal(resolveManagedProjectsRoot({
+        platform: 'win32',
+        portableDataRoot: portableRoot,
+        localAppData: path.join(os.tmpdir(), 'LocalAppData'),
+        userDataDir: path.join(os.tmpdir(), 'Roaming', 'Darkstar'),
+    }), path.resolve(portableRoot, 'Darkstar-Projects'));
+});
+
+test('legacy managed projects are moved wholesale into the canonical root without losing project metadata', (t) => {
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-project-storage-migration-'));
+    t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+    const legacyRoot = path.join(baseDir, 'projects');
+    const projectsRoot = path.join(baseDir, 'LocalAppData', 'Darkstar', 'Darkstar-Projects');
+    const projectRoot = path.join(legacyRoot, 'Existing Project');
+    fs.mkdirSync(path.join(projectRoot, '.darkstar'), { recursive: true });
+    fs.writeFileSync(path.join(projectRoot, 'notes.txt'), 'preserve me');
+    fs.writeFileSync(path.join(projectRoot, '.darkstar', 'chat-session.dscs'), 'chat metadata');
+
+    const result = migrateLegacyManagedProjects({
+        projectsRoot,
+        legacyRoots: legacyManagedProjectsRoots({ dataRoot: baseDir }),
+        platform: process.platform,
+        logger: { log() {}, warn() {} },
+    });
+
+    assert.equal(result.migrated, true);
+    assert.equal(result.mode, 'rename');
+    assert.equal(fs.existsSync(legacyRoot), false);
+    assert.equal(fs.readFileSync(path.join(projectsRoot, 'Existing Project', 'notes.txt'), 'utf8'), 'preserve me');
+    assert.equal(fs.readFileSync(path.join(projectsRoot, 'Existing Project', '.darkstar', 'chat-session.dscs'), 'utf8'), 'chat metadata');
+});
+
+test('cross-volume migration promotes a complete copy and retains the legacy tree as a backup', (t) => {
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-project-storage-cross-volume-'));
+    t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+    const legacyRoot = path.join(baseDir, 'projects');
+    const projectsRoot = path.join(baseDir, 'target', 'Darkstar-Projects');
+    fs.mkdirSync(path.join(legacyRoot, 'Existing Project', '.darkstar'), { recursive: true });
+    fs.writeFileSync(path.join(legacyRoot, 'Existing Project', 'data.txt'), 'cross-volume-preserve');
+    fs.writeFileSync(path.join(legacyRoot, 'Existing Project', '.darkstar', 'chat-session.dscs'), 'chat-preserve');
+
+    const originalRenameSync = fs.renameSync;
+    let renameCalls = 0;
+    fs.renameSync = function(source, destination) {
+        renameCalls += 1;
+        if (renameCalls === 1) {
+            const error = new Error('simulated cross-device move');
+            error.code = 'EXDEV';
+            throw error;
+        }
+        return originalRenameSync(source, destination);
+    };
+    let result;
+    try {
+        result = migrateLegacyManagedProjects({
+            projectsRoot,
+            legacyRoots: [legacyRoot],
+            logger: { log() {}, warn() {} },
+        });
+    } finally {
+        fs.renameSync = originalRenameSync;
+    }
+
+    assert.equal(result.migrated, true);
+    assert.equal(result.mode, 'copy-backup');
+    assert.equal(fs.existsSync(legacyRoot), false);
+    assert.equal(fs.existsSync(result.backupPath), true);
+    assert.equal(fs.readFileSync(path.join(projectsRoot, 'Existing Project', 'data.txt'), 'utf8'), 'cross-volume-preserve');
+    assert.equal(fs.readFileSync(path.join(projectsRoot, 'Existing Project', '.darkstar', 'chat-session.dscs'), 'utf8'), 'chat-preserve');
+    assert.equal(fs.readFileSync(path.join(result.backupPath, 'Existing Project', 'data.txt'), 'utf8'), 'cross-volume-preserve');
+});
+
+test('an already-populated canonical root is never overwritten by legacy migration', (t) => {
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-project-storage-collision-'));
+    t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+    const projectsRoot = path.join(baseDir, 'canonical', 'Darkstar-Projects');
+    const legacyRoot = path.join(baseDir, 'projects');
+    fs.mkdirSync(path.join(projectsRoot, 'Canonical Project'), { recursive: true });
+    fs.mkdirSync(path.join(legacyRoot, 'Legacy Project'), { recursive: true });
+
+    const warnings = [];
+    const result = migrateLegacyManagedProjects({
+        projectsRoot,
+        legacyRoots: [legacyRoot],
+        logger: { log() {}, warn(message) { warnings.push(String(message)); } },
+    });
+    assert.equal(result.migrated, false);
+    assert.equal(result.reason, 'canonical-populated');
+    assert.equal(fs.existsSync(path.join(projectsRoot, 'Canonical Project')), true);
+    assert.equal(fs.existsSync(path.join(legacyRoot, 'Legacy Project')), true);
+    assert.equal(warnings.length, 1);
+});
+
+test('chat-session managed-root discovery follows the injected canonical projects root', (t) => {
+    const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-chat-managed-root-'));
+    t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+    const projectsRoot = path.join(baseDir, 'storage', 'Darkstar-Projects');
+    const projectRoot = path.join(projectsRoot, 'Managed');
+    fs.mkdirSync(projectRoot, { recursive: true });
+    const store = new ChatSessionStore({
+        legacyFilePath: path.join(baseDir, 'chat-session.dscs'),
+        registryPath: path.join(baseDir, 'chat-project-roots.json'),
+        baseDir,
+        projectsRoot,
+        encoder: { close() {} },
+    });
+    t.after(() => store.close());
+    assert.deepEqual(store._managedProjectRoots(), [fs.realpathSync(projectRoot)]);
+});
+});
+
 const testSources = new Map();
 for (const [id, factory] of TEST_FACTORIES) testSources.set(id, factoryBody(factory));
 const allVirtualSources = new Map([...productionSources, ...testSources]);
@@ -25324,7 +26328,7 @@ Module._load = function load(request, parent, isMain) {
         const { WorkspaceRegistry } = require(path.join(ROOT, 'backend', 'workspace', 'workspace-service'));
         const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'darkstar-delete-fallback-'));
         t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
-        const managedRoot = path.join(baseDir, 'projects', 'New Project 2');
+        const managedRoot = path.join(baseDir, 'Darkstar-Projects', 'New Project 2');
         fs.mkdirSync(path.join(managedRoot, 'New Directory'), { recursive: true });
         fs.writeFileSync(path.join(managedRoot, 'New Directory', 'data.txt'), 'delete-me');
         const workspace = new WorkspaceRegistry();
@@ -25399,7 +26403,7 @@ Module._load = function load(request, parent, isMain) {
 }
 
 // Release guard: managed projects are filesystem truth. The sidebar must enumerate
-// direct ./projects directories, automatically provide one when the root is empty,
+// direct Darkstar-Projects directories, automatically provide one when the root is empty,
 // and continuously reconcile additions/removals rather than trusting stale session state.
 {
     const { test } = require('node:test');
@@ -25426,15 +26430,15 @@ Module._load = function load(request, parent, isMain) {
         assert.equal(result.success, true);
         assert.deepEqual(result.projects.map((project) => project.name), ['New Project']);
         assert.equal(fs.isDirectory ? true : true, true);
-        assert.equal(fs.statSync(path.join(baseDir, 'projects', 'New Project', 'New Directory')).isDirectory(), true);
+        assert.equal(fs.statSync(path.join(baseDir, 'Darkstar-Projects', 'New Project', 'New Directory')).isDirectory(), true);
 
-        fs.mkdirSync(path.join(baseDir, 'projects', 'Alpha'));
-        fs.mkdirSync(path.join(baseDir, 'projects', 'Beta'));
-        fs.writeFileSync(path.join(baseDir, 'projects', 'not-a-project.txt'), 'ignore');
+        fs.mkdirSync(path.join(baseDir, 'Darkstar-Projects', 'Alpha'));
+        fs.mkdirSync(path.join(baseDir, 'Darkstar-Projects', 'Beta'));
+        fs.writeFileSync(path.join(baseDir, 'Darkstar-Projects', 'not-a-project.txt'), 'ignore');
         result = await list(null, {});
         assert.deepEqual(result.projects.map((project) => project.name), ['Alpha', 'Beta', 'New Project']);
 
-        fs.rmSync(path.join(baseDir, 'projects', 'Alpha'), { recursive: true, force: true });
+        fs.rmSync(path.join(baseDir, 'Darkstar-Projects', 'Alpha'), { recursive: true, force: true });
         result = await list(null, {});
         assert.deepEqual(result.projects.map((project) => project.name), ['Beta', 'New Project']);
     });
@@ -26202,7 +27206,7 @@ process.stdout.write('SAMPLERFLAG=' + out('--sampling-method') + '\\n');
 const fs=require('node:fs');
 const png=Buffer.from('${ONE_PIXEL_PNG}','base64');
 const a=process.argv.slice(2);
-if(a.includes('--help')){console.log('stable-diffusion.cpp sd-cli --diffusion-model --prompt --negative-prompt --output --steps --cfg-scale --sampling-method --scheduler --preview --preview-path --preview-interval euler karras');process.exit(0);}
+if(a.includes('--help')){console.log('stable-diffusion.cpp sd-cli --diffusion-model --prompt --negative-prompt --output --steps --cfg-scale --sampling-method --scheduler --preview --preview-path --preview-interval euler karras');process.exit(0);} 
 const val=(...names)=>{for(const n of names){const i=a.indexOf(n);if(i>=0)return a[i+1];}return '';};
 const preview=val('--preview-path'); const output=val('-o','--output');
 setTimeout(()=>fs.writeFileSync(preview,png),20);
