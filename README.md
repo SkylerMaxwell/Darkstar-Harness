@@ -31,12 +31,6 @@ Launch_Darkstar.bat
 
 Required runtime components are provisioned automatically when needed.
 
-For portable builds, use:
-
-```text
-Build_Portable_EXE.bat
-```
-
 Hardware requirements depend on the model, quantization, context size, and selected execution backend.
 
 ## License
