@@ -38,7 +38,7 @@ Darkstar/
 ├── agent_assets/
 │   ├── agent_prompts/        what each agent is told
 │   ├── skills/               what each agent can learn
-│   └── tools/                what each agent can use
+│   └── tools/                external tools
 ├── backend/
 │   ├── Darkstar_Core.js      ∅  the system
 │   ├── Darkstar_Renderer.js  ∅  the interface
