@@ -4,13 +4,9 @@
 
 <h1 align="center">Darkstar</h1>
 
-<p align="center"><b>Intelligence, contained.</b><br>Version 4.0.1</p>
+<p align="center"><b>Harness the Singularity</b><br>Version 4.0.1</p>
 
 ---
-
-Darkstar runs AI on your computer. One window. Your models, your files, your machine.
-
-You don't set it up. You don't maintain it. We already did.
 
 ## Modes
 
@@ -35,7 +31,7 @@ You don't set it up. You don't maintain it. We already did.
 
 This is the shape of Darkstar as it ships: its prompts, its tools, its skills, its interface shell.
 
-It is not the engine. The two files that *are* Darkstar are kept here as empty placeholders. They ship sealed, inside the installer.
+The dual monolith engine core is kept empty in order to protect IP.
 
 ```text
 Darkstar/
@@ -56,13 +52,12 @@ Darkstar/
 
 ## Get Darkstar
 
-Download the installer from **Releases**. Windows 10 or 11, or x86-64 Linux.
-
 Install. Launch. That's all.
 
 ## License
 
-Source-available, not open source. Governed by the **Darkstar Software License v3.0** ([LICENSE.md](LICENSE.md)).
-You may read it here and fork it on GitHub. No mirrors, no redistribution, no rebrands.
+While some of the source may be made available, Darkstar is NOT open source software. Darkstar is Governed by the **Darkstar Software License v3.0** ([LICENSE.md](LICENSE.md)).
+
+For business inquiries: smsterling@protonmail.com
 
 <p align="center"><sub>© 2026 S.M. Sterling</sub></p>
