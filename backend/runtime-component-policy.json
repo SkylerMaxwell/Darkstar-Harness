@@ -1,0 +1,292 @@
+{
+  "schemaVersion": 1,
+  "project": "Darkstar Harness",
+  "python": {
+    "version": "3.11.9",
+    "requiredSeries": "3.11",
+    "architecture": "amd64",
+    "root": "backend/vendor/python/win32-x64",
+    "sentinel": "python.exe",
+    "requirements": "backend/portable-python-requirements.txt",
+    "source": "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe",
+    "sha256": "5ee42c4eee1e6b4464bb23722f90b45303f79442df63083f05322f1785f5fdde",
+    "asset": "python-3.11.9-amd64.exe",
+    "publisher": "Python Software Foundation",
+    "packageIndex": "https://pypi.org/simple",
+    "license": "PSF-2.0",
+    "notice": "backend/vendor/python/PYTHON-LICENSE.txt"
+  },
+  "electron": {
+    "root": "backend/vendor/electron/win32-x64",
+    "sentinel": "electron.exe",
+    "versionFile": "version",
+    "required": false,
+    "notices": [
+      "backend/vendor/electron/win32-x64/LICENSE",
+      "backend/vendor/electron/win32-x64/LICENSES.chromium.html"
+    ],
+    "noticeChecks": {
+      "backend/vendor/electron/win32-x64/LICENSE": [
+        "Permission is hereby granted, free of charge",
+        "THE SOFTWARE IS PROVIDED"
+      ],
+      "backend/vendor/electron/win32-x64/LICENSES.chromium.html": [
+        "Chromium"
+      ]
+    },
+    "version": "43.2.0",
+    "bootstrap": {
+      "asset": "electron-v43.2.0-win32-x64.zip",
+      "url": "https://github.com/electron/electron/releases/download/v43.2.0/electron-v43.2.0-win32-x64.zip",
+      "sha256": "eba5f5088af40ecb364fe258809c79a5234c6ece5a75c64722772eba01b02786"
+    }
+  },
+  "backendBin": {
+    "root": "backend/bin",
+    "components": [
+      {
+        "id": "llama.cpp",
+        "name": "llama.cpp runtime",
+        "license": "MIT",
+        "patterns": [
+          "llama-server.exe",
+          "llama.dll",
+          "mtmd.dll",
+          "ggml*.dll",
+          "backends/*/llama*.exe",
+          "backends/*/llama*.dll",
+          "backends/*/mtmd.dll",
+          "backends/*/ggml*.dll"
+        ],
+        "notices": [
+          "backend/bin/licenses/llama.cpp-LICENSE"
+        ],
+        "noticeChecks": {
+          "backend/bin/licenses/llama.cpp-LICENSE": [
+            "Permission is hereby granted, free of charge",
+            "THE SOFTWARE IS PROVIDED"
+          ]
+        }
+      },
+      {
+        "id": "nvidia-cuda-runtime",
+        "name": "NVIDIA CUDA 12.4 runtime components",
+        "license": "NVIDIA CUDA Toolkit EULA 12.4",
+        "patterns": [
+          "cudart*.dll",
+          "cufft*.dll",
+          "cufftw*.dll",
+          "cublas*.dll",
+          "cublasLt*.dll",
+          "nvblas*.dll",
+          "cusparse*.dll",
+          "cusolver*.dll",
+          "curand*.dll",
+          "nppc*.dll",
+          "nppial*.dll",
+          "nppicc*.dll",
+          "nppicom*.dll",
+          "nppidei*.dll",
+          "nppif*.dll",
+          "nppig*.dll",
+          "nppim*.dll",
+          "nppist*.dll",
+          "nppisu*.dll",
+          "nppitc*.dll",
+          "npps*.dll",
+          "nvjpeg*.dll",
+          "nvrtc*.dll",
+          "nvrtc-builtins*.dll",
+          "nvvm*.dll",
+          "libnvJitLink*.dll",
+          "cupti*.dll",
+          "nvToolsExt*.dll",
+          "backends/cuda/cudart*.dll",
+          "backends/cuda/cufft*.dll",
+          "backends/cuda/cufftw*.dll",
+          "backends/cuda/cublas*.dll",
+          "backends/cuda/cublasLt*.dll",
+          "backends/cuda/nvblas*.dll",
+          "backends/cuda/cusparse*.dll",
+          "backends/cuda/cusolver*.dll",
+          "backends/cuda/curand*.dll",
+          "backends/cuda/nppc*.dll",
+          "backends/cuda/nppial*.dll",
+          "backends/cuda/nppicc*.dll",
+          "backends/cuda/nppicom*.dll",
+          "backends/cuda/nppidei*.dll",
+          "backends/cuda/nppif*.dll",
+          "backends/cuda/nppig*.dll",
+          "backends/cuda/nppim*.dll",
+          "backends/cuda/nppist*.dll",
+          "backends/cuda/nppisu*.dll",
+          "backends/cuda/nppitc*.dll",
+          "backends/cuda/npps*.dll",
+          "backends/cuda/nvjpeg*.dll",
+          "backends/cuda/nvrtc*.dll",
+          "backends/cuda/nvrtc-builtins*.dll",
+          "backends/cuda/nvvm*.dll",
+          "backends/cuda/libnvJitLink*.dll",
+          "backends/cuda/cupti*.dll",
+          "backends/cuda/nvToolsExt*.dll"
+        ],
+        "notices": [
+          "backend/bin/licenses/NVIDIA-CUDA-12.4-EULA.pdf"
+        ],
+        "noticeChecks": {},
+        "cudaRelease": "12.4",
+        "cudaMajor": 12
+      },
+      {
+        "id": "git-for-windows",
+        "name": "MinGit (Git for Windows), the version control engine of swarm repositories",
+        "license": "GPL-2.0-only",
+        "patterns": [
+          "git/*.exe",
+          "git/*.dll"
+        ],
+        "notices": [
+          "backend/bin/licenses/git-for-windows-COPYING"
+        ],
+        "noticeChecks": {
+          "backend/bin/licenses/git-for-windows-COPYING": [
+            "GNU GENERAL PUBLIC LICENSE",
+            "Version 2"
+          ]
+        }
+      },
+      {
+        "id": "darkstar-sandbox",
+        "name": "Darkstar swarm agent sandbox and process helper (first-party, built from backend/sandbox/windows/DarkstarSandbox.cs)",
+        "license": "LicenseRef-Darkstar-3.0",
+        "patterns": [
+          "sandbox/darkstar-sandbox.exe"
+        ],
+        "notices": [
+          "LICENSE.md"
+        ],
+        "noticeChecks": {
+          "LICENSE.md": [
+            "Darkstar Software License"
+          ]
+        }
+      }
+    ],
+    "manualDeclarations": [],
+    "bootstrap": {
+      "bundleVersion": 2,
+      "build": "b10645",
+      "commit": "c5fc7e34885ba31217e330809437afa993d27745",
+      "cudaRelease": "12.4",
+      "backends": {
+        "cpu": {
+          "label": "CPU",
+          "archives": [
+            {
+              "asset": "llama-b10645-bin-win-cpu-x64.zip",
+              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10645/llama-b10645-bin-win-cpu-x64.zip",
+              "sha256": "d3a82793b79701cff48323ebf18d3f0a4384d54aacd502e13cc3c30fa09653b2"
+            }
+          ]
+        },
+        "vulkan": {
+          "label": "Vulkan",
+          "archives": [
+            {
+              "asset": "llama-b10645-bin-win-vulkan-x64.zip",
+              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10645/llama-b10645-bin-win-vulkan-x64.zip",
+              "sha256": "2dbb1b161252d0caf704a20a00a111fdc53b1f77812787e3ab87c3ef726b9666"
+            }
+          ]
+        },
+        "cuda": {
+          "label": "CUDA 12.4",
+          "archives": [
+            {
+              "asset": "llama-b10645-bin-win-cuda-12.4-x64.zip",
+              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10645/llama-b10645-bin-win-cuda-12.4-x64.zip",
+              "sha256": "c172f30312a8830795fba4b08f4ac027777f62505d61653b07b896c43898c86a"
+            },
+            {
+              "asset": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+              "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10645/cudart-llama-bin-win-cuda-12.4-x64.zip",
+              "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6"
+            }
+          ]
+        }
+      },
+      "noticeDownloads": [
+        {
+          "asset": "llama.cpp-LICENSE",
+          "url": "https://raw.githubusercontent.com/ggml-org/llama.cpp/c5fc7e34885ba31217e330809437afa993d27745/LICENSE",
+          "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+        },
+        {
+          "asset": "NVIDIA-CUDA-12.4-EULA.pdf",
+          "url": "https://docs.nvidia.com/cuda/archive/12.4.0/pdf/EULA.pdf",
+          "sha256": "6ada441ae5a45a4a3d51ade8850fa2229fc6dd95de0c9da6e2cdd7a46701b844"
+        }
+      ]
+    }
+  },
+  "speechBootstrap": {
+    "bundleVersion": 1,
+    "root": "backend/NemotronSTT",
+    "runtimeVersion": "0.2.0",
+    "note": "NVIDIA's official nemo-speech.cpp v0.2.0 Windows release archives (bin/nemo-speech.exe plus DLLs). SHA-256 values are those published with the release (SHA256SUMS) and are verified before use.",
+    "allowedHosts": [
+      "github.com",
+      "objects.githubusercontent.com",
+      "release-assets.githubusercontent.com",
+      "huggingface.co",
+      "cdn-lfs.huggingface.co",
+      "cas-bridge.xethub.hf.co"
+    ],
+    "model": {
+      "file": "nemotron-speech-streaming-en-0.6b.q8_0.gguf",
+      "url": "https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b/resolve/main/nemotron-speech-streaming-en-0.6b.q8_0.gguf",
+      "sha256": "d9a01898d2a611c8764e23a1c2f45e70bbd5a425dc4de93692ac951dd603812d",
+      "license": "NVIDIA Open Model License"
+    },
+    "backends": {
+      "cpu": {
+        "dir": "CPU",
+        "asset": "nemo-speech-0.2.0-windows-x86_64-cpu.zip",
+        "url": "https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v0.2.0/nemo-speech-0.2.0-windows-x86_64-cpu.zip",
+        "sha256": "82c80451086e86194aba9af19f800da77cd66d1c28d993d0efceffd6cdb49bb8"
+      },
+      "vulkan": {
+        "dir": "Vulkan",
+        "asset": "nemo-speech-0.2.0-windows-x86_64-vulkan.zip",
+        "url": "https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v0.2.0/nemo-speech-0.2.0-windows-x86_64-vulkan.zip",
+        "sha256": "edf15a04ba98740aa0ab75ae4681ac7ad0a488b22b35ce2cbebd10590bb1c1e1"
+      },
+      "cuda": {
+        "dir": "CUDA",
+        "asset": "nemo-speech-0.2.0-windows-x86_64-cuda.zip",
+        "url": "https://github.com/NVIDIA/NeMo-Speech.cpp/releases/download/v0.2.0/nemo-speech-0.2.0-windows-x86_64-cuda.zip",
+        "sha256": "9ffe5e842c39a7d3211f3b2c3b3aa1bca8c0b2455d96d961ed5f22ec5108f98d"
+      }
+    }
+  },
+  "sandboxBootstrap": {
+    "bundleVersion": 2,
+    "note": "Swarm agent sandbox. darkstar-sandbox.exe is first-party: it is compiled from backend/sandbox/windows/DarkstarSandbox.cs with the .NET Framework 4 C# compiler that ships with Windows, and runs each swarm element's programs with a restricted token at low integrity inside a job object (no virtual machine, no driver, no administrator rights). Its qos command also keeps Darkstar's own processes out of Windows power throttling. MinGit, the newest Git for Windows release, is resolved on every run and verified against the SHA-256 digest GitHub publishes.",
+    "helperSource": "backend/sandbox/windows/DarkstarSandbox.cs",
+    "helper": "backend/bin/sandbox/darkstar-sandbox.exe",
+    "gitRoot": "backend/bin/git",
+    "allowedHosts": [
+      "api.github.com",
+      "github.com",
+      "objects.githubusercontent.com",
+      "release-assets.githubusercontent.com",
+      "raw.githubusercontent.com"
+    ],
+    "git": {
+      "repository": "git-for-windows/git",
+      "assetPattern": "^MinGit-(\\d+\\.\\d+\\.\\d+(?:\\.\\d+)?)-64-bit\\.zip$",
+      "license": "GPL-2.0-only",
+      "notice": "COPYING"
+    }
+  }
+}

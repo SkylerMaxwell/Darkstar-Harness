@@ -1,0 +1,8 @@
+{
+    "name":  "darkstar",
+    "version":  "4.0.1",
+    "description":  "Darkstar Harness - local AI client with an embedded browser",
+    "main":  "../Darkstar_Core.js",
+    "author":  "Darkstar Harness contributors",
+    "license":  "SEE LICENSE IN LICENSE.md"
+}

@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="space">
+<head>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:*; media-src 'self' data: blob:; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none';">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Darkstar</title>
+
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Darkstar">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="theme-color" content="#000000">
+    <meta name="format-detection" content="telephone=no">
+
+    <link rel="apple-touch-icon" href="../assets/icon.png">
+    <link rel="icon" type="image/png" href="../assets/icon.png">
+    <link rel="stylesheet" href="styles.css?v=20261110-space-cuda-orange">
+</head>
+<body>
+    <div class="bg-gradient"></div>
+
+    <div class="app-container" id="appRoot">
+        <header class="mobile-header">
+            <div class="logo">
+                <span class="logo-text">Darkstar</span>
+            </div>
+            <button class="btn-settings" id="btnSettings" type="button">⚙️</button>
+        </header>
+
+        <div class="settings-panel" id="settingsPanel">
+            <div class="section-title">Model</div>
+            <div class="model-select">
+                <select id="mobileModelSelect"><option value="">Loading...</option></select>
+            </div>
+
+            <div class="section-title">Token Usage</div>
+            <div class="token-counter">
+                <div class="token-bar">
+                    <div class="token-fill" id="mobileTokenFill"></div>
+                </div>
+                <div class="token-text">
+                    <span id="mobileTokenCount">0</span> / <span id="mobileTokenLimit">8,192</span> tokens
+                </div>
+            </div>
+
+            <div class="section-title">Thinking</div>
+            <div class="thinking-effort">
+                <div class="effort-buttons">
+                    <button class="effort-btn" type="button" data-effort="off">
+                        <span class="effort-icon">⚡</span>
+                        <span class="effort-label">Off</span>
+                    </button>
+                    <button class="effort-btn" type="button" data-effort="low">
+                        <span class="effort-icon">💭</span>
+                        <span class="effort-label">Low</span>
+                    </button>
+                    <button class="effort-btn active" type="button" data-effort="medium">
+                        <span class="effort-icon">🧠</span>
+                        <span class="effort-label">Med</span>
+                    </button>
+                    <button class="effort-btn" type="button" data-effort="high">
+                        <span class="effort-icon">🔮</span>
+                        <span class="effort-label">Max</span>
+                    </button>
+                </div>
+            </div>
+
+            <button class="btn-clear" id="mobileClearChatButton" type="button">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
+                </svg>
+                Clear conversation
+            </button>
+        </div>
+
+        <div class="settings-view" id="settingsView">
+            <div class="settings-toast" id="settingsToast" role="status" aria-live="polite" aria-hidden="true"></div>
+            <div class="settings-canvas" id="settingsCanvas">
+                <div class="workflow-sections-scroll" id="workflowSectionsScroll">
+                    <section class="settings-property-sheet" aria-label="Settings properties">
+                        <div class="settings-property-tabs-shell">
+                            <div class="settings-property-tabs" id="settingsPropertyTabs" role="tablist" aria-orientation="horizontal" aria-label="Settings sections">
+                            </div>
+                            <div class="settings-actions" role="toolbar" aria-label="Workflow and chat actions">
+                                <button class="settings-action-button" id="settingsInternetAccessButton" type="button" aria-label="Disable Internet Access" aria-pressed="true" data-enabled="true">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"></path><path class="settings-internet-off-mark" d="M4 4 20 20"></path></svg>
+                                    <span class="settings-action-label">Internet</span>
+                                </button>
+                                <button class="settings-action-button" id="settingsMuteButton" type="button" aria-label="Mute interface sounds" aria-pressed="false">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z"></path><path class="settings-sound-on-mark" d="M15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12"></path><path class="settings-sound-off-mark" d="m16 9 5 6m0-6-5 6"></path></svg>
+                                    <span class="settings-action-label">Sound</span>
+                                </button>
+                                <button class="settings-action-button" id="settingsThemeButton" type="button" aria-label="Current theme: Space. Switch to Light" data-current-theme="space" data-next-theme="light">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18h1.3c1.3 0 2.1-1.3 1.5-2.4-.6-1.2.3-2.6 1.7-2.6H18a3 3 0 0 0 3-3A9 9 0 0 0 12 3Z"></path><circle cx="7.5" cy="12" r="1" fill="currentColor" stroke="none"></circle><circle cx="10" cy="7.5" r="1" fill="currentColor" stroke="none"></circle><circle cx="15.5" cy="8" r="1" fill="currentColor" stroke="none"></circle></svg>
+                                    <span class="settings-action-label">Theme</span>
+                                </button>
+                                <button class="settings-action-button" id="settingsClearContextButton" type="button" aria-label="Clear active chat context">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 7h16"></path><path d="M9 7V4h6v3"></path><path d="m7 7 1 13h8l1-13"></path><path d="M10 11v5M14 11v5"></path></svg>
+                    <span class="settings-action-label">Clear</span>
+                </button>
+                                <button class="settings-action-button" id="settingsChatTraceButton" type="button" aria-label="Expand all chat traces" aria-pressed="false">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 6h14"></path><path d="M5 12h14"></path><path d="M5 18h14"></path><path d="m8 3-3 3 3 3"></path><path d="m16 15 3 3-3 3"></path></svg>
+                    <span class="settings-action-label">Traces</span>
+                </button>
+                            </div>
+                        </div>
+                        <div class="settings-sections workflow-sections-layer" id="settingsSections" aria-label="Settings panels"></div>
+                    </section>
+                </div>
+                <div class="workflow-overlay-scrollbar" id="workflowOverlayScrollbar" hidden aria-hidden="true">
+                    <div class="workflow-overlay-scrollbar-thumb" id="workflowOverlayScrollbarThumb"></div>
+                </div>
+            </div>
+        </div>
+
+
+        <select id="modelSelect" class="model-select-source"><option value="">Loading...</option></select>
+
+        <div class="bottom-floor"></div>
+
+        <button class="tab-nav" id="tabNav" type="button" aria-label="Open settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"></path>
+            </svg>
+        </button>
+
+        <div class="title-bar">
+            <span class="title-bar-text">DARKSTAR</span>
+            <div class="window-controls" id="windowControls" role="group" aria-label="Window controls" data-maximized="false">
+                <button class="window-control window-control-minimize" id="windowMinimizeButton" type="button" aria-label="Minimize">
+                    <svg viewBox="0 0 10 10" aria-hidden="true" focusable="false"><path d="M0 5.5h10"></path></svg>
+                </button>
+                <button class="window-control window-control-maximize" id="windowMaximizeButton" type="button" aria-label="Maximize">
+                    <svg class="window-glyph-maximize" viewBox="0 0 10 10" aria-hidden="true" focusable="false"><rect x="0.5" y="0.5" width="9" height="9"></rect></svg>
+                    <svg class="window-glyph-restore" viewBox="0 0 10 10" aria-hidden="true" focusable="false"><path d="M2.5 2.5V.5h7v7h-2"></path><rect x="0.5" y="2.5" width="7" height="7"></rect></svg>
+                </button>
+                <button class="window-control window-control-close" id="windowCloseButton" type="button" aria-label="Close">
+                    <svg viewBox="0 0 10 10" aria-hidden="true" focusable="false"><path d="M.5.5l9 9m0-9l-9 9"></path></svg>
+                </button>
+            </div>
+        </div>
+
+        <div class="tab-bar" id="tabBar">
+            <button class="tab-new" id="newTabButton" type="button" aria-label="New tab" aria-haspopup="menu" aria-expanded="false">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            </button>
+        </div>
+
+        <div class="workspace-sidebar" id="workspaceSidebar">
+            <div class="workspace-header">
+                <span class="workspace-header-title">SCHEMA</span>
+                <button class="workspace-toggle" id="workspaceToggle" type="button">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="11 17 6 12 11 7"></polyline><polyline points="18 17 13 12 18 7"></polyline></svg>
+                </button>
+            </div>
+            <section class="schema-section schema-file-explorer-section" aria-labelledby="schemaFileExplorerTitle">
+                <div class="schema-section-header">
+                    <span class="schema-section-title" id="schemaFileExplorerTitle">FILE EXPLORER</span>
+                    <button class="workspace-open-folder" id="workspaceOpenFolder" type="button" aria-label="Add Directory">
+                        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3.5 6.75A1.75 1.75 0 0 1 5.25 5h4.2l1.8 2h7.5a1.75 1.75 0 0 1 1.75 1.75v8.5A1.75 1.75 0 0 1 18.75 19H5.25a1.75 1.75 0 0 1-1.75-1.75z" fill="currentColor" fill-opacity=".12" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"></path><path d="M12 11v5m-2.5-2.5h5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"></path></svg>
+                    </button>
+                </div>
+                <div class="workspace-files" id="workspaceFiles"></div>
+            </section>
+            <section class="schema-section schema-projects-section" aria-labelledby="schemaProjectsTitle">
+                <div class="schema-section-header">
+                    <span class="schema-section-title" id="schemaProjectsTitle">PROJECTS</span>
+                    <button class="schema-project-add" id="projectAddButton" type="button" aria-label="New Project">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5v14M5 12h14"></path></svg>
+                    </button>
+                </div>
+                <div class="schema-project-list" id="projectList"></div>
+            </section>
+            <div class="workspace-sidebar-resize-handle" id="workspaceSidebarResizeHandle" aria-hidden="true"></div>
+        </div>
+
+        <aside class="web-engine-sidebar" id="webEngineSidebar" aria-label="Action Engine" aria-hidden="true">
+            <div class="web-engine-toolbar" hidden inert aria-hidden="true">
+                <button class="web-engine-icon-button" id="webEngineBack" type="button" aria-label="Back" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button>
+                <button class="web-engine-icon-button" id="webEngineForward" type="button" aria-label="Forward" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></button>
+                <button class="web-engine-icon-button" id="webEngineReload" type="button" aria-label="Reload page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.7-6"/><path d="M20 4.5V9h-4.5"/></svg></button>
+                <div class="web-engine-address-wrap">
+                    <span class="web-engine-lock" id="webEngineLock" data-state="none" role="img" aria-label="">
+                        <svg class="lock-closed" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"></rect><path d="M8 11V8a4 4 0 0 1 8 0v3"></path></svg>
+                        <svg class="lock-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"></rect><path d="M8 11V8a4 4 0 0 1 7.6-1.7"></path></svg>
+                    </span>
+                    <input id="webEngineAddress" class="web-engine-address" type="text" aria-label="Address" spellcheck="false">
+                </div>
+                <button class="web-engine-open-button" id="webEngineOpenButton" type="button" aria-label="Open address">Go</button>
+                <button class="web-engine-icon-button" id="webEngineChooseFileButton" type="button" aria-label="Choose local HTML"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 7.5A1.5 1.5 0 0 1 5 6h4l2 2h8a1.5 1.5 0 0 1 1.5 1.5v8A1.5 1.5 0 0 1 19 19H5a1.5 1.5 0 0 1-1.5-1.5z"/></svg></button>
+                <button class="web-engine-icon-button" id="webEngineReset" type="button" aria-label="Reset browser: close every tab and erase cookies and site data" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v7"/><path d="M7.3 7.3a7 7 0 1 0 9.4 0"/></svg></button>
+                <button class="web-engine-icon-button close" id="webEngineClose" type="button" aria-label="Back to chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+            </div>
+            <div class="web-engine-viewport" id="webEngineViewport" aria-label="Browser viewport">
+                <div class="web-engine-tiles" id="webEngineTiles"></div>
+                <div class="web-engine-shield" id="webEngineShield" aria-hidden="true"></div>
+            </div>
+        </aside>
+
+        <section class="image-editor ie-root" id="imageEditor" tabindex="-1" hidden aria-hidden="true" aria-label="Markup Tool">
+            <div id="ieWorkspace">
+                <aside id="ieToolbox" aria-label="Tools"></aside>
+                <main id="ieCenter">
+                    <div id="ieStage">
+                        <canvas id="ieRulerTop"></canvas>
+                        <canvas id="ieRulerLeft"></canvas>
+                        <div id="ieRulerCorner"></div>
+                        <div id="ieViewport">
+                            <canvas id="ieView"></canvas>
+                            <div id="ieCanvasOverlay"></div>
+                        </div>
+                        <div id="ieWinctl">
+                            <button id="imageEditorApply" class="apply" type="button" aria-label="Apply changes to this image"><svg viewBox="0 0 12 12" width="14" height="14" aria-hidden="true"><path d="M2 6.4l2.7 2.7L10 3.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+                            <button id="imageEditorDiscard" class="close" type="button" aria-label="Discard changes to this image"><svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.2"/></svg></button>
+                        </div>
+                    </div>
+                </main>
+                <div id="ieDockResize"></div>
+                <aside id="ieDock" aria-label="Panels"></aside>
+            </div>
+            <div id="ieOverlay"></div>
+        </section>
+
+        <main class="main-content">
+            <div class="chat-stage" id="chatStage">
+                <div class="swarm-sandbox-banner" id="swarmSandboxBanner" role="status" aria-hidden="true" hidden>
+                    <span class="swarm-sandbox-message" id="swarmSandboxMessage"></span>
+                </div>
+                <div class="chat-container" id="chatContainer">
+                    <div class="chat-spacer"></div>
+                    <div class="welcome-screen" id="welcomeScreen">
+                    </div>
+                </div>
+
+                <section class="swarm-org" id="swarmOrganization" aria-label="Table of Organization" aria-hidden="true" hidden>
+                    <div class="swarm-org-canvas" id="swarmOrgCanvas">
+                        <canvas class="swarm-org-grid" id="swarmOrgGrid" aria-hidden="true"></canvas>
+                        <div class="swarm-org-world" id="swarmOrgWorld">
+                            <svg class="swarm-org-links" id="swarmOrgLinks" aria-hidden="true"></svg>
+                            <div class="swarm-org-tree" id="swarmOrgTree" role="group"></div>
+                        </div>
+                        <div class="swarm-org-overlay swarm-org-nav" id="swarmOrgNav">
+                            <div class="swarm-org-zoombar">
+                                <button type="button" id="swarmOrgZoomOut" hidden aria-label="Zoom out"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 8h8"/></svg></button>
+                                <button type="button" id="swarmOrgZoomIn" hidden aria-label="Zoom in"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 8h8M8 4v8"/></svg></button>
+                                <span class="swarm-org-zoombar-rule" aria-hidden="true" hidden></span>
+                                <button type="button" id="swarmOrgFit" aria-label="Fit to view"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 5.5v-3h3M10.5 2.5h3v3M13.5 10.5v3h-3M5.5 13.5h-3v-3"/></svg></button>
+                            </div>
+                        </div>
+                        <div class="swarm-org-overlay swarm-org-dossier" id="swarmOrgDossier" aria-hidden="true"></div>
+                    </div>
+                </section>
+
+                <section class="swarm-objective" id="swarmObjective" aria-label="Tree of Objectives" aria-hidden="true" hidden>
+                    <div class="swarm-objective-body">
+                        <div class="swarm-objective-canvas" id="swarmObjectiveCanvas">
+                            <div class="swarm-objective-world" id="swarmObjectiveWorld">
+                                <svg class="swarm-objective-links" id="swarmObjectiveLinks" aria-hidden="true"></svg>
+                                <div class="swarm-objective-nodes" id="swarmObjectiveNodes" role="group" aria-label="Objectives"></div>
+                            </div>
+                        </div>
+                        <div class="swarm-objective-tip" id="swarmObjectiveTip" aria-hidden="true"></div>
+                    </div>
+                </section>
+
+                <section class="task-board" id="taskBoard" aria-label="Tasks" aria-hidden="true" hidden>
+                    <aside class="task-board-brief" id="taskBoardBrief"></aside>
+                    <div class="task-board-main">
+                        <ol class="task-board-list" id="taskBoardList" aria-label="Tasks"></ol>
+                    </div>
+                </section>
+
+                <section class="swarm-rooms" id="swarmRooms" aria-label="Swarm chatrooms" aria-hidden="true" hidden>
+                    <div class="swarm-rooms-layout">
+                        <div class="swarm-rooms-main">
+                            <div class="swarm-rooms-tools">
+                                <span class="swarm-rooms-highlight" id="swarmRoomsHighlight" role="status" hidden></span>
+                                <button type="button" class="swarm-rooms-pins-toggle" id="swarmRoomsPinsToggle" aria-expanded="false" aria-controls="swarmRoomsPins" aria-label="Pinned messages">
+                                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 3.5h7M9.7 3.5v6.3L6.5 14.5h11l-3.2-4.7V3.5M12 14.5v6"></path></svg>
+                                    <span class="swarm-rooms-pins-count" id="swarmRoomsPinsCount"></span>
+                                </button>
+                            </div>
+                            <div class="swarm-rooms-pins" id="swarmRoomsPins" role="region" aria-label="Pinned messages" hidden></div>
+                            <div class="swarm-rooms-messages" id="swarmRoomsMessages" role="log" aria-live="polite" aria-relevant="additions"></div>
+                            <form class="swarm-rooms-composer" id="swarmRoomsComposer" autocomplete="off">
+                                <div class="swarm-rooms-error" id="swarmRoomsError" role="alert"></div>
+                                <div class="swarm-rooms-composer-box">
+                                    <div class="swarm-rooms-mention-menu" id="swarmRoomsMention" role="listbox" aria-label="Mention an element" hidden></div>
+                                    <textarea id="swarmRoomsInput" rows="1" maxlength="12000" placeholder="Message # swarm" aria-label="Message this channel"></textarea>
+                                </div>
+                            </form>
+                        </div>
+                        <div class="swarm-rooms-side">
+                            <aside class="swarm-rooms-members" id="swarmRoomsMembers" aria-label="Channel members"></aside>
+                            <nav class="swarm-rooms-channels" id="swarmRoomsChannels" aria-label="Swarm channels"></nav>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="swarm-element" id="swarmElementView" aria-label="Element chat" aria-hidden="true" hidden>
+                    <div class="chat-container swarm-element-chat" id="swarmElementFeed"></div>
+                </section>
+
+                <section class="raw-context" id="rawContextView" aria-label="Raw context" aria-hidden="true" hidden>
+                    <div class="raw-context-error" id="rawContextError" role="alert" hidden></div>
+                    <pre class="raw-context-text" id="rawContextText" tabindex="0" aria-label="Raw model context"></pre>
+                </section>
+
+            </div>
+
+            <div class="input-area">
+                <div class="message-queue" id="messageQueue"></div>
+                <div class="input-container">
+                    <div class="project-directory-gate" id="projectDirectoryGate" hidden>
+                        <div class="project-directory-gate-copy">
+                            <strong><span class="project-directory-gate-project">This project</span> needs a directory.</strong>
+                            <span>Choose a workspace directory before chatting with the model.</span>
+                        </div>
+                        <button type="button" id="projectDirectoryChooseButton">Choose Directory</button>
+                    </div>
+                    <div class="composer-state-card" id="composerStateGate" role="status" aria-live="polite" hidden>
+                        <div class="composer-state-icon" id="composerStateGateIcon" aria-hidden="true"></div>
+                        <div class="composer-state-copy">
+                            <strong id="composerStateGateTitle"></strong>
+                            <span id="composerStateGateDetail"></span>
+                        </div>
+                        <div class="composer-state-actions">
+                            <button type="button" id="composerStateGateSettings" hidden>Settings</button>
+                            <button type="button" id="composerStateGateNewChat" class="composer-state-primary">Start new chat</button>
+                        </div>
+                    </div>
+                    <div class="agent-attention-card" id="agentAttentionCard" hidden role="alert" aria-live="assertive" aria-labelledby="agentAttentionTitle">
+                        <div class="agent-attention-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a7 7 0 0 0-7 7v3.7L3.6 16h16.8L19 13.7V10a7 7 0 0 0-7-7Z"></path><path d="M9.7 19a2.5 2.5 0 0 0 4.6 0"></path></svg>
+                        </div>
+                        <div class="agent-attention-copy">
+                            <div class="agent-attention-heading"><strong id="agentAttentionTitle">Confirmation needed</strong><span id="agentAttentionCount" hidden></span></div>
+                            <span id="agentAttentionPrompt">A model action is waiting for your decision.</span>
+                            <span class="agent-attention-error" id="agentAttentionError" role="status"></span>
+                        </div>
+                        <div class="agent-attention-actions">
+                            <button type="button" id="agentAttentionAllow" class="agent-attention-primary">Allow</button>
+                            <button type="button" id="agentAttentionReject">Reject</button>
+                        </div>
+                    </div>
+                    <div class="composer-row">
+                    <button class="queue-toggle" id="queueToggle" type="button" aria-label="Scheduled messages">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="4.5" cy="6" r="1.1" fill="currentColor" stroke="none"></circle><circle cx="4.5" cy="12" r="1.1" fill="currentColor" stroke="none"></circle><circle cx="4.5" cy="18" r="1.1" fill="currentColor" stroke="none"></circle><line x1="9" y1="6" x2="20" y2="6"></line><line x1="9" y1="12" x2="20" y2="12"></line><line x1="9" y1="18" x2="20" y2="18"></line></svg>
+                        <span class="queue-count" id="queueCount"></span>
+                    </button>
+                    <div class="input-wrapper">
+                        <div class="composer-gallery" id="composerGallery" aria-label="Attached images" hidden></div>
+                        <div class="slash-command-menu" id="slashCommandMenu" role="listbox" aria-label="Slash commands" hidden></div>
+                        <button class="btn-upload" id="imageUploadButton" type="button" aria-label="Upload image">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                                <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                                <polyline points="21 15 16 10 5 21"></polyline>
+                            </svg>
+                        </button>
+                        <div class="stt-status" id="sttStatus" role="status" aria-live="polite" aria-hidden="true"></div>
+                        <div id="messageInput" class="composer-editor" contenteditable="plaintext-only" role="textbox" aria-multiline="true" aria-label="Message" spellcheck="true" data-placeholder="Send a message..." data-empty="true"></div>
+                        <button class="btn-send" id="sendBtn" type="button" aria-label="Send message" data-mode="send">
+                            <svg class="composer-send-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                                <line x1="12" y1="19" x2="12" y2="5"></line>
+                                <polyline points="5 12 12 5 19 12"></polyline>
+                            </svg>
+                            <svg class="composer-stop-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                                <rect x="6" y="6" width="12" height="12" rx="2"></rect>
+                            </svg>
+                            <svg class="composer-mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                                <line x1="12" y1="19" x2="12" y2="23"></line>
+                                <line x1="8" y1="23" x2="16" y2="23"></line>
+                            </svg>
+                            <svg class="composer-schedule-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <polyline points="12 6 12 12 16 14"></polyline>
+                            </svg>
+                            <span class="composer-stt-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+                        </button>
+                    </div>
+                    </div>
+
+                </div>
+            </div>
+
+            <div class="status-bar">
+                <div class="status-bar-left">
+                    <button class="status-item settings-btn" id="statusSettings" type="button" aria-label="Open settings">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="3"></circle>
+                            <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"></path>
+                        </svg>
+                    </button>
+                    <!-- Lucide SVG icon geometry (ISC); see LUCIDE_ICON_NOTICE.txt. -->
+                    <nav class="space-rail" id="spaceRail" aria-label="Spaces">
+                        <button class="space-thumb" type="button" data-space="Tab" aria-label="Table of Organization (Tab)" hidden><span class="space-thumb-view" aria-hidden="true"></span><svg class="space-thumb-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="9" y="2" width="6" height="6" rx="2"/><rect x="2" y="16" width="6" height="6" rx="2"/><rect x="16" y="16" width="6" height="6" rx="2"/><path d="M12 8v3M5 16v-1a4 4 0 0 1 4-4h6a4 4 0 0 1 4 4v1"/></svg></button>
+                        <button class="space-thumb" type="button" data-space="Q" aria-label="Chat (Q)" hidden><span class="space-thumb-view" aria-hidden="true"></span><svg class="space-thumb-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/><path d="M8 10h9M8 14h6"/></svg></button>
+                        <button class="space-thumb" type="button" data-space="W" aria-label="Action Engine (W)"><span class="space-thumb-view" aria-hidden="true"></span><svg class="space-thumb-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20.341 6.484A10 10 0 0 1 10.266 21.85"/><path d="M3.659 17.516A10 10 0 0 1 13.74 2.152"/><circle cx="12" cy="12" r="3"/><circle cx="19" cy="5" r="2"/><circle cx="5" cy="19" r="2"/></svg></button>
+                        <button class="space-thumb" type="button" data-space="E" aria-label="Tree of Objectives (E)" hidden><span class="space-thumb-view" aria-hidden="true"></span><svg class="space-thumb-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg></button>
+                        <button class="space-thumb" type="button" data-space="R" aria-label="Messenger (R)" hidden><span class="space-thumb-view" aria-hidden="true"></span><svg class="space-thumb-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></button>
+                    </nav>
+                </div>
+                <div class="status-bar-right">
+                    <div class="status-swarm-freeze-note" id="statusSwarmFreezeNote" role="alert" hidden></div>
+                    <button class="status-item swarm-freeze-btn" id="statusForceUnload" type="button" aria-label="Unload the model from memory" disabled>
+                        <svg class="swarm-freeze-icon swarm-force-unload-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4.5h14"></path><path d="M12 8.5v10"></path><path d="M7.5 14.5 12 19l4.5-4.5"></path></svg>
+                        <svg class="swarm-freeze-icon swarm-freeze-spinner" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle></svg>
+                    </button>
+                    <button class="status-item swarm-freeze-btn" id="statusSwarmFreeze" type="button" aria-label="Pause" aria-pressed="false" hidden>
+                        <svg class="swarm-freeze-icon swarm-freeze-pause" viewBox="0 0 24 24" aria-hidden="true"><rect x="6.25" y="5" width="3.75" height="14" rx="1.1"></rect><rect x="14" y="5" width="3.75" height="14" rx="1.1"></rect></svg>
+                        <svg class="swarm-freeze-icon swarm-freeze-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.2 5.6c0-.8.86-1.28 1.53-.86l9.04 5.7c.63.4.63 1.32 0 1.72l-9.04 5.7c-.67.42-1.53-.06-1.53-.86z"></path></svg>
+                        <svg class="swarm-freeze-icon swarm-freeze-spinner" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle></svg>
+                    </button>
+                    <div class="status-item" id="statusTokensPerSecond" aria-label="Generation speed">0.0 tok/s</div>
+                    <div class="status-item" id="statusTokenCounter">0 / 4,096</div>
+                    <button class="status-item raw-context-btn" id="statusRawContext" type="button" aria-label="Show raw context">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="17" height="17" rx="3.2"></rect><path d="M10.4 7.6 9.2 16.4M14.8 7.6l-1.2 8.8M7.6 10.4h9.2M7 13.6h9.2"></path></svg>
+                    </button>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <div class="project-delete-modal" id="projectDeleteModal" role="dialog" aria-modal="true" aria-labelledby="projectDeleteModalTitle" aria-describedby="projectDeleteModalDescription" aria-hidden="true">
+        <div class="project-delete-modal-card" role="document">
+            <div class="popup-bar"><span class="popup-bar-title">Confirm</span><button type="button" class="popup-bar-x" data-popup-close="projectDeleteCancelButton" aria-label="Close" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div>
+            <div class="project-delete-modal-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 15H6L5 6"></path><path d="M10 11v6M14 11v6"></path></svg>
+            </div>
+            <div class="project-delete-modal-copy">
+                <div class="project-delete-modal-title" id="projectDeleteModalTitle">Delete project?</div>
+                <div class="project-delete-modal-description" id="projectDeleteModalDescription"></div>
+            </div>
+            <div class="project-delete-modal-buttons">
+                <button type="button" class="project-delete-modal-button project-delete-modal-cancel" id="projectDeleteCancelButton">Cancel</button>
+                <button type="button" class="project-delete-modal-button project-delete-modal-confirm" id="projectDeleteConfirmButton">Delete Project</button>
+            </div>
+        </div>
+    </div>
+
+
+    <div class="workflow-file-modal" id="workflowFileModal" role="dialog" aria-modal="true" aria-labelledby="workflowFileModalTitle" aria-hidden="true">
+        <div class="workflow-file-modal-card" role="document">
+            <div class="workflow-file-modal-header popup-bar">
+                <div class="workflow-file-modal-title" id="workflowFileModalTitle">Save Workflow</div>
+                <button type="button" class="popup-bar-x" data-popup-close="workflowFileAbortButton" aria-label="Close" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg></button>
+            </div>
+            <div class="workflow-file-modal-subtitle" id="workflowFileModalSubtitle">Workflow files are stored only in ./workflows.</div>
+            <div class="workflow-file-name-section" id="workflowFileNameSection">
+                <label class="workflow-file-field-label" for="workflowFileNameInput">Name</label>
+                <div class="workflow-file-location-row">
+                    <div class="workflow-file-history-controls" id="workflowFileHistoryControls" aria-label="Folder history" hidden>
+                        <button class="workflow-file-history-button" id="workflowFileBackButton" type="button" aria-label="Back" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13.5 6 7.5 12l6 6M8 12h9"/></svg></button>
+                        <button class="workflow-file-history-button" id="workflowFileForwardButton" type="button" aria-label="Forward" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10.5 6 6 6-6 6M16 12H7"/></svg></button>
+                    </div>
+                    <input class="workflow-file-name-input" id="workflowFileNameInput" type="text" autocomplete="off" spellcheck="false" placeholder="Enter workflow name" aria-describedby="workflowFileNameHint workflowFileModalError">
+                </div>
+                <div class="workflow-file-name-hint" id="workflowFileNameHint">A name is required. The saved file will use the .dswf extension.</div>
+            </div>
+            <div class="workflow-file-picker-section" id="workflowFilePickerSection">
+                <div class="workflow-file-picker-label" id="workflowFilePickerLabel">Existing workflows</div>
+                <div class="workflow-file-picker-body">
+                    <nav class="workflow-file-sidebar" id="workflowFileSidebar" aria-label="Locations" hidden>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="desktop"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><span>Desktop</span></button>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="downloads"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 18v2h14v-2"/></svg><span>Downloads</span></button>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="documents"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3.5h8l4 4V20.5H6zM14 3.5v4h4M9 12h6M9 16h6"/></svg><span>Documents</span></button>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="pictures"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="16" rx="2"/><circle cx="9" cy="9" r="1.5"/><path d="m6 17 4-4 3 3 2-2 3 3"/></svg><span>Pictures</span></button>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="music"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 17.5V6l9-2v11.5M9 7.5l9-2M6.5 20a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Zm9 0a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z"/></svg><span>Music</span></button>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="videos"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M8 5v14M16 5v14M3.5 10h17M3.5 14h17"/></svg><span>Videos</span></button>
+                        <button type="button" class="workflow-file-sidebar-item" data-filesystem-location="this-pc"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4" width="17" height="12" rx="2"/><path d="M8 20h8M12 16v4M6.5 7.5h11"/></svg><span>This PC</span></button>
+                    </nav>
+                    <div class="workflow-file-list-pane">
+                        <div class="workflow-file-list" id="workflowFileList" role="listbox" aria-labelledby="workflowFilePickerLabel"></div>
+                        <div class="workflow-file-empty" id="workflowFileEmpty" hidden>No .dswf workflows are currently saved in ./workflows.</div>
+                    </div>
+                </div>
+            </div>
+            <div class="workflow-file-modal-error" id="workflowFileModalError" role="alert" aria-live="polite"></div>
+            <div class="workflow-file-modal-buttons">
+                <button type="button" class="workflow-file-modal-button workflow-file-abort" id="workflowFileAbortButton">Abort</button>
+                <button type="button" class="workflow-file-modal-button workflow-file-commit" id="workflowFileCommitButton" disabled>Commit</button>
+            </div>
+        </div>
+    </div>
+
+
+
+    <div class="project-delete-modal workspace-delete-modal" id="workspaceDeleteModal" role="dialog" aria-modal="true" aria-labelledby="workspaceDeleteModalTitle" aria-describedby="workspaceDeleteModalDescription" aria-hidden="true">
+        <div class="project-delete-modal-card" role="document">
+            <div class="popup-bar"><span class="popup-bar-title">Confirm</span><button type="button" class="popup-bar-x" data-popup-close="workspaceDeleteCancelButton" aria-label="Close" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div>
+            <div class="project-delete-modal-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 15H6L5 6"></path><path d="M10 11v6M14 11v6"></path></svg>
+            </div>
+            <div class="project-delete-modal-copy">
+                <div class="project-delete-modal-title" id="workspaceDeleteModalTitle">Delete workspace item?</div>
+                <div class="project-delete-modal-description" id="workspaceDeleteModalDescription"></div>
+            </div>
+            <div class="project-delete-modal-buttons">
+                <button type="button" class="project-delete-modal-button project-delete-modal-cancel" id="workspaceDeleteCancelButton">Cancel</button>
+                <button type="button" class="project-delete-modal-button project-delete-modal-confirm" id="workspaceDeleteConfirmButton">Delete</button>
+            </div>
+        </div>
+    </div>
+    <div class="trial-dialog update-dialog" id="updateDialog" role="dialog" aria-modal="true" aria-labelledby="updateDialogTitle" aria-describedby="updateDialogMessage" aria-hidden="true" data-update-phase="idle">
+        <div class="trial-dialog-card update-dialog-card" role="document">
+            <header class="trial-dialog-header">
+                <span class="trial-dialog-wordmark">Darkstar Harness</span>
+                <span class="trial-dialog-edition" id="updateDialogVersion"></span>
+            </header>
+            <div class="update-dialog-body">
+                <div class="trial-dialog-title" id="updateDialogTitle"></div>
+                <div class="trial-dialog-message" id="updateDialogMessage"></div>
+                <div class="update-dialog-progress" id="updateDialogProgress" role="progressbar" aria-label="Update download" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span class="update-dialog-progress-bar" id="updateDialogProgressBar"></span></div>
+                <div class="update-dialog-detail" id="updateDialogDetail" role="status" aria-live="polite"></div>
+                <div class="trial-dialog-error" id="updateDialogError" role="alert" hidden></div>
+            </div>
+            <div class="trial-dialog-buttons">
+                <button type="button" class="trial-dialog-button trial-dialog-continue" id="updateDialogLater">Not now</button>
+                <button type="button" class="trial-dialog-button trial-dialog-buy" id="updateDialogRetry" hidden>Try again</button>
+            </div>
+        </div>
+    </div>
+    <div class="trial-dialog" id="trialDialog" role="dialog" aria-modal="true" aria-labelledby="trialDialogTitle" aria-describedby="trialDialogMessage" aria-hidden="true" data-trial-state="active">
+        <div class="trial-dialog-card" role="document">
+            <header class="trial-dialog-header">
+                <span class="trial-dialog-wordmark">Darkstar Harness</span>
+                <span class="trial-dialog-edition" id="trialDialogEdition"></span>
+            </header>
+            <div class="trial-dialog-body">
+                <div class="trial-dial" aria-hidden="true">
+                    <svg class="trial-dial-svg" viewBox="0 0 200 200" focusable="false"><g class="trial-dial-ticks" id="trialDialTicks"></g></svg>
+                    <svg class="trial-dial-check" viewBox="0 0 200 200" focusable="false"><circle cx="100" cy="100" r="86"></circle><path d="M62 104 88 130 140 74"></path></svg>
+                    <div class="trial-dial-readout">
+                        <span class="trial-dial-number" id="trialDialNumber"></span>
+                        <span class="trial-dial-unit" id="trialDialUnit"></span>
+                    </div>
+                </div>
+                <div class="trial-dialog-copy">
+                    <div class="trial-dialog-title" id="trialDialogTitle"></div>
+                    <div class="trial-dialog-message" id="trialDialogMessage"></div>
+                    <dl class="trial-dialog-facts" id="trialDialogFacts">
+                        <div class="trial-dialog-fact"><dt>Trial started</dt><dd id="trialDialogStarted"></dd></div>
+                        <div class="trial-dialog-fact"><dt id="trialDialogEndsLabel">Trial ends</dt><dd id="trialDialogEnds"></dd></div>
+                    </dl>
+                    <div class="trial-dialog-error" id="trialDialogError" role="alert" hidden></div>
+                </div>
+            </div>
+            <form class="trial-dialog-keyview" id="trialDialogLicenseForm" autocomplete="off" novalidate hidden>
+                <div class="trial-dialog-keylabel">LICENSE KEY</div>
+                <div class="trial-dialog-keytext" id="trialDialogKeyText">Enter the license key you received with Darkstar.</div>
+                <div class="trial-dialog-keyframe">
+                    <input type="text" class="trial-dialog-keyinput" id="trialDialogLicenseInput" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX" maxlength="24" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="License key" aria-describedby="trialDialogLicenseHint">
+                </div>
+                <div class="trial-dialog-keyhint" id="trialDialogLicenseHint" role="status"></div>
+            </form>
+            <div class="trial-dialog-buttons">
+                <button type="button" class="trial-dialog-license-link" id="trialDialogLicenseLink">Enter license key</button>
+                <button type="button" class="trial-dialog-button trial-dialog-continue trial-dialog-keyback" id="trialDialogLicenseBack">Back</button>
+                <button type="submit" form="trialDialogLicenseForm" class="trial-dialog-button trial-dialog-buy trial-dialog-keysubmit" id="trialDialogLicenseSubmit">Activate</button>
+                <button type="button" class="trial-dialog-button trial-dialog-continue" id="trialDialogContinue">Continue Trial</button>
+                <button type="button" class="trial-dialog-button trial-dialog-buy" id="trialDialogBuy">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"></path></svg>
+                    <span>Buy Now</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+<script src="../Darkstar_Renderer.js" data-darkstar-role="renderer"></script>
+</body>
+</html>
