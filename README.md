@@ -56,7 +56,7 @@ Install. Launch. That's all.
 
 ## License
 
-While some of the source may be made available, Darkstar is NOT open source software. Darkstar is Governed by the **Darkstar Software License v3.0** ([LICENSE.md](LICENSE.md)).
+While some of the source may be made available, Darkstar is NOT open source software. Darkstar is Governed by the **Darkstar Software License** ([LICENSE.md](LICENSE.md)).
 
 For any inquiries: smsterling@protonmail.com
 
